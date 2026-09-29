@@ -1,4 +1,4 @@
-use std::{path::PathBuf, process::Stdio, time::Duration};
+use std::{process::Stdio, time::Duration};
 
 use eyre::{Result, eyre};
 use futures_util::{SinkExt, StreamExt};
@@ -7,22 +7,28 @@ use tokio::{net::TcpListener, process::Command, sync::oneshot, time::timeout};
 use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 
 #[tokio::test]
-async fn interrupt_after_completion_still_flushes_one_terminal_event() -> Result<()> {
+async fn interrupts_after_completion_flush_one_terminal_event_and_fail() -> Result<()> {
+    assert_signal_after_completion("INT").await?;
+    assert_signal_after_completion("TERM").await
+}
+
+async fn assert_signal_after_completion(signal_name: &str) -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("ws://{}", listener.local_addr()?);
     let (completed_tx, completed_rx) = oneshot::channel();
     let server = tokio::spawn(serve_completed_response(listener, completed_tx));
-    let workspace = temporary_workspace()?;
+    let workspace = tempfile::tempdir()?;
     let child = Command::new(env!("CARGO_BIN_EXE_nanocodex"))
-        .current_dir(&workspace)
+        .current_dir(workspace.path())
         .env_remove("OPENAI_API_KEY")
         .arg("run")
+        .arg("--browser=none")
         .arg("--api-key")
         .arg("test-key")
         .arg("--websocket-url")
         .arg(endpoint)
         .arg("--cwd")
-        .arg(&workspace)
+        .arg(workspace.path())
         .arg("--rollouts")
         .arg("false")
         .arg("--mcp-defaults")
@@ -42,16 +48,20 @@ async fn interrupt_after_completion_still_flushes_one_terminal_event() -> Result
 
     // The response event is much larger than a pipe, so the adapter is blocked
     // writing stdout while the independently-owned driver commits the turn.
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
     let pid = child.id().ok_or_else(|| eyre!("CLI had no process ID"))?;
     let signal = Command::new("kill")
-        .args(["-INT", &pid.to_string()])
+        .args([format!("-{signal_name}"), pid.to_string()])
         .status()
         .await?;
-    assert!(signal.success(), "failed to send SIGINT to CLI");
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(signal.success(), "failed to send SIG{signal_name} to CLI");
+    // Keep the pipe backpressured until the CLI has selected the signal branch.
+    // Draining it too quickly makes completion and interruption simultaneously
+    // ready, so the randomized select can legitimately observe completion first
+    // on a loaded runner.
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
-    let output = timeout(Duration::from_secs(10), child.wait_with_output())
+    let output = timeout(Duration::from_secs(20), child.wait_with_output())
         .await
         .map_err(|_| eyre!("interrupted CLI did not exit"))??;
     timeout(Duration::from_secs(5), server)
@@ -66,11 +76,9 @@ async fn interrupt_after_completion_still_flushes_one_terminal_event() -> Result
         .iter()
         .filter(|event| matches!(event["type"].as_str(), Some("run.completed" | "run.failed")))
         .count();
-    std::fs::remove_dir_all(workspace)?;
-
     assert!(
         !output.status.success(),
-        "SIGINT unexpectedly returned success"
+        "SIG{signal_name} unexpectedly returned success"
     );
     assert_eq!(
         terminals, 1,
@@ -93,7 +101,7 @@ async fn serve_completed_response(
             json!({
                 "type": "response.reasoning_summary_text.delta",
                 "summary_index": 0,
-                "delta": "x".repeat(8 * 1024 * 1024)
+                "delta": "x".repeat(2 * 1024 * 1024)
             })
             .to_string()
             .into(),
@@ -163,16 +171,4 @@ where
         ))
         .await?;
     Ok(())
-}
-
-fn temporary_workspace() -> Result<PathBuf> {
-    let path = std::env::temp_dir().join(format!(
-        "nanocodex-run-interrupt-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&path)?;
-    Ok(path)
 }

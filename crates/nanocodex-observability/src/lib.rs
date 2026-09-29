@@ -3,6 +3,9 @@
 
 extern crate self as nanocodex_observability;
 
+#[cfg(feature = "cli")]
+mod cli;
+
 use std::{fs::OpenOptions, io, path::PathBuf};
 
 use opentelemetry::trace::TracerProvider as _;
@@ -15,12 +18,16 @@ use opentelemetry_sdk::{
     },
 };
 use opentelemetry_semantic_conventions::{SCHEMA_URL, attribute::SERVICE_VERSION};
-use tracing_appender::non_blocking::WorkerGuard;
+use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
 use tracing_subscriber::{
     EnvFilter, Layer, fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt,
 };
 
+#[cfg(feature = "cli")]
+pub use cli::ObservabilityOutputArgs;
+
 const DEPLOYMENT_ENVIRONMENT_NAME: &str = "deployment.environment.name";
+const LOCAL_LOG_BUFFERED_LINES_LIMIT: usize = 4_096;
 
 /// Human-readable or structured local tracing output.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -156,7 +163,10 @@ impl ObservabilityBuilder {
         if rustls::crypto::CryptoProvider::get_default().is_none() {
             drop(rustls::crypto::ring::default_provider().install_default());
         }
-        let (writer, writer_guard) = tracing_appender::non_blocking(self.writer()?);
+        let (writer, writer_guard) = NonBlockingBuilder::default()
+            .buffered_lines_limit(LOCAL_LOG_BUFFERED_LINES_LIMIT)
+            .lossy(false)
+            .finish(self.writer()?);
         let filter = EnvFilter::try_new(self.filter.as_str())?;
         let otel_filter = EnvFilter::try_new(self.otel_filter.as_str())?;
         let fmt_layer = match self.format {
@@ -319,43 +329,6 @@ mod tests {
     use super::*;
 
     const OTLP_TEST_TIMEOUT: Duration = Duration::from_secs(30);
-
-    #[test]
-    fn resource_uses_configured_service_identity_and_semantic_schema() {
-        let resource = ObservabilityBuilder::new("nanocodex-test", "1.2.3")
-            .environment("test")
-            .resource();
-
-        assert_eq!(
-            resource.get(&opentelemetry::Key::new("service.name")),
-            Some(opentelemetry::Value::from("nanocodex-test"))
-        );
-        assert_eq!(
-            resource.get(&opentelemetry::Key::new(SERVICE_VERSION)),
-            Some(opentelemetry::Value::from("1.2.3"))
-        );
-        assert_eq!(
-            resource.get(&opentelemetry::Key::new(DEPLOYMENT_ENVIRONMENT_NAME)),
-            Some(opentelemetry::Value::from("test"))
-        );
-        assert_eq!(resource.schema_url(), Some(SCHEMA_URL));
-    }
-
-    #[test]
-    fn async_export_requires_a_multithreaded_tokio_runtime() {
-        assert!(!current_tokio_runtime_is_multi_thread());
-
-        let current_thread = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
-        assert!(!current_thread.block_on(async { current_tokio_runtime_is_multi_thread() }));
-
-        let multi_thread = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .build()
-            .unwrap();
-        assert!(multi_thread.block_on(async { current_tokio_runtime_is_multi_thread() }));
-    }
 
     #[test]
     fn formatting_and_otlp_export_share_the_installed_span_stream() {

@@ -5,7 +5,7 @@ use serde::Deserialize;
 pub(super) fn retryable_api_error(event: &str) -> Option<(&'static str, Option<Duration>)> {
     let event: ApiErrorEnvelope = serde_json::from_str(event).ok()?;
     let error = event.error();
-    let code = error.and_then(|error| error.code.as_deref());
+    let code = event.code();
     let discriminator = code.or_else(|| error.and_then(|error| error.kind.as_deref()));
 
     let class = match event.event_type.as_deref() {
@@ -15,13 +15,14 @@ pub(super) fn retryable_api_error(event: &str) -> Option<(&'static str, Option<D
                 return None;
             }
             match discriminator {
+                Some("server_is_overloaded" | "slow_down") => "api_overload",
                 Some("rate_limit_exceeded") => "api_rate_limit",
                 Some("server_error" | "websocket_connection_limit_reached") => "api_server",
                 _ => "api_failed",
             }
         }
         _ => match discriminator {
-            Some("server_is_overloaded" | "slow_down") => return None,
+            Some("server_is_overloaded" | "slow_down") => "api_overload",
             Some("server_error" | "websocket_connection_limit_reached") => "api_server",
             Some("rate_limit_exceeded") => "api_rate_limit",
             _ => return None,
@@ -39,7 +40,57 @@ pub(super) fn api_error_has_code(event: &str, expected: &str) -> bool {
     let Ok(event) = serde_json::from_str::<ApiErrorEnvelope>(event) else {
         return false;
     };
-    event.error().and_then(|error| error.code.as_deref()) == Some(expected)
+    event.code() == Some(expected)
+}
+
+/// Resolves only structured paths into discovered function parameters.
+pub(super) fn invalid_tool_schema_path(event: &str) -> Option<Vec<usize>> {
+    let event: ApiErrorEnvelope = serde_json::from_str(event).ok()?;
+    let (code, param) = if event.code.is_some() {
+        (event.code.as_deref(), event.param.as_deref())
+    } else {
+        let error = event.error()?;
+        (error.code.as_deref(), error.param.as_deref())
+    };
+    if code != Some("invalid_function_parameters") {
+        return None;
+    }
+    let (input, mut rest) = path_index(param?.strip_prefix("input[")?)?;
+    let mut indices = vec![input];
+    while let Some(suffix) = rest.strip_prefix(".tools[") {
+        let (index, suffix) = path_index(suffix)?;
+        indices.push(index);
+        rest = suffix;
+    }
+    let suffix = rest.strip_prefix(".parameters")?;
+    (indices.len() >= 2
+        && (suffix.is_empty() || suffix.starts_with('.') || suffix.starts_with('[')))
+    .then_some(indices)
+}
+
+fn path_index(path: &str) -> Option<(usize, &str)> {
+    let (index, rest) = path.split_once(']')?;
+    if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some((index.parse().ok()?, rest))
+}
+
+pub(super) fn api_error_is_checkpoint_missing(event: &str) -> bool {
+    let Ok(event) = serde_json::from_str::<ApiErrorEnvelope>(event) else {
+        return false;
+    };
+    let Some(error) = event.error() else {
+        return false;
+    };
+    if error.code.as_deref() == Some("previous_response_not_found") {
+        return true;
+    }
+    error.kind.as_deref() == Some("invalid_request_error")
+        && error
+            .message
+            .as_deref()
+            .is_some_and(|message| message.eq_ignore_ascii_case("Invalid `previous_response_id`."))
 }
 
 fn is_terminal_response_failure(code: &str) -> bool {
@@ -49,10 +100,9 @@ fn is_terminal_response_failure(code: &str) -> bool {
             | "insufficient_quota"
             | "usage_not_included"
             | "cyber_policy"
+            | "misalignment_policy_violation"
             | "invalid_prompt"
             | "bio_policy"
-            | "server_is_overloaded"
-            | "slow_down"
     )
 }
 
@@ -69,6 +119,10 @@ struct ApiErrorEnvelope {
     #[serde(default, rename = "type")]
     event_type: Option<Box<str>>,
     #[serde(default)]
+    code: Option<Box<str>>,
+    #[serde(default)]
+    param: Option<Box<str>>,
+    #[serde(default)]
     error: Option<ApiErrorDetail>,
     #[serde(default)]
     response: Option<ApiErrorResponse>,
@@ -81,6 +135,12 @@ impl ApiErrorEnvelope {
         self.error
             .as_ref()
             .or_else(|| self.response.as_ref()?.error.as_ref())
+    }
+
+    fn code(&self) -> Option<&str> {
+        self.code
+            .as_deref()
+            .or_else(|| self.error().and_then(|error| error.code.as_deref()))
     }
 }
 
@@ -96,6 +156,10 @@ struct ApiErrorDetail {
     kind: Option<Box<str>>,
     #[serde(default)]
     code: Option<Box<str>>,
+    #[serde(default)]
+    param: Option<Box<str>>,
+    #[serde(default)]
+    message: Option<Box<str>>,
     #[serde(default)]
     retry_after: Option<f64>,
 }
@@ -120,7 +184,32 @@ impl RetryAfterValue {
 mod tests {
     use std::time::Duration;
 
-    use super::retryable_api_error;
+    use super::{api_error_has_code, api_error_is_checkpoint_missing, retryable_api_error};
+
+    #[test]
+    fn recognizes_both_checkpoint_missing_error_shapes() {
+        let coded = r#"{
+            "type": "error",
+            "error": {
+                "code": "previous_response_not_found",
+                "message": "checkpoint expired"
+            }
+        }"#;
+        let current = r#"{
+            "type": "error",
+            "status": 400,
+            "error": {
+                "type": "invalid_request_error",
+                "message": "Invalid `previous_response_id`."
+            }
+        }"#;
+
+        assert!(api_error_is_checkpoint_missing(coded));
+        assert!(api_error_is_checkpoint_missing(current));
+        assert!(!api_error_is_checkpoint_missing(
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"Invalid model."}}"#
+        ));
+    }
 
     #[test]
     fn retries_incomplete_responses() {
@@ -166,22 +255,35 @@ mod tests {
     }
 
     #[test]
-    fn overload_failures_are_terminal() {
+    fn overload_failures_are_retryable_and_retain_server_delay() {
         for code in ["server_is_overloaded", "slow_down"] {
-            let failed = format!(
-                r#"{{
-                    "type": "response.failed",
-                    "response": {{ "error": {{ "code": "{code}" }} }}
-                }}"#
-            );
-            let error = format!(
-                r#"{{
-                    "type": "error",
-                    "error": {{ "code": "{code}" }}
-                }}"#
-            );
-            assert_eq!(retryable_api_error(&failed), None, "failed: {code}");
-            assert_eq!(retryable_api_error(&error), None, "error: {code}");
+            for discriminator in ["code", "type"] {
+                let failed = format!(
+                    r#"{{
+                        "type": "response.failed",
+                        "response": {{
+                            "error": {{ "{discriminator}": "{code}", "retry_after": 1.25 }}
+                        }}
+                    }}"#
+                );
+                let error = format!(
+                    r#"{{
+                        "type": "error",
+                        "error": {{ "{discriminator}": "{code}" }},
+                        "headers": {{ "Retry-After": "2.5" }}
+                    }}"#
+                );
+                assert_eq!(
+                    retryable_api_error(&failed),
+                    Some(("api_overload", Some(Duration::from_millis(1_250)))),
+                    "failed: {discriminator}={code}"
+                );
+                assert_eq!(
+                    retryable_api_error(&error),
+                    Some(("api_overload", Some(Duration::from_millis(2_500)))),
+                    "error: {discriminator}={code}"
+                );
+            }
         }
     }
 
@@ -192,6 +294,7 @@ mod tests {
             "insufficient_quota",
             "usage_not_included",
             "cyber_policy",
+            "misalignment_policy_violation",
             "invalid_prompt",
             "bio_policy",
         ] {
@@ -203,6 +306,18 @@ mod tests {
             );
             assert_eq!(retryable_api_error(&event), None, "{code}");
         }
+    }
+
+    #[test]
+    fn recognizes_top_level_error_codes() {
+        let event = r#"{
+            "type": "error",
+            "code": "misalignment_policy_violation",
+            "message": "stop this conversation"
+        }"#;
+
+        assert!(api_error_has_code(event, "misalignment_policy_violation"));
+        assert_eq!(retryable_api_error(event), None);
     }
 
     #[test]

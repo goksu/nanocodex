@@ -7,7 +7,8 @@ mod platform;
 
 use crate::{
     DefaultResponsesService, Model, OpenAiAuth, OpenAiAuthError, OpenAiAuthMode, ReasoningMode,
-    ResponsesHistory, ResponsesRetryPolicy, ResponsesTransport, Thinking, session::SessionBuilder,
+    ResponsesHistory, ResponsesRetryPolicy, ResponsesTransport, Thinking,
+    responses::StrictJsonSchema, session::SessionBuilder,
 };
 
 #[doc(hidden)]
@@ -87,6 +88,26 @@ where
         )
     }
 
+    /// Attaches an authenticated control sideband to an existing realtime call.
+    ///
+    /// The embedding retains ownership of call creation, WebRTC negotiation,
+    /// and media. Nanocodex does not reconfigure or close the remote call.
+    #[cfg(all(feature = "realtime", not(target_family = "wasm")))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(all(feature = "realtime", not(target_family = "wasm"))))
+    )]
+    #[must_use]
+    pub fn attach_realtime_call(
+        &self,
+        call_id: impl Into<String>,
+    ) -> crate::realtime::RealtimeCallAttachmentBuilder {
+        crate::realtime::RealtimeCallAttachmentBuilder::new(
+            self.config.auth.clone(),
+            call_id.into(),
+        )
+    }
+
     /// Starts a client-side managed session with stable developer
     /// instructions.
     ///
@@ -118,20 +139,34 @@ pub struct OpenAiBuilder<F = StandardServiceFactory> {
 }
 
 impl<F> OpenAiBuilder<F> {
-    /// Selects the default GPT-5.6 coding model for new sessions and agents.
+    /// Selects the default coding model for new sessions and agents.
     ///
     /// A higher-level session or agent builder may override this reusable
     /// client default without mutating the `OpenAi` recipe.
     #[must_use]
     pub const fn model(mut self, model: Model) -> Self {
         self.config.model = model;
+        // Workers AI is a stateless chat binding behind the host Responses adapter.
+        // Preserve the agent loop while selecting its existing full-replay HTTP path.
+        if matches!(model, Model::Glm53 | Model::Kimi | Model::Mimo) {
+            self.config.responses_transport = ResponsesTransport::Https;
+            self.config.responses_history = ResponsesHistory::FullReplay;
+            self.config.store_responses = false;
+            self.config.websocket_warmup = false;
+        }
+        if !self.config.thinking_explicit {
+            self.config.thinking = model.default_thinking();
+        }
+        if self.config.context_window_tokens > model.max_context_window_tokens() {
+            self.config.context_window_tokens = model.max_context_window_tokens();
+        }
         self
     }
 
     /// Prepends a namespace to supported model identifiers on the wire.
     ///
     /// For example, an OpenAI routing gateway may expose Sol as
-    /// `openai/gpt-5.6-sol` while Nanocodex continues to retain `Model::Sol`
+    /// `openai/gpt-6.1-sol` while Nanocodex continues to retain `Model::Sol`
     /// for model-specific behavior, pricing, compaction, and snapshots. This
     /// changes only the wire identifier for the closed [`Model`] enum; it is
     /// not an alternate provider or arbitrary-model surface. [`Self::build`]
@@ -155,6 +190,29 @@ impl<F> OpenAiBuilder<F> {
         if matches!(transport, ResponsesTransport::Https) && !self.config.store_responses {
             self.config.responses_history = ResponsesHistory::FullReplay;
         }
+        self
+    }
+
+    /// Controls the optional non-generating request used to prewarm a
+    /// persistent Responses WebSocket before its first model call.
+    ///
+    /// This is enabled by default to match Codex: session startup primes the
+    /// immutable tools and instructions, and the first model call reuses the
+    /// resulting response chain on the same connection.
+    #[must_use]
+    pub const fn websocket_warmup(mut self, enabled: bool) -> Self {
+        self.config.websocket_warmup = enabled;
+        self
+    }
+
+    /// Controls complete raw `api.event` telemetry from the standard transport.
+    ///
+    /// Enabled by default. Disable this when only normalized output and transport
+    /// progress are needed: raw payloads are skipped before event serialization.
+    /// The policy is inherited by sessions and agents created from this client.
+    #[must_use]
+    pub const fn raw_api_events(mut self, enabled: bool) -> Self {
+        self.config.raw_api_events = enabled;
         self
     }
 
@@ -189,6 +247,17 @@ impl<F> OpenAiBuilder<F> {
         self
     }
 
+    /// Requires each Responses request to produce output matching a JSON Schema.
+    ///
+    /// The format is sent as `text.format` with `type: "json_schema"` and
+    /// strict validation enabled. This setting is inherited by sessions and
+    /// agents created from this client.
+    #[must_use]
+    pub fn strict_json_schema(mut self, schema: StrictJsonSchema) -> Self {
+        self.config.strict_json_schema = Some(schema);
+        self
+    }
+
     /// Sets the default reasoning effort for new sessions and agents.
     ///
     /// A higher-level session or agent builder may override this reusable
@@ -196,6 +265,7 @@ impl<F> OpenAiBuilder<F> {
     #[must_use]
     pub const fn thinking(mut self, thinking: Thinking) -> Self {
         self.config.thinking = thinking;
+        self.config.thinking_explicit = true;
         self
     }
 
@@ -216,6 +286,17 @@ impl<F> OpenAiBuilder<F> {
     #[must_use]
     pub const fn fast_mode(mut self, enabled: bool) -> Self {
         self.config.fast_mode = enabled;
+        self
+    }
+
+    /// Sets the selected model's context window used for accounting and compaction.
+    ///
+    /// Nanocodex defaults to 272,000 tokens to stay below long-context pricing.
+    /// Values above the selected model's advertised maximum are clamped.
+    #[must_use]
+    pub const fn context_window_tokens(mut self, tokens: u64) -> Self {
+        let maximum = self.config.model.max_context_window_tokens();
+        self.config.context_window_tokens = if tokens > maximum { maximum } else { tokens };
         self
     }
 
@@ -312,6 +393,7 @@ impl<F> OpenAiBuilder<F> {
     ///             Ok::<_, ResponseError>(ResponsesServiceResponse::new(
     ///                 ResponsesOutput::Generation(GenerationOutput {
     ///                     id: "resp_adapter_01".to_owned(),
+    ///                     reported_model: None,
     ///                     status: "completed".to_owned(),
     ///                     end_turn: Some(true),
     ///                     final_message: Some("served by the adapter".to_owned()),
@@ -514,6 +596,31 @@ fn apply_mode_defaults(config: &mut ModelConfig, mode: OpenAiAuthMode) {
 
 fn validate(config: &ModelConfig) -> Result<(), OpenAiError> {
     config.auth.validate()?;
+    if !config.model.supports_thinking(config.thinking) {
+        return Err(OpenAiError::InvalidConfiguration {
+            detail: (if config.model == Model::Glm53 {
+                "GLM-5.3 requires low, medium, or high reasoning effort"
+            } else if config.model == Model::Sol {
+                "GPT-6.1 Sol requires low, medium, high, xhigh, or max reasoning effort"
+            } else {
+                "GPT-6 Astra requires low, medium, high, xhigh, or max reasoning effort"
+            }),
+        });
+    }
+    if !config.model.supports_reasoning_mode(config.reasoning_mode) {
+        return Err(OpenAiError::InvalidConfiguration {
+            detail: (if config.model == Model::Glm53 {
+                "GLM-5.3 does not support pro reasoning mode"
+            } else {
+                "GPT-6 Astra does not support pro reasoning mode"
+            }),
+        });
+    }
+    if config.context_window_tokens == 0 {
+        return Err(OpenAiError::InvalidConfiguration {
+            detail: "the model context window must be greater than zero",
+        });
+    }
     if config.websocket_url.trim().is_empty() {
         return Err(OpenAiError::InvalidConfiguration {
             detail: "the Responses WebSocket URL must not be empty",
@@ -576,9 +683,12 @@ mod tests {
     use ::tower::{Service, service_fn, timeout::TimeoutLayer};
 
     use crate::{
-        ModelConfig, OpenAiAuthMode, ResponseError, ResponsesAttempt, ResponsesHistory,
-        ResponsesServiceResponse, ResponsesTransport,
+        Model, ModelConfig, OpenAiAuthMode, ResponseError, ResponsesAttempt, ResponsesHistory,
+        ResponsesServiceResponse, ResponsesTransport, Thinking,
+        responses::{RequestProfile, StrictJsonSchema},
     };
+    use serde_json::json;
+    use std::sync::Arc;
 
     use super::{OpenAi, apply_mode_defaults};
 
@@ -603,20 +713,6 @@ mod tests {
     }
 
     #[test]
-    fn one_client_recipe_builds_independent_sessions() {
-        let client = OpenAi::builder("test-key")
-            .service(|| NeverCalled)
-            .build()
-            .unwrap();
-
-        let session = client.instructions("Answer only from supplied facts.");
-        let first = session.clone().build().unwrap();
-        let second = session.build().unwrap();
-
-        assert_ne!(first.id(), second.id());
-    }
-
-    #[test]
     fn response_storage_is_opt_in_for_both_auth_modes() {
         for mode in [OpenAiAuthMode::ApiKey, OpenAiAuthMode::ChatGpt] {
             let mut config = ModelConfig {
@@ -629,18 +725,123 @@ mod tests {
     }
 
     #[test]
-    fn api_key_can_opt_into_https_checkpoints() {
+    fn strict_json_schema_is_sent_in_the_text_format() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": false
+        });
         let client = OpenAi::builder("test-key")
-            .transport(ResponsesTransport::Https)
-            .store(true)
+            .strict_json_schema(StrictJsonSchema::new("answer", schema.clone()))
             .build()
             .unwrap();
+        let profile = RequestProfile::new("schema-session", "schema-cache", Arc::from([]));
+        let request = serde_json::to_value(crate::responses::ResponseCreate::warmup(
+            client.config(),
+            Model::Astra,
+            Thinking::Low,
+            false,
+            &profile,
+            None,
+        ))
+        .expect("request should serialize");
 
-        assert!(client.config.store_responses);
+        assert_eq!(
+            request["text"],
+            json!({
+                "verbosity": "low",
+                "format": {
+                    "type": "json_schema",
+                    "strict": true,
+                    "name": "answer",
+                    "schema": schema
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn glm53_selects_stateless_https_without_websocket_probe() {
+        let client = OpenAi::builder("test-key")
+            .model(Model::Glm53)
+            .service(|| NeverCalled)
+            .build()
+            .unwrap();
+        assert_eq!(client.config.responses_transport, ResponsesTransport::Https);
         assert_eq!(
             client.config.responses_history,
-            ResponsesHistory::Incremental
+            ResponsesHistory::FullReplay
         );
+        assert!(!client.config.store_responses);
+        assert!(!client.config.websocket_warmup);
+    }
+
+    #[test]
+    fn context_window_defaults_and_clamps_to_supported_model_limit() {
+        let default = OpenAi::builder("test-key")
+            .service(|| NeverCalled)
+            .build()
+            .unwrap();
+        assert_eq!(
+            default.config.context_window_tokens,
+            crate::CONTEXT_WINDOW_TOKENS
+        );
+
+        let maximum = OpenAi::builder("test-key")
+            .context_window_tokens(u64::MAX)
+            .service(|| NeverCalled)
+            .build()
+            .unwrap();
+        assert_eq!(
+            maximum.config.context_window_tokens,
+            Model::default().max_context_window_tokens()
+        );
+
+        let astra_maximum = OpenAi::builder("test-key")
+            .model(Model::Astra)
+            .context_window_tokens(u64::MAX)
+            .service(|| NeverCalled)
+            .build()
+            .unwrap();
+        assert_eq!(
+            astra_maximum.config.context_window_tokens,
+            crate::MAX_CONTEXT_WINDOW_TOKENS
+        );
+
+        let error = OpenAi::builder("test-key")
+            .context_window_tokens(0)
+            .service(|| NeverCalled)
+            .build()
+            .err()
+            .expect("zero context window should fail validation");
+        assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn astra_rejects_unsupported_none_reasoning() {
+        let error = OpenAi::builder("test-key")
+            .model(crate::Model::Astra)
+            .thinking(crate::Thinking::None)
+            .service(|| NeverCalled)
+            .build()
+            .err()
+            .expect("Astra none reasoning should fail validation");
+
+        assert!(error.to_string().contains("GPT-6 Astra requires low"));
+    }
+
+    #[test]
+    fn astra_rejects_unsupported_pro_reasoning_mode() {
+        let error = OpenAi::builder("test-key")
+            .model(crate::Model::Astra)
+            .reasoning_mode(crate::ReasoningMode::Pro)
+            .service(|| NeverCalled)
+            .build()
+            .err()
+            .expect("Astra pro reasoning mode should fail validation");
+
+        assert!(error.to_string().contains("does not support pro"));
     }
 
     #[test]

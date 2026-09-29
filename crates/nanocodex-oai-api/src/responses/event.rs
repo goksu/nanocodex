@@ -91,7 +91,11 @@ pub enum ServerEvent {
     #[serde(rename = "response.reasoning_summary_part.added")]
     ReasoningSummaryPartAdded { summary_index: i64 },
     #[serde(rename = "response.output_item.done")]
-    OutputItemDone { item: ResponseItem },
+    OutputItemDone {
+        #[serde(default)]
+        output_index: Option<u32>,
+        item: ResponseItem,
+    },
     #[serde(rename = "response.completed")]
     Completed { response: CompletedResponse },
     #[serde(rename = "response.failed")]
@@ -218,7 +222,7 @@ impl ServerEvent {
                     summary_index: *summary_index,
                 })
             }
-            Self::OutputItemDone { item } => Some(ResponseEvent::OutputItemDone(item.clone())),
+            Self::OutputItemDone { item, .. } => Some(ResponseEvent::OutputItemDone(item.clone())),
             Self::Completed { response } => Some(ResponseEvent::Completed {
                 usage: response.usage.clone(),
                 end_turn: response.end_turn,
@@ -268,6 +272,8 @@ pub struct WarmupResponse {
 #[derive(Deserialize)]
 pub struct CompletedResponse {
     pub id: String,
+    #[serde(default)]
+    pub model: Option<String>,
     #[serde(default = "completed_status")]
     pub status: String,
     #[serde(default)]

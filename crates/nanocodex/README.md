@@ -6,6 +6,9 @@ This crate contains no second runtime implementation. It re-exports the owned
 agent lifecycle and gives the lower-level crates stable, named module paths.
 Depending on `nanocodex-agent` directly creates the same agent.
 
+Upgrading from 0.5? Read the [Rust API changelog and migration guide](https://github.com/gakonst/nanocodex/blob/v0.6.0/docs/MIGRATING_0_6.md)
+for breaking signatures, changed defaults, and snapshot/tool migrations.
+
 ## Quick start
 
 Build one owned agent, keep its cheap cloneable handle, and await typed turn
@@ -40,17 +43,19 @@ not wait for the turn's optional event stream to be consumed. Follow-on prompts
 reuse the same retained context and transport without asking the caller to
 manage response IDs or history.
 
-`gpt-5.6-sol` is the default; `.model(Model::Terra)` and `.model(Model::Luna)`
-select the other supported models when creating the agent. The selected model
-remains fixed for the thread so follow-on turns can continue from the provider
+`gpt-6-astra` with low reasoning is the SDK default; `.model(Model::Sol)` and
+`.model(Model::Luna)` select the other supported models
+when creating the agent. Model selection uses the catalog's default reasoning
+unless an effort was explicitly selected. Astra requires low or greater reasoning. A caller may change the model
+before the first turn is accepted; it then remains fixed for the thread so follow-on turns can continue from the provider
 checkpoint without replaying the complete retained context.
 
 ## Usage and USD estimates
 
-Every completed turn reports aggregate provider usage. Cost remains explicit:
-Nanocodex automatically applies the selected model's published standard or
-priority rates. Terra and Luna use their documented rates rather than Sol's
-higher rates.
+When the provider reports aggregate usage for a completed turn, cost remains
+explicit: Nanocodex automatically applies the selected model's published
+standard or priority rates. Every supported model, including Astra, uses its
+own published rates and long-context multipliers.
 
 ```rust,no_run
 use nanocodex::{Nanocodex, OpenAi};
@@ -62,10 +67,12 @@ let (agent, _events) = Nanocodex::builder(openai)
     .build()?;
 
 let result = agent.prompt("Explain the identifier req_7f3.").await?.await?;
-if let Some(cost) = result.usage().estimated_cost() {
-    println!("estimated {}", cost.amount());
-} else {
-    println!("cost unavailable: {}", result.usage().cost_status().as_str());
+if let Some(usage) = result.usage() {
+    if let Some(cost) = usage.estimated_cost() {
+        println!("estimated {}", cost.amount());
+    } else {
+        println!("cost unavailable: {}", usage.cost_status().as_str());
+    }
 }
 agent.shutdown().await?;
 # Ok(())
@@ -78,6 +85,8 @@ The root exports only the golden-path types. Reach for a named module when an
 embedding needs more control:
 
 - [`agent`] — lifecycle policy, events, input, sessions, usage, and rollout
+- [`durability`] — optional durable admission, effect replay, checkpoints, and
+  host-store contracts layered over an agent
 - [`oai`] — managed Responses sessions and the concrete Tower boundary
 - [`tools`] — tool contracts, built-ins, Code Mode, and MCP
 - `observability` — native tracing and OTLP setup when the default-off
@@ -96,6 +105,7 @@ when reaching for its detailed API:
 ```rust
 use nanocodex::{Nanocodex, OpenAi};
 use nanocodex::agent::{events::AgentEvent, session::SessionSnapshot};
+use nanocodex::durability::{DurableSession, MemoryStore};
 use nanocodex::oai::tower::ResponsesAttempt;
 use nanocodex::tools::mcp::Mcp;
 
@@ -104,6 +114,8 @@ use nanocodex::tools::mcp::Mcp;
 #     _: Option<OpenAi>,
 #     _: Option<AgentEvent>,
 #     _: Option<SessionSnapshot>,
+#     _: Option<DurableSession>,
+#     _: Option<MemoryStore>,
 #     _: Option<ResponsesAttempt>,
 #     _: Option<Mcp>,
 # ) {}
@@ -115,4 +127,5 @@ intentionally does not repeat sibling convenience exports: provider
 configuration belongs under [`oai`], tool implementation belongs under
 [`tools`], and lifecycle state belongs under [`agent`]. Applications that need
 only one component can depend on its package directly and use
-`nanocodex_oai_api`, `nanocodex_tools`, or `nanocodex_agent`.
+`nanocodex_oai_api`, `nanocodex_tools`, `nanocodex_agent`, or
+`nanocodex_durability`.

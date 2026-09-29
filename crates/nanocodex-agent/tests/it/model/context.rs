@@ -131,7 +131,7 @@ async fn fork_replaces_or_removes_changed_agents_md_once() -> Result<()> {
         let replaced = next_json(&mut replacement).await?;
         assert!(replaced.get("previous_response_id").is_none());
         let replaced = replaced.to_string();
-        assert!(replaced.contains("creation-time agents"));
+        assert_eq!(replaced.matches("creation-time agents").count(), 1);
         assert!(replaced.contains(
             "These AGENTS.md instructions replace all previously provided AGENTS.md instructions."
         ));
@@ -147,7 +147,7 @@ async fn fork_replaces_or_removes_changed_agents_md_once() -> Result<()> {
         let removed = next_json(&mut removal).await?;
         assert!(removed.get("previous_response_id").is_none());
         let removed = removed.to_string();
-        assert!(removed.contains("creation-time agents"));
+        assert_eq!(removed.matches("creation-time agents").count(), 1);
         assert!(
             removed.contains("The previously provided AGENTS.md instructions no longer apply.")
         );
@@ -224,7 +224,7 @@ async fn fork_reloads_a_changed_global_agents_source_once() -> Result<()> {
         let replaced = next_json(&mut fork).await?;
         assert!(replaced.get("previous_response_id").is_none());
         let replaced = replaced.to_string();
-        assert!(replaced.contains("original global agents"));
+        assert_eq!(replaced.matches("original global agents").count(), 1);
         assert!(replaced.contains("replacement global agents"));
         assert_eq!(
             replaced.matches("replace all previously provided").count(),
@@ -305,7 +305,11 @@ async fn legacy_snapshot_reconstructs_agents_md_before_diffing() -> Result<()> {
         .session_id(test_session_id())
         .build()?;
     let first = agent.prompt("first prompt").await?.result().await?;
-    let mut legacy = serde_json::to_value(first.snapshot())?;
+    let mut legacy = serde_json::to_value(
+        first
+            .snapshot()
+            .expect("local turns always retain a snapshot"),
+    )?;
     legacy
         .as_object_mut()
         .ok_or_else(|| eyre!("snapshot is not an object"))?

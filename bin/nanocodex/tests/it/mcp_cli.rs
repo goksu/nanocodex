@@ -23,6 +23,7 @@ async fn repeated_cli_turns_search_and_call_mcp_through_the_library() -> Result<
             .current_dir(&workspace)
             .env_remove("OPENAI_API_KEY")
             .arg("run")
+            .arg("--browser=none")
             .arg("--api-key")
             .arg("test-key")
             .arg("--websocket-url")

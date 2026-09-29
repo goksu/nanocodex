@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 #[cfg(any(
     all(target_os = "linux", not(target_env = "musl")),
@@ -10,19 +10,33 @@ mod egress;
 mod resource;
 
 use self::egress::TempoEgress;
+use alloy_primitives::Address;
 use clap::{ArgAction, Args, builder::NonEmptyStringValueParser};
 use eyre::{Context, Result, eyre};
 use mpp::{
-    MppError, PaymentChallenge, PaymentCredential,
-    client::{PaymentProvider, TempoAccountsProvider, tempo::AutoswapConfig},
+    client::{
+        PaymentContext, TempoAccountsProvider,
+        tempo::{
+            AutoswapConfig,
+            session::store::{SqliteChannelStore, SqliteChannelStoreOptions},
+        },
+    },
+    mcp::{
+        client::{McpPayment, PendingPayment},
+        credential_value, extract_challenges_from_data,
+    },
     protocol::{
-        core::accept_payment::{ACCEPT_PAYMENT_HEADER, from_methods},
-        intents::ChargeRequest,
+        core::{
+            PaymentChallenge,
+            accept_payment::{ACCEPT_PAYMENT_HEADER, from_methods},
+        },
         methods::tempo::{INTENT_CHARGE, METHOD_NAME},
     },
 };
+use nanocodex::tools::mcp::{McpPaymentProvider, McpPendingPayment};
 use nanocodex_egress::EgressProxy;
 use nanousd::{NANOUSD_ADDRESS, TEMPO_MAINNET_CHAIN_ID};
+use serde_json::Value;
 
 #[cfg(any(
     all(target_os = "linux", not(target_env = "musl")),
@@ -34,7 +48,8 @@ use crate::vm::EgressLease;
 
 const DEFAULT_MPP_API_BASE_URL: &str = "https://openai.mpp.tempo.xyz/v1";
 const DEFAULT_TEMPO_SWAP_SLIPPAGE_BPS: u16 = 100;
-const DEFAULT_MAX_EGRESS_CHARGE: u128 = 100_000;
+const DEFAULT_MCP_SESSION_MAX_DEPOSIT: u128 = 50_000;
+const DEFAULT_MCP_SESSION_TOP_UP: u128 = 50_000;
 #[cfg(any(
     all(target_os = "linux", not(target_env = "musl")),
     all(target_os = "macos", target_arch = "aarch64")
@@ -59,7 +74,7 @@ pub(crate) struct MppArgs {
     )]
     openai: bool,
 
-    /// Pay for HTTPS Responses and tool requests with `NanoUSD` Charge.
+    /// Pay for HTTPS Responses and tool requests with Tempo Charge.
     #[arg(
         long = "provider.tempo",
         id = "tempo",
@@ -89,7 +104,16 @@ pub(crate) struct MppArgs {
     )]
     wallet_store: Option<PathBuf>,
 
-    /// Maximum slippage for automatic swaps from `NanoUSD`, in basis points.
+    /// Preferred payment token and automatic-swap input currency.
+    #[arg(
+        long = "provider.tempo.payment-token",
+        global = true,
+        env = "NANOCODEX_PROVIDER_TEMPO_PAYMENT_TOKEN",
+        default_value_t = NANOUSD_ADDRESS
+    )]
+    payment_token: Address,
+
+    /// Maximum slippage for automatic swaps from the payment token, in basis points.
     #[arg(
         long = "provider.tempo.swap-slippage-bps",
         global = true,
@@ -97,15 +121,6 @@ pub(crate) struct MppArgs {
         default_value_t = DEFAULT_TEMPO_SWAP_SLIPPAGE_BPS
     )]
     swap_slippage_bps: u16,
-
-    /// Maximum one-shot Charge payment in `NanoUSD` atomic units.
-    #[arg(
-        long = "provider.tempo.egress-max-charge",
-        global = true,
-        env = "NANOCODEX_PROVIDER_TEMPO_EGRESS_MAX_CHARGE",
-        default_value_t = DEFAULT_MAX_EGRESS_CHARGE
-    )]
-    egress_max_charge: u128,
 
     /// Optional access key for gated MPP deployments.
     #[arg(
@@ -145,15 +160,14 @@ impl MppArgs {
         )?;
         let provider = provider
             .with_expected_chain_id(TEMPO_MAINNET_CHAIN_ID)
-            .with_preferred_currency(NANOUSD_ADDRESS)
-            .with_autoswap(AutoswapConfig::new(NANOUSD_ADDRESS, self.swap_slippage_bps));
-        let provider = CappedChargeProvider {
-            provider,
-            max_charge: self.egress_max_charge,
-        };
+            .with_preferred_currency(self.payment_token)
+            .with_autoswap(AutoswapConfig::new(
+                self.payment_token,
+                self.swap_slippage_bps,
+            ));
         let egress = EgressProxy::builder()
             .allow_loopback_upstreams(allow_loopback)
-            .layer(TempoEgress::new(provider))
+            .layer(TempoEgress::new(provider.clone()))
             .spawn()
             .await
             .wrap_err("failed to start the embedded MPP egress proxy")?;
@@ -161,58 +175,9 @@ impl MppArgs {
         Ok(Some(MppAdapter {
             api_base_url,
             mpp_api_key: self.mpp_api_key,
+            provider,
             egress: Some(egress),
         }))
-    }
-}
-
-#[derive(Clone)]
-struct CappedChargeProvider<P> {
-    provider: P,
-    max_charge: u128,
-}
-
-impl<P> PaymentProvider for CappedChargeProvider<P>
-where
-    P: PaymentProvider,
-{
-    fn supports(&self, method: &str, intent: &str) -> bool {
-        self.provider.supports(method, intent)
-    }
-
-    fn select_challenge<'a>(
-        &self,
-        challenges: &[&'a PaymentChallenge],
-    ) -> Option<&'a PaymentChallenge> {
-        self.provider.select_challenge(challenges)
-    }
-
-    async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
-        challenge
-            .request
-            .decode::<ChargeRequest>()?
-            .validate_max_amount(&self.max_charge.to_string())?;
-        self.provider.pay(challenge).await
-    }
-
-    async fn commit_payment(
-        &self,
-        challenge: &PaymentChallenge,
-        credential: &PaymentCredential,
-    ) -> Result<(), MppError> {
-        self.provider.commit_payment(challenge, credential).await
-    }
-
-    async fn rollback_payment(
-        &self,
-        challenge: &PaymentChallenge,
-        credential: &PaymentCredential,
-    ) -> Result<(), MppError> {
-        self.provider.rollback_payment(challenge, credential).await
-    }
-
-    fn accept_payment_header(&self) -> Option<String> {
-        self.provider.accept_payment_header()
     }
 }
 
@@ -252,6 +217,7 @@ fn normalize_api_base_url(value: &str) -> Result<String> {
 pub(crate) struct MppAdapter {
     api_base_url: String,
     mpp_api_key: Option<String>,
+    provider: TempoAccountsProvider,
     egress: Option<EgressProxy>,
 }
 
@@ -341,6 +307,25 @@ impl MppAdapter {
             .wrap_err("failed to configure the MPP-aware tool HTTP client")
     }
 
+    pub(crate) fn mcp_payment_provider(&self, url: &str) -> Result<Arc<dyn McpPaymentProvider>> {
+        let store = SqliteChannelStore::open(SqliteChannelStoreOptions {
+            namespace: url.to_owned(),
+            request_url: Some(url.to_owned()),
+            ..Default::default()
+        })
+        .wrap_err("failed to open the durable Tempo MCP channel store")?;
+        let provider = self
+            .provider
+            .clone()
+            .with_session_store(Arc::new(store))
+            .with_session_max_deposit(DEFAULT_MCP_SESSION_MAX_DEPOSIT)
+            .with_session_top_up_amount(DEFAULT_MCP_SESSION_TOP_UP);
+        Ok(Arc::new(TempoMcpPayment::new(
+            provider,
+            url.parse().wrap_err("Tempo MCP URL is invalid")?,
+        )))
+    }
+
     pub(crate) async fn shutdown(mut self) -> Result<()> {
         if let Some(egress) = self.egress.take() {
             egress
@@ -349,6 +334,86 @@ impl MppAdapter {
                 .wrap_err("failed to stop the embedded MPP egress proxy")?;
         }
         Ok(())
+    }
+}
+
+struct TempoMcpPayment {
+    payment: McpPayment<TempoAccountsProvider>,
+}
+
+impl TempoMcpPayment {
+    fn new(provider: TempoAccountsProvider, resource_url: reqwest::Url) -> Self {
+        Self {
+            payment: McpPayment::new(
+                provider,
+                PaymentContext {
+                    url: resource_url,
+                    headers: reqwest::header::HeaderMap::new(),
+                },
+            ),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl McpPaymentProvider for TempoMcpPayment {
+    async fn prepare(
+        &self,
+        payment_required: &Value,
+    ) -> Result<Option<Box<dyn McpPendingPayment>>, String> {
+        let challenges: Vec<PaymentChallenge> = extract_challenges_from_data(payment_required)
+            .ok_or_else(|| "MCP payment-required payload has no valid challenges".to_owned())?;
+        let Some(pending) = self
+            .payment
+            .prepare(&challenges)
+            .await
+            .map_err(|error| format!("failed to prepare Tempo MCP payment: {error}"))?
+        else {
+            return Ok(None);
+        };
+        let credential = match credential_value(pending.credential()) {
+            Ok(credential) => credential,
+            Err(error) => {
+                let rollback = pending.rollback().await;
+                let mut message = format!("failed to encode Tempo MCP credential: {error}");
+                if let Err(rollback) = rollback {
+                    message.push_str(&format!("; rollback failed: {rollback}"));
+                }
+                return Err(message);
+            }
+        };
+        Ok(Some(Box::new(TempoPendingMcpPayment {
+            pending,
+            credential,
+        })))
+    }
+}
+
+struct TempoPendingMcpPayment {
+    pending: PendingPayment<TempoAccountsProvider>,
+    credential: Value,
+}
+
+#[async_trait::async_trait]
+impl McpPendingPayment for TempoPendingMcpPayment {
+    fn credential(&self) -> &Value {
+        &self.credential
+    }
+
+    async fn commit(self: Box<Self>) -> Result<(), String> {
+        let Self { pending, .. } = *self;
+        pending
+            .commit()
+            .await
+            .map_err(|error| format!("failed to commit Tempo MCP payment: {error}"))
+    }
+
+    async fn rollback(self: Box<Self>) -> Result<(), String> {
+        let Self { pending, .. } = *self;
+        pending
+            .rollback()
+            .await
+            .map_err(|error| format!("failed to roll back Tempo MCP payment: {error}"))
     }
 }
 
@@ -371,71 +436,13 @@ fn responses_payment_headers(api_key: Option<&str>) -> Result<reqwest::header::H
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
-
-    use mpp::{Base64UrlJson, PaymentPayload};
-
     use super::*;
+    use clap::Parser;
 
-    #[derive(Clone, Default)]
-    struct MockProvider {
-        payments: Arc<AtomicUsize>,
-        commits: Arc<AtomicUsize>,
-        rollbacks: Arc<AtomicUsize>,
-        select_last: bool,
-    }
-
-    impl MockProvider {
-        fn selecting_last(mut self) -> Self {
-            self.select_last = true;
-            self
-        }
-    }
-
-    impl PaymentProvider for MockProvider {
-        fn supports(&self, method: &str, intent: &str) -> bool {
-            method == "tempo" && intent == "charge"
-        }
-
-        fn select_challenge<'a>(
-            &self,
-            challenges: &[&'a PaymentChallenge],
-        ) -> Option<&'a PaymentChallenge> {
-            if self.select_last {
-                challenges.last().copied()
-            } else {
-                challenges.first().copied()
-            }
-        }
-
-        async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
-            self.payments.fetch_add(1, Ordering::SeqCst);
-            Ok(PaymentCredential::new(
-                challenge.to_echo(),
-                PaymentPayload::hash("paid"),
-            ))
-        }
-
-        async fn commit_payment(
-            &self,
-            _: &PaymentChallenge,
-            _: &PaymentCredential,
-        ) -> Result<(), MppError> {
-            self.commits.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-
-        async fn rollback_payment(
-            &self,
-            _: &PaymentChallenge,
-            _: &PaymentCredential,
-        ) -> Result<(), MppError> {
-            self.rollbacks.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        mpp: MppArgs,
     }
 
     fn test_args() -> MppArgs {
@@ -444,44 +451,30 @@ mod tests {
             enabled: false,
             api_base_url: DEFAULT_MPP_API_BASE_URL.to_owned(),
             wallet_store: None,
+            payment_token: NANOUSD_ADDRESS,
             swap_slippage_bps: DEFAULT_TEMPO_SWAP_SLIPPAGE_BPS,
-            egress_max_charge: DEFAULT_MAX_EGRESS_CHARGE,
             mpp_api_key: None,
         }
-    }
-
-    fn challenge(amount: &str) -> PaymentChallenge {
-        let request = Base64UrlJson::from_value(&serde_json::json!({
-            "amount": amount,
-            "currency": NANOUSD_ADDRESS,
-            "recipient": "0x1111111111111111111111111111111111111111",
-            "methodDetails": {"chainId": TEMPO_MAINNET_CHAIN_ID},
-        }))
-        .unwrap();
-        PaymentChallenge::new("challenge", "api.example.com", "tempo", "charge", request)
-    }
-
-    #[test]
-    fn capped_provider_preserves_inner_challenge_selection() {
-        let provider = CappedChargeProvider {
-            provider: MockProvider::default().selecting_last(),
-            max_charge: DEFAULT_MAX_EGRESS_CHARGE,
-        };
-        let first = challenge("1");
-        let mut preferred = challenge("1");
-        preferred.id = "preferred".to_owned();
-
-        assert_eq!(
-            provider
-                .select_challenge(&[&first, &preferred])
-                .map(|challenge| challenge.id.as_str()),
-            Some("preferred")
-        );
     }
 
     #[tokio::test]
     async fn mpp_is_opt_in() {
         assert!(test_args().start().await.unwrap().is_none());
+    }
+
+    #[test]
+    fn payment_token_defaults_to_nanousd_and_accepts_pathusd() {
+        let default = TestCli::try_parse_from(["nanocodex"]).unwrap();
+        assert_eq!(default.mpp.payment_token, NANOUSD_ADDRESS);
+
+        let pathusd = alloy_primitives::address!("20c0000000000000000000000000000000000000");
+        let configured = TestCli::try_parse_from([
+            "nanocodex",
+            "--provider.tempo.payment-token",
+            "0x20c0000000000000000000000000000000000000",
+        ])
+        .unwrap();
+        assert_eq!(configured.mpp.payment_token, pathusd);
     }
 
     #[cfg(any(
@@ -518,47 +511,6 @@ mod tests {
             !name.contains("WALLET") && !name.contains("PRIVATE") && !name.contains("SECRET")
         }));
         adapter.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn charge_cap_is_checked_before_payment() {
-        let inner = MockProvider::default();
-        let payments = Arc::clone(&inner.payments);
-        let provider = CappedChargeProvider {
-            provider: inner,
-            max_charge: 100,
-        };
-
-        let error = provider.pay(&challenge("101")).await.unwrap_err();
-
-        assert!(matches!(error, MppError::AmountExceedsMax { .. }));
-        assert_eq!(payments.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn capped_provider_forwards_payment_lifecycle() {
-        let inner = MockProvider::default();
-        let payments = Arc::clone(&inner.payments);
-        let commits = Arc::clone(&inner.commits);
-        let rollbacks = Arc::clone(&inner.rollbacks);
-        let provider = CappedChargeProvider {
-            provider: inner,
-            max_charge: 100,
-        };
-        let challenge = challenge("100");
-        let credential = provider.pay(&challenge).await.unwrap();
-        provider
-            .commit_payment(&challenge, &credential)
-            .await
-            .unwrap();
-        provider
-            .rollback_payment(&challenge, &credential)
-            .await
-            .unwrap();
-
-        assert_eq!(payments.load(Ordering::SeqCst), 1);
-        assert_eq!(commits.load(Ordering::SeqCst), 1);
-        assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
     }
 
     #[test]

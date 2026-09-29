@@ -19,9 +19,15 @@ struct ShutdownState {
 #[derive(Clone, Default)]
 pub(in crate::agent) struct DriverShutdown {
     state: Arc<std::sync::Mutex<ShutdownState>>,
+    execution_policy_owned: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DriverShutdown {
+    pub(in crate::agent) fn set_execution_policy_owned(&self, owned: bool) {
+        self.execution_policy_owned
+            .store(owned, std::sync::atomic::Ordering::Release);
+    }
+
     pub(in crate::agent) fn request(&self) -> (bool, oneshot::Receiver<SharedShutdownResult>) {
         let (result, receiver) = oneshot::channel();
         let mut state = match self.state.lock() {
@@ -45,14 +51,6 @@ impl DriverShutdown {
         }
     }
 
-    pub(in crate::agent) fn requested(&self) -> bool {
-        let state = match self.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        !matches!(state.phase, ShutdownPhase::Running)
-    }
-
     pub(in crate::agent) fn complete(&self, outcome: Result<()>) {
         let outcome = outcome.map_err(Arc::new);
         let waiters = {
@@ -67,9 +65,105 @@ impl DriverShutdown {
             drop(waiter.send(outcome.clone()));
         }
     }
+
+    pub(in crate::agent) async fn stopped_error(&self) -> NanocodexError {
+        let receiver = {
+            let (result, receiver) = oneshot::channel();
+            let mut state = match self.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            match &state.phase {
+                ShutdownPhase::Complete(outcome) => {
+                    drop(result.send(outcome.clone()));
+                }
+                ShutdownPhase::Running | ShutdownPhase::Requested => {
+                    state.waiters.push(result);
+                }
+            }
+            receiver
+        };
+        let error = match receiver.await {
+            Ok(Err(error))
+                if matches!(
+                    error.execution_policy_disposition(),
+                    Some(crate::ExecutionPolicyDisposition::Reopen)
+                ) =>
+            {
+                NanocodexError::Shutdown(error)
+            }
+            Ok(Ok(()) | Err(_)) | Err(_) => NanocodexError::AgentStopped,
+        };
+        if matches!(error, NanocodexError::AgentStopped)
+            && self
+                .execution_policy_owned
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            NanocodexError::ExecutionPolicyOwnerStopped
+        } else {
+            error
+        }
+    }
 }
 
-pub(super) fn cancel_queued_turn(queued_turns: &mut VecDeque<QueuedTurn>, target: TurnKey) -> bool {
+pub(super) fn queued_execution_operation(
+    queued_turns: &VecDeque<QueuedTurn>,
+    target: TurnKey,
+) -> Option<(Option<ExecutionOperation>, Prompt)> {
+    queued_turns.iter().find_map(|queued| match queued {
+        QueuedTurn::Pending {
+            key,
+            execution_operation,
+            prompt,
+            ..
+        } if *key == target => Some((execution_operation.clone(), prompt.clone())),
+        _ => None,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) const fn queued_prompt(
+    key: TurnKey,
+    prompt: Prompt,
+    execution_operation: Option<ExecutionOperation>,
+    cancel_on_admission: bool,
+    thinking: Thinking,
+    fast_mode: bool,
+    parent: Option<tracing::Span>,
+    events: EventSink,
+    result: oneshot::Sender<Result<TurnResult>>,
+) -> QueuedTurn {
+    if cancel_on_admission {
+        QueuedTurn::Cancelled {
+            key,
+            prompt,
+            execution_operation,
+            cancellation_committed: false,
+            thinking,
+            fast_mode,
+            parent,
+            events,
+            result,
+        }
+    } else {
+        QueuedTurn::Pending {
+            key,
+            prompt,
+            execution_operation,
+            thinking,
+            fast_mode,
+            parent,
+            events,
+            result,
+        }
+    }
+}
+
+pub(super) fn cancel_queued_turn(
+    queued_turns: &mut VecDeque<QueuedTurn>,
+    target: TurnKey,
+    cancellation_committed: bool,
+) -> bool {
     let Some(position) = queued_turns
         .iter()
         .position(|queued| matches!(queued, QueuedTurn::Pending { key, .. } if *key == target))
@@ -80,7 +174,9 @@ pub(super) fn cancel_queued_turn(queued_turns: &mut VecDeque<QueuedTurn>, target
         return false;
     };
     let QueuedTurn::Pending {
+        key,
         prompt,
+        execution_operation,
         thinking,
         fast_mode,
         parent,
@@ -94,7 +190,10 @@ pub(super) fn cancel_queued_turn(queued_turns: &mut VecDeque<QueuedTurn>, target
     queued_turns.insert(
         position,
         QueuedTurn::Cancelled {
+            key,
             prompt,
+            execution_operation,
+            cancellation_committed,
             thinking,
             fast_mode,
             parent,
@@ -109,7 +208,9 @@ pub(super) fn mark_all_queued_turns_cancelled(queued_turns: &mut VecDeque<Queued
     let accepted = std::mem::take(queued_turns);
     queued_turns.extend(accepted.into_iter().map(|queued| match queued {
         QueuedTurn::Pending {
+            key,
             prompt,
+            execution_operation,
             thinking,
             fast_mode,
             parent,
@@ -117,7 +218,10 @@ pub(super) fn mark_all_queued_turns_cancelled(queued_turns: &mut VecDeque<Queued
             result,
             ..
         } => QueuedTurn::Cancelled {
+            key,
             prompt,
+            execution_operation,
+            cancellation_committed: false,
             thinking,
             fast_mode,
             parent,
@@ -138,23 +242,36 @@ pub(super) async fn begin_shutdown(
     while let Some(command) = commands.recv().await {
         match command {
             Command::Prompt {
+                accepted: Some(accepted),
+                result,
+                ..
+            } => {
+                drop(accepted.send(Err(NanocodexError::AgentStopped)));
+                drop(result);
+            }
+            Command::Prompt {
                 key,
                 prompt,
+                execution_operation,
+                accepted: None,
+                cancel_on_admission,
                 thinking,
                 fast_mode,
                 parent,
                 events,
                 result,
             } => {
-                queued_turns.push_back(QueuedTurn::Pending {
+                queued_turns.push_back(queued_prompt(
                     key,
                     prompt,
-                    thinking: thinking.unwrap_or(default_thinking),
-                    fast_mode: fast_mode.unwrap_or(default_fast_mode),
+                    execution_operation,
+                    cancel_on_admission,
+                    thinking.unwrap_or(default_thinking),
+                    fast_mode.unwrap_or(default_fast_mode),
                     parent,
                     events,
                     result,
-                });
+                ));
             }
             Command::RoutePrompt {
                 route_result,
@@ -164,14 +281,34 @@ pub(super) async fn begin_shutdown(
                 drop(route_result.send(Err(NanocodexError::AgentStopped)));
                 drop(turn_result);
             }
-            Command::Fork { result, .. } | Command::Spawn { result } => {
+            Command::Snapshot { result } => {
+                drop(result.send(Err(NanocodexError::AgentStopped)));
+            }
+            Command::ChildSnapshot { result } => {
+                drop(result.send(Err(NanocodexError::AgentStopped)));
+            }
+            Command::Fork { result, .. } => {
+                drop(result.send(Err(NanocodexError::AgentStopped)));
+            }
+            Command::Spawn { result, .. } => {
+                drop(result.send(Err(NanocodexError::AgentStopped)));
+            }
+            Command::SpawnBatch { result, .. } => {
                 drop(result.send(Err(NanocodexError::AgentStopped)));
             }
             Command::AppendDeveloperMessage { result, .. } => {
                 drop(result.send(Err(NanocodexError::AgentStopped)));
             }
-            Command::Steer { result, .. }
+            Command::Context { result } => {
+                drop(result.send(Err(NanocodexError::AgentStopped)));
+            }
+            Command::WithdrawSteer { result, .. } => {
+                drop(result.send(Err(NanocodexError::AgentStopped)));
+            }
+            Command::SteerWithId { result, .. }
+            | Command::Steer { result, .. }
             | Command::Cancel { result, .. }
+            | Command::SetModel { result, .. }
             | Command::SetThinking { result, .. }
             | Command::SetFastMode { result, .. }
             | Command::Compact { result, .. } => {
@@ -203,7 +340,36 @@ pub(super) fn handle_idle_command<S>(
     S::Future: AgentSend,
 {
     match command {
-        Command::Fork { checkpoint, result } => {
+        Command::Snapshot { result } => {
+            drop(
+                result.send(
+                    latest
+                        .ok_or(NanocodexError::ForkBeforeCompletedTurn)
+                        .map(|checkpoint| checkpoint.snapshot()),
+                ),
+            );
+        }
+        Command::ChildSnapshot { result } => {
+            drop(result.send(Ok(ChildRuntimeSnapshot {
+                session_id: session_id.to_owned(),
+                model: defaults.model,
+                thinking: defaults.thinking,
+                fast_mode: defaults.fast_mode,
+                stateless_http: matches!(
+                    spawner.config.responses_transport,
+                    ResponsesTransport::Https
+                ) && matches!(
+                    spawner.config.responses_history,
+                    ResponsesHistory::FullReplay
+                ) && !spawner.config.store_responses,
+                conversation: latest.map(|checkpoint| checkpoint.snapshot()),
+            })));
+        }
+        Command::Fork {
+            checkpoint,
+            result,
+            side_conversation,
+        } => {
             let checkpoint = checkpoint.or_else(|| latest.cloned());
             let outcome = checkpoint
                 .ok_or(NanocodexError::ForkBeforeCompletedTurn)
@@ -214,20 +380,56 @@ pub(super) fn handle_idle_command<S>(
                         defaults.model,
                         defaults.thinking,
                         defaults.fast_mode,
+                        spawner.host_context.as_ref().map(Arc::clone),
+                        side_conversation,
                     )
                 });
             drop(result.send(outcome));
         }
-        Command::Spawn { result } => {
-            drop(result.send(spawner.spawn_clean(
+        Command::Spawn {
+            restore,
+            options,
+            host_context,
+            result,
+        } => {
+            let model = options.model.unwrap_or(defaults.model);
+            let thinking = options.thinking.unwrap_or(defaults.thinking);
+            let outcome = validate_model_thinking(model, thinking).and_then(|()| {
+                if let Some(snapshot) = restore {
+                    return spawner.restore_child(snapshot, workspace, session_id, host_context);
+                }
+                spawner.spawn_clean(
+                    workspace,
+                    session_id,
+                    model,
+                    thinking,
+                    defaults.fast_mode,
+                    options.stateless_http,
+                    host_context.or_else(|| spawner.host_context.as_ref().map(Arc::clone)),
+                )
+            });
+            drop(result.send(outcome));
+        }
+        Command::SpawnBatch {
+            count,
+            observer,
+            host_context,
+            result,
+        } => {
+            let outcome = spawner.spawn_clean_many(
                 workspace,
                 session_id,
-                defaults.model,
-                defaults.thinking,
-                defaults.fast_mode,
-            )));
+                defaults,
+                count,
+                observer.as_deref(),
+                host_context,
+            );
+            drop(result.send(outcome));
         }
-        Command::Steer { result, .. } => {
+        Command::WithdrawSteer { result, .. } => {
+            drop(result.send(Ok(false)));
+        }
+        Command::SteerWithId { result, .. } | Command::Steer { result, .. } => {
             drop(result.send(Err(NanocodexError::TurnNotSteerable)));
         }
         Command::RoutePrompt {
@@ -244,6 +446,9 @@ pub(super) fn handle_idle_command<S>(
         Command::SetThinking { result, .. } | Command::SetFastMode { result, .. } => {
             drop(result.send(Ok(())));
         }
+        Command::SetModel { result, .. } => {
+            drop(result.send(Err(model_change_locked())));
+        }
         Command::Shutdown => {}
         Command::Compact { result, .. } => {
             drop(result.send(Err(NanocodexError::AgentStopped)));
@@ -251,6 +456,42 @@ pub(super) fn handle_idle_command<S>(
         Command::AppendDeveloperMessage { result, .. } => {
             drop(result.send(Err(NanocodexError::AgentStopped)));
         }
+        Command::Context { result } => {
+            drop(result.send(super::agent_session_context(
+                latest.map(AsRef::as_ref),
+                workspace.as_deref(),
+                &spawner.context_source,
+            )));
+        }
         Command::Prompt { .. } => {}
+    }
+}
+
+pub(super) fn model_change_locked() -> NanocodexError {
+    NanocodexError::InvalidRequest(
+        "the model can only be changed before the first turn is accepted".to_owned(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stopped_error_distinguishes_ordinary_and_policy_owned_agents() {
+        let ordinary = DriverShutdown::default();
+        ordinary.complete(Ok(()));
+        assert!(matches!(
+            ordinary.stopped_error().await,
+            NanocodexError::AgentStopped
+        ));
+
+        let policy_owned = DriverShutdown::default();
+        policy_owned.set_execution_policy_owned(true);
+        policy_owned.complete(Ok(()));
+        assert!(matches!(
+            policy_owned.stopped_error().await,
+            NanocodexError::ExecutionPolicyOwnerStopped
+        ));
     }
 }

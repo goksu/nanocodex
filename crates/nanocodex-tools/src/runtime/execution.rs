@@ -6,7 +6,7 @@ use super::*;
 /// normally owned privately by the higher-level agent driver.
 pub struct ToolRuntime {
     pub(super) registry: Arc<ToolRegistry>,
-    exposure: ToolExposure,
+    exposure: Option<ToolExposure>,
     deferred_tools_guidance_enabled: bool,
     code_mode: code_mode::CodeModeRuntime,
     sessions: Arc<ShellSessions>,
@@ -51,6 +51,11 @@ impl ToolRuntime {
         image_generation: Option<ImageGenerationConfig>,
         tools: &Tools,
     ) -> Self {
+        let workspace = tools
+            .workspace_tools
+            .as_ref()
+            .map(|workspace| workspace.root.clone())
+            .unwrap_or_else(|| workspace.into());
         Self::new_inner(
             workspace,
             web_search,
@@ -73,10 +78,7 @@ impl ToolRuntime {
         nanocodex_oai_api::transport::install_default_rustls_crypto_provider();
         let workspace = workspace.into();
         let current_turn = Arc::new(AtomicU64::new(0));
-        let sessions = Arc::new(ShellSessions::with_environment_and_turn(
-            process_environment,
-            Arc::clone(&current_turn),
-        ));
+        let sessions = Arc::new(ShellSessions::with_environment(process_environment));
         let default_shell_name = Arc::from(sessions.default_shell_name());
         let working_directory = Arc::from(workspace.to_string_lossy().into_owned());
         let code_mode_workspace = workspace.clone();
@@ -110,7 +112,7 @@ impl ToolRuntime {
         }
         Self {
             registry: Arc::new(ToolRegistry::from_ordered(handlers)),
-            exposure: ToolExposure::default(),
+            exposure: None,
             deferred_tools_guidance_enabled: false,
             code_mode: code_mode::CodeModeRuntime::new_with_turn(
                 code_mode_workspace,
@@ -123,19 +125,28 @@ impl ToolRuntime {
         }
     }
 
-    /// Extends this runtime with a validated declarative tool selection.
-    ///
-    /// Dynamic providers begin discovery immediately. Their [`DynamicToolProvider::start`]
-    /// implementations are required to be idempotent so callers may also start
-    /// discovery earlier during application think time.
-    #[must_use]
-    pub fn with_tools(mut self, tools: &Tools) -> Self {
+    fn with_tools(mut self, tools: &Tools) -> Self {
         tools.start_providers();
-        self.exposure = tools.exposure();
-        self.deferred_tools_guidance_enabled = tools.deferred_tools_guidance_enabled;
         let registry = Arc::make_mut(&mut self.registry);
-        registry.extend(tools.registered.iter().cloned());
-        registry.extend(tools.provider_direct.iter().cloned());
+        if self.exposure.is_none() {
+            let exposure = tools.exposure();
+            self.exposure = Some(exposure);
+            registry.set_all_exposures(exposure);
+        }
+        self.deferred_tools_guidance_enabled |= tools.deferred_tools_guidance_enabled;
+        registry.extend(tools.registered.iter().map(|tool| {
+            (
+                Arc::clone(&tool.handler),
+                tool.exposure.unwrap_or_else(|| tools.exposure()),
+            )
+        }));
+        registry.extend(
+            tools
+                .provider_direct
+                .iter()
+                .cloned()
+                .map(|tool| (tool, tools.exposure())),
+        );
         registry.providers.extend(tools.providers.iter().cloned());
         if let Some(working_directory) = &tools.working_directory {
             self.working_directory = Arc::clone(working_directory);
@@ -158,6 +169,21 @@ impl ToolRuntime {
         &self.working_directory
     }
 
+    #[cfg(test)]
+    pub(crate) async fn has_shell_session(&self, session_id: i64) -> bool {
+        self.sessions.contains(session_id).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn hold_code_mode_admission(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.code_mode.hold_admission().await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_code_mode_admission_attempt(&self) {
+        self.code_mode.wait_for_admission_attempt().await;
+    }
+
     #[doc(hidden)]
     #[must_use]
     pub fn control(&self) -> ToolRuntimeControl {
@@ -175,33 +201,27 @@ impl ToolRuntime {
     /// session.
     #[must_use]
     pub fn model_specs(&self, _session_id: &str) -> Vec<ToolDefinition> {
-        let mut nested = self
+        let mut nested = self.registry.registered_code_mode_definitions();
+        let provider_summaries = self.registry.code_mode_tool_summaries();
+        let mut direct = self
             .registry
-            .definitions()
-            .iter()
+            .direct_definitions()
             .filter(|definition| !matches!(definition, ToolDefinition::ToolSearch { .. }))
             .cloned()
             .collect::<Vec<_>>();
-        let mut direct = self
-            .registry
-            .definitions()
+        let code_mode_names = nested
             .iter()
-            .filter(|definition| {
-                self.exposure == ToolExposure::DirectAndCodeMode
-                    && !matches!(definition, ToolDefinition::ToolSearch { .. })
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if self.exposure == ToolExposure::DirectAndCodeMode {
-            direct = group_direct_code_mode_definitions(direct);
-            crate::code_mode_order::sort_direct_definitions(&mut direct);
-        }
+            .map(|definition| definition.name().to_owned())
+            .collect::<HashSet<_>>();
+        direct = group_direct_code_mode_definitions(direct, &code_mode_names);
+        crate::code_mode_order::sort_direct_definitions(&mut direct);
         crate::code_mode_order::sort_definitions(&mut nested);
         let mut native = vec![
             code_mode::exec_spec(
                 &nested,
+                &provider_summaries,
                 self.deferred_tools_guidance_enabled,
-                self.exposure == ToolExposure::CodeModeOnly,
+                self.exposure.unwrap_or_default() == ToolExposure::CodeModeOnly,
             ),
             code_mode::wait_spec(),
         ];
@@ -243,14 +263,19 @@ impl ToolRuntime {
     }
 
     /// Starts or resumes a Code Mode cell and observes its first terminal boundary.
-    pub async fn execute_code(&self, source: &str, context: ToolContext<'_>) -> CodeModeExecution {
-        self.code_mode
+    pub async fn execute_code(
+        &self,
+        source: &str,
+        context: ToolContext<'_>,
+    ) -> Result<CodeModeExecution, crate::embedded::CodeModeHostError> {
+        Ok(self
+            .code_mode
             .execute(
                 source,
                 Arc::clone(&self.registry),
                 OwnedToolContext::from_context(context),
             )
-            .await
+            .await)
     }
 
     #[doc(hidden)]
@@ -259,15 +284,16 @@ impl ToolRuntime {
         source: &str,
         context: ToolContext<'_>,
         observer: &mut dyn CodeModeObserver,
-    ) -> CodeModeExecution {
-        self.code_mode
+    ) -> Result<CodeModeExecution, crate::embedded::CodeModeHostError> {
+        Ok(self
+            .code_mode
             .execute_with_updates(
                 source,
                 Arc::clone(&self.registry),
                 OwnedToolContext::from_context(context),
                 observer,
             )
-            .await
+            .await)
     }
 
     /// Executes Code Mode without copying an already-owned history snapshot.
@@ -276,10 +302,11 @@ impl ToolRuntime {
         &self,
         source: &str,
         context: OwnedToolContext,
-    ) -> CodeModeExecution {
-        self.code_mode
+    ) -> Result<CodeModeExecution, crate::embedded::CodeModeHostError> {
+        Ok(self
+            .code_mode
             .execute(source, Arc::clone(&self.registry), context)
-            .await
+            .await)
     }
 
     #[doc(hidden)]
@@ -288,15 +315,20 @@ impl ToolRuntime {
         source: &str,
         context: OwnedToolContext,
         observer: &mut dyn CodeModeObserver,
-    ) -> CodeModeExecution {
-        self.code_mode
+    ) -> Result<CodeModeExecution, crate::embedded::CodeModeHostError> {
+        Ok(self
+            .code_mode
             .execute_with_updates(source, Arc::clone(&self.registry), context, observer)
-            .await
+            .await)
     }
 
     /// Waits for a previously yielded Code Mode cell.
-    pub async fn wait_for_code(&self, input: &str, context: ToolContext<'_>) -> CodeModeExecution {
-        self.code_mode.wait(input, context).await
+    pub async fn wait_for_code(
+        &self,
+        input: &str,
+        context: ToolContext<'_>,
+    ) -> Result<CodeModeExecution, crate::embedded::CodeModeHostError> {
+        Ok(self.code_mode.wait(input, context).await)
     }
 
     #[doc(hidden)]
@@ -305,15 +337,16 @@ impl ToolRuntime {
         input: &str,
         _context: ToolContext<'_>,
         observer: &mut dyn CodeModeObserver,
-    ) -> CodeModeExecution {
-        self.code_mode.wait_with_updates(input, observer).await
+    ) -> Result<CodeModeExecution, crate::embedded::CodeModeHostError> {
+        Ok(self.code_mode.wait_with_updates(input, observer).await)
     }
 
     /// Executes one registered or dynamically activated tool through this
     /// runtime's retained state.
     ///
     /// Shell sessions created by `exec_command` remain available to later
-    /// `write_stdin` calls on the same runtime.
+    /// `write_stdin` calls on the same runtime, including after cancellation
+    /// of the turn that started or last observed them.
     ///
     /// Handler panics become failed `aborted` outputs and never unwind through
     /// the runtime owner.
@@ -322,16 +355,23 @@ impl ToolRuntime {
         name: &str,
         input: ToolInput,
         context: ToolContext<'_>,
-    ) -> ToolOutput {
-        self.registry.execute_direct(name, input, context).await
+    ) -> Result<ToolOutput, crate::embedded::CodeModeHostError> {
+        Ok(self.registry.execute_direct(name, input, context).await)
     }
 }
 
-fn group_direct_code_mode_definitions(definitions: Vec<ToolDefinition>) -> Vec<ToolDefinition> {
+fn group_direct_code_mode_definitions(
+    definitions: Vec<ToolDefinition>,
+    code_mode_names: &HashSet<String>,
+) -> Vec<ToolDefinition> {
     let mut grouped = Vec::<ToolDefinition>::new();
     for definition in definitions {
         let canonical_name = definition.name().to_owned();
-        let mut definition = code_mode::description::augment_definition_for_code_mode(definition);
+        let mut definition = if code_mode_names.contains(&canonical_name) {
+            crate::code_mode_description::augment_definition_for_code_mode(definition)
+        } else {
+            definition
+        };
         let Some((namespace, name)) = canonical_name.rsplit_once("__") else {
             grouped.push(definition);
             continue;
@@ -376,18 +416,19 @@ impl ToolRuntimeControl {
     #[doc(hidden)]
     pub async fn cancel_turn(&self) {
         let turn_id = self.current_turn.load(Ordering::Acquire);
-        tokio::join!(
-            self.code_mode.terminate_turn(turn_id),
-            self.sessions.terminate_turn(turn_id)
-        );
+        // Shell sessions are owned by this runtime once spawned, not by the
+        // turn that launched or observed them. Full runtime cancellation below
+        // remains their explicit cleanup boundary.
+        self.code_mode.terminate_turn(turn_id).await;
     }
 
     #[doc(hidden)]
     pub async fn cancel(&self) {
-        tokio::join!(
-            self.code_mode.terminate_all(),
-            self.sessions.terminate_all()
-        );
+        // Code Mode cells can still be inside a nested exec_command. Quiesce
+        // and join every producer before draining the session-owned shells so
+        // no late registration can escape the shutdown boundary.
+        let _code_mode_quiescence = self.code_mode.terminate_all().await;
+        self.sessions.terminate_all().await;
     }
 }
 

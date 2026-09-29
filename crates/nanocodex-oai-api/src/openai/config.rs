@@ -1,8 +1,14 @@
 use std::{borrow::Cow, sync::Arc};
 
-use crate::{Model, OpenAiAuth, ReasoningMode, ResponsesHistory, ResponsesTransport, Thinking};
+use crate::{
+    CONTEXT_WINDOW_TOKENS, Model, OpenAiAuth, ReasoningMode, ResponsesHistory, ResponsesTransport,
+    Thinking, responses::StrictJsonSchema,
+};
 
-const SYSTEM_PROMPT: &str = include_str!("../../prompts/system.md");
+const SOL_SYSTEM_PROMPT: &str = include_str!("../../prompts/sol.md");
+const LUNA_SYSTEM_PROMPT: &str = include_str!("../../prompts/luna.md");
+const GLM_SYSTEM_PROMPT: &str = include_str!("../../prompts/glm.md");
+const ASTRA_SYSTEM_PROMPT: &str = include_str!("../../prompts/astra.md");
 
 /// Validated, read-only settings passed to a [`ResponsesServiceFactory`].
 ///
@@ -13,12 +19,12 @@ const SYSTEM_PROMPT: &str = include_str!("../../prompts/system.md");
 /// [`ResponsesServiceFactory`]: super::ResponsesServiceFactory
 #[derive(Clone)]
 pub struct ModelConfig {
-    /// Selected GPT-5.6 coding model.
+    /// Selected OpenAI coding model.
     pub model: Model,
     /// Optional namespace prepended to the model identifier on the wire.
     ///
     /// This preserves Nanocodex's closed typed model policy while allowing an
-    /// OpenAI routing gateway to require IDs such as `openai/gpt-5.6-sol`.
+    /// OpenAI routing gateway to require IDs such as `openai/gpt-6.1-sol`.
     pub model_id_prefix: Option<Arc<str>>,
     /// Authentication source resolved for each transport connection.
     pub auth: OpenAiAuth,
@@ -26,14 +32,27 @@ pub struct ModelConfig {
     pub reasoning_mode: ReasoningMode,
     /// Requested reasoning effort.
     pub thinking: Thinking,
+    /// Whether an embedding selected an effort instead of model defaults.
+    #[doc(hidden)]
+    pub thinking_explicit: bool,
     /// Whether requests use priority processing.
     pub fast_mode: bool,
+    /// Resolved context window used for accounting and automatic compaction.
+    pub context_window_tokens: u64,
     /// Preferred initial streaming transport.
     pub responses_transport: ResponsesTransport,
+    /// Whether a WebSocket session sends an optional non-generating prewarm
+    /// request before its first model call.
+    pub websocket_warmup: bool,
+    /// Whether the standard transport emits complete raw API request/response events.
+    /// Enabled by default; disabling avoids serializing their telemetry payloads.
+    pub raw_api_events: bool,
     /// Selected healthy-call history strategy.
     pub responses_history: ResponsesHistory,
     /// Whether the provider may retain response checkpoints.
     pub store_responses: bool,
+    /// Optional strict JSON Schema required for model output.
+    pub strict_json_schema: Option<StrictJsonSchema>,
     /// Responses WebSocket endpoint.
     pub websocket_url: String,
     /// Base URL used for HTTPS Responses calls and related endpoints.
@@ -41,8 +60,10 @@ pub struct ModelConfig {
     /// Embedding-host transport used by the standard WebAssembly client.
     #[cfg(any(target_family = "wasm", docsrs))]
     pub host_transport: Option<Arc<dyn crate::transport::host::HostTransport>>,
-    /// Immutable harness system prompt serialized before session instructions.
-    pub system_prompt: Arc<str>,
+    /// Explicit replacement for the selected model's built-in instructions.
+    pub system_prompt: Option<Arc<str>>,
+    /// Host instructions appended to the selected or overridden system prompt.
+    pub additional_instructions: Option<Arc<str>>,
 }
 
 impl ModelConfig {
@@ -59,10 +80,31 @@ impl ModelConfig {
         "local_code_mode"
     }
 
-    /// Returns the immutable harness system prompt.
+    /// Resolves the selected model's instructions while preserving caller overrides.
     #[must_use]
-    pub fn system_prompt(&self) -> &str {
-        &self.system_prompt
+    pub fn system_prompt(&self) -> Cow<'_, str> {
+        let base = self.system_prompt.as_deref().unwrap_or(match self.model {
+            Model::Astra => ASTRA_SYSTEM_PROMPT,
+            Model::Glm53 | Model::Kimi | Model::Mimo => GLM_SYSTEM_PROMPT,
+            Model::Sol => SOL_SYSTEM_PROMPT,
+            Model::Luna => LUNA_SYSTEM_PROMPT,
+        });
+        let base =
+            if self.system_prompt.is_none() && matches!(self.model, Model::Kimi | Model::Mimo) {
+                Cow::Owned(base.replacen(
+                    "powered by Z.ai GLM-5.3",
+                    &format!("powered by {}", self.model.as_str()),
+                    1,
+                ))
+            } else {
+                Cow::Borrowed(base)
+            };
+        match self.additional_instructions.as_deref() {
+            Some(additional) if !additional.is_empty() => {
+                Cow::Owned(format!("{base}\n\n{additional}"))
+            }
+            _ => base,
+        }
     }
 
     /// Returns the `OpenAI` tool-search endpoint derived from the base URL.
@@ -80,15 +122,21 @@ impl Default for ModelConfig {
             auth: OpenAiAuth::api_key(String::new()),
             reasoning_mode: ReasoningMode::default(),
             thinking: Thinking::default(),
+            thinking_explicit: false,
             fast_mode: false,
+            context_window_tokens: CONTEXT_WINDOW_TOKENS,
             responses_transport: ResponsesTransport::default(),
+            websocket_warmup: true,
+            raw_api_events: true,
             responses_history: ResponsesHistory::default(),
             store_responses: false,
+            strict_json_schema: None,
             websocket_url: "wss://api.openai.com/v1/responses".to_owned(),
             api_base_url: "https://api.openai.com/v1".to_owned(),
             #[cfg(any(target_family = "wasm", docsrs))]
             host_transport: None,
-            system_prompt: SYSTEM_PROMPT.into(),
+            system_prompt: None,
+            additional_instructions: None,
         }
     }
 }

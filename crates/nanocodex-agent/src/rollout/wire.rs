@@ -80,6 +80,7 @@ impl UserMessage {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(super) enum CodexEvent<'a> {
+    InputAccepted(&'a nanocodex_oai_api::events::AcceptedInput),
     TaskStarted {
         turn_id: &'a str,
         started_at: i64,
@@ -121,8 +122,12 @@ pub(super) struct SessionContextWindow {
 
 #[derive(Serialize)]
 pub(super) struct SessionMeta {
+    pub(super) root_session_id: String,
+    pub(super) conversation_role: &'static str,
+    pub(super) origin_kind: String,
     pub(super) session_id: String,
     pub(super) id: String,
+    pub(super) prompt_cache_key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) forked_from_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -174,4 +179,5 @@ pub(super) struct WorldStateItem<'a> {
 #[derive(Serialize)]
 pub(super) struct PersistedContextState<'a> {
     pub(super) nanocodex_context: &'a ContextBaseline,
+    pub(super) nanocodex_client_authored: &'a std::collections::BTreeSet<String>,
 }

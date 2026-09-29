@@ -1,6 +1,6 @@
 //! Model-visible tool declarations and open JSON boundary values.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 
 /// Model-visible tool definition carried by Responses Lite input.
@@ -15,9 +15,15 @@ pub enum ToolDefinition {
         description: Box<str>,
         /// Whether the provider should enforce the parameter schema strictly.
         strict: bool,
+        /// Whether this definition is returned for deferred provider loading.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        defer_loading: Option<bool>,
+        /// Whether the model may continue while the application executes this tool.
+        #[serde(default, rename = "async", skip_serializing_if = "is_false")]
+        asynchronous: bool,
         /// JSON Schema accepted as function arguments.
         parameters: JsonSchema,
-        #[serde(skip)]
+        #[serde(default, skip_serializing)]
         /// Optional JSON Schema produced by the function.
         ///
         /// This is client-owned Code Mode metadata and is not part of the
@@ -30,7 +36,8 @@ pub enum ToolDefinition {
         name: Box<str>,
         /// Guidance describing the namespace as a whole.
         description: Box<str>,
-        /// Function declarations exposed under this namespace.
+        /// Function or custom declarations exposed under this namespace.
+        #[serde(serialize_with = "serialize_namespace_tools")]
         tools: Vec<Self>,
     },
     /// Free-form custom tool constrained by a grammar.
@@ -39,6 +46,12 @@ pub enum ToolDefinition {
         name: Box<str>,
         /// Concrete guidance for when and how to use the tool.
         description: Box<str>,
+        /// Whether this definition is returned for deferred provider loading.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        defer_loading: Option<bool>,
+        /// Whether the model may continue while the application executes this tool.
+        #[serde(default, rename = "async", skip_serializing_if = "is_false")]
+        asynchronous: bool,
         /// Free-form input grammar.
         format: CustomToolFormat,
     },
@@ -51,6 +64,27 @@ pub enum ToolDefinition {
         /// JSON Schema accepted as search arguments.
         parameters: JsonSchema,
     },
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn serialize_namespace_tools<S>(tools: &[ToolDefinition], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    if tools.iter().any(|tool| {
+        !matches!(
+            tool,
+            ToolDefinition::Function { .. } | ToolDefinition::Custom { .. }
+        )
+    }) {
+        return Err(serde::ser::Error::custom(
+            "Responses namespaces may contain only function or custom definitions",
+        ));
+    }
+    tools.serialize(serializer)
 }
 
 impl ToolDefinition {
@@ -86,6 +120,8 @@ impl ToolDefinition {
             name: name.into(),
             description: description.into(),
             strict: false,
+            defer_loading: None,
+            asynchronous: false,
             parameters: parameters.into(),
             output_schema: None,
         }
@@ -101,6 +137,8 @@ impl ToolDefinition {
         Self::Custom {
             name: name.into(),
             description: description.into(),
+            defer_loading: None,
+            asynchronous: false,
             format,
         }
     }
@@ -157,6 +195,17 @@ impl ToolDefinition {
         }
     }
 
+    /// Requests provider-enforced strict function arguments. The caller must
+    /// supply a strict-compatible, closed parameter schema (including all
+    /// properties in `required`); the provider rejects incompatible schemas.
+    #[must_use]
+    pub const fn with_strict_parameters(mut self) -> Self {
+        if let Self::Function { strict, .. } = &mut self {
+            *strict = true;
+        }
+        self
+    }
+
     /// Adds an output schema to a function definition.
     ///
     /// Custom and provider-native tool definitions are returned unchanged.
@@ -170,6 +219,53 @@ impl ToolDefinition {
             *current = Some(output_schema.into());
         }
         self
+    }
+
+    /// Marks a function or custom definition for provider-native deferred loading.
+    #[must_use]
+    #[allow(
+        clippy::missing_const_for_fn,
+        reason = "ToolDefinition owns drop types that const evaluation rejects"
+    )]
+    pub fn with_deferred_loading(mut self) -> Self {
+        match &mut self {
+            Self::Function { defer_loading, .. } | Self::Custom { defer_loading, .. } => {
+                *defer_loading = Some(true);
+            }
+            Self::Namespace { .. } | Self::ToolSearch { .. } => {}
+        }
+        self
+    }
+
+    /// Marks a function or custom tool for provider-native asynchronous execution.
+    ///
+    /// The application still owns execution and must return the result on the
+    /// original call ID. Namespace and provider-hosted definitions are returned
+    /// unchanged.
+    #[must_use]
+    #[allow(
+        clippy::missing_const_for_fn,
+        reason = "ToolDefinition owns drop types that const evaluation rejects"
+    )]
+    pub fn with_async_execution(mut self) -> Self {
+        match &mut self {
+            Self::Function { asynchronous, .. } | Self::Custom { asynchronous, .. } => {
+                *asynchronous = true;
+            }
+            Self::Namespace { .. } | Self::ToolSearch { .. } => {}
+        }
+        self
+    }
+
+    /// Returns whether this function or custom tool opts into asynchronous execution.
+    #[must_use]
+    pub const fn is_async(&self) -> bool {
+        match self {
+            Self::Function { asynchronous, .. } | Self::Custom { asynchronous, .. } => {
+                *asynchronous
+            }
+            Self::Namespace { .. } | Self::ToolSearch { .. } => false,
+        }
     }
 
     /// Returns the model-visible tool name.
@@ -281,10 +377,74 @@ impl From<Value> for JsonValue {
 mod tests {
     use serde_json::json;
 
-    use super::{JsonSchema, ToolDefinition};
+    use super::{CustomToolFormat, JsonSchema, ToolDefinition};
 
     #[test]
-    fn namespace_serializes_function_children_without_client_output_metadata() {
+    fn custom_tools_opt_into_deferred_loading_and_namespace_membership() {
+        let custom = ToolDefinition::custom(
+            "patch",
+            "Apply a patch.",
+            CustomToolFormat::grammar("lark", "start: \"patch\""),
+        )
+        .with_deferred_loading();
+        assert_eq!(
+            serde_json::to_value(&custom).unwrap()["defer_loading"],
+            true
+        );
+        let namespace = ToolDefinition::namespace("editing", "Deferred editing tools.", [custom]);
+        assert_eq!(
+            serde_json::to_value(namespace).unwrap()["tools"][0]["type"],
+            "custom"
+        );
+    }
+
+    #[test]
+    fn function_and_custom_tools_opt_into_async_execution() {
+        let function = ToolDefinition::function(
+            "lookup",
+            "Run a background lookup.",
+            json!({"type": "object"}),
+        )
+        .with_async_execution();
+        let custom = ToolDefinition::custom(
+            "compile",
+            "Run a background compiler.",
+            CustomToolFormat::grammar("lark", "start: \"compile\""),
+        )
+        .with_async_execution();
+
+        assert!(function.is_async());
+        assert!(custom.is_async());
+        assert_eq!(serde_json::to_value(function).unwrap()["async"], true);
+        assert_eq!(serde_json::to_value(custom).unwrap()["async"], true);
+        assert!(
+            serde_json::to_value(ToolDefinition::function(
+                "sync",
+                "Run synchronously.",
+                json!({"type": "object"}),
+            ))
+            .unwrap()
+            .get("async")
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn function_can_request_strict_provider_arguments() {
+        let definition = ToolDefinition::function(
+            "spawn_agent",
+            "Start child.",
+            json!({ "type": "object", "properties": { "role": { "type": "string" } },
+                "required": ["role"], "additionalProperties": false }),
+        )
+        .with_strict_parameters();
+        let sent = serde_json::to_value(&definition).unwrap();
+        assert_eq!(sent["strict"], true);
+        assert_eq!(sent["parameters"]["required"], json!(["role"]));
+    }
+
+    #[test]
+    fn namespace_serializes_supported_children_and_rejects_nested_namespaces() {
         let definition = ToolDefinition::namespace(
             "image_gen",
             "Tools in the image_gen namespace.",
@@ -320,6 +480,40 @@ mod tests {
                     }
                 }]
             })
+        );
+        let nested = ToolDefinition::namespace(
+            "outer",
+            "Outer tools.",
+            [ToolDefinition::namespace("inner", "Inner tools.", [])],
+        );
+        assert!(serde_json::to_value(nested).is_err());
+    }
+
+    #[test]
+    fn output_schema_is_host_input_metadata_but_not_responses_wire_output() {
+        let definition: ToolDefinition = serde_json::from_value(json!({
+            "type": "function",
+            "name": "exec_command",
+            "description": "Run a command.",
+            "strict": false,
+            "parameters": { "type": "object" },
+            "output_schema": {
+                "type": "object",
+                "properties": { "output": { "type": "string" } },
+                "required": ["output"]
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            definition.output_schema().unwrap().as_value()["required"],
+            json!(["output"])
+        );
+        assert!(
+            serde_json::to_value(definition)
+                .unwrap()
+                .get("output_schema")
+                .is_none()
         );
     }
 

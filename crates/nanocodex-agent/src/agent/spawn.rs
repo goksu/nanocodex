@@ -29,20 +29,17 @@ where
             lineage_id,
             prompt_cache_key: restored_cache_key,
             workspace,
-            base_instructions,
             canonical_context,
             history,
+            client_authored,
             context_baseline,
             checkpoint,
         } = snapshot.into_resume()?;
         Arc::make_mut(&mut config).model = model;
-        if base_instructions
-            .as_deref()
-            .is_some_and(|stored| stored != config.system_prompt())
-        {
-            return Err(NanocodexError::InvalidSessionSnapshot(
-                "instructions do not match the resumed rollout".to_owned(),
-            ));
+        validate_model_thinking(config.model, config.thinking)?;
+        validate_model_reasoning_mode(config.model, config.reasoning_mode)?;
+        if config.context_window_tokens > model.max_context_window_tokens() {
+            Arc::make_mut(&mut config).context_window_tokens = model.max_context_window_tokens();
         }
         if key
             .as_deref()
@@ -56,8 +53,10 @@ where
             || {
                 InitialResume::History(Box::new(HistoryCheckpoint {
                     workspace,
+                    provider_session_id: Arc::clone(&lineage_id),
                     canonical_context,
                     history,
+                    client_authored,
                     prompt_cache_key: Arc::clone(&restored_cache_key),
                     context_baseline,
                 }))
@@ -105,17 +104,22 @@ where
         ))
     };
     let service = service_factory(Arc::clone(&config));
+    let provider_session_id = Arc::clone(&lineage_id);
     spawn_agent_driver(
         BranchSpawner {
             config,
             tools,
             lineage_id,
+            provider_session_id,
             prompt_cache_key,
             shared_prompt_cache: shared,
+            before_compaction: codex.before_compaction,
             context_config: codex.context,
             context_source,
             depth: 0,
-            durability: codex.durability,
+            execution: codex.execution,
+            restored_snapshot: None,
+            host_context: None,
             service_factory,
         },
         session_id,
@@ -145,21 +149,31 @@ where
 {
     let session_id_text = session_id.to_string();
     let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
+    let shutdown = DriverShutdown::default();
     let tools = spawner
         .tools
         .materialize(AgentHandle {
             commands: commands.downgrade(),
+            shutdown: shutdown.clone(),
+            session_id: Arc::from(session_id_text.as_str()),
         })?
         .for_session(&session_id_text);
-    let durability = spawner.durability.start(
+    let prompt_cache_key = spawner
+        .prompt_cache_key
+        .as_deref()
+        .unwrap_or(&spawner.lineage_id);
+    let execution = spawner.execution.start(
         &session_id_text,
+        prompt_cache_key,
         workspace.as_deref(),
-        spawner.config.system_prompt(),
+        &spawner.config.system_prompt(),
         origin.kind,
         origin.parent_session_id.as_deref(),
         initial_resume.as_ref().map(InitialResume::history_len),
     )?;
-    let (events, event_stream) = EventSink::channel(session_id_text.clone());
+    let (runtime, event_stream) = BackendRuntime::new_openai(session_id);
+    let events = EventSink::from_publisher(runtime.events());
+    shutdown.set_execution_policy_owned(execution.identifies_prompts());
     let initial_model = initial_resume
         .map(|initial| match initial {
             InitialResume::Exact(checkpoint) => prepare_resumed_checkpoint(
@@ -179,16 +193,19 @@ where
         })
         .transpose()?;
     let transport_stats = Arc::new(TransportStats::default());
-    let shutdown = DriverShutdown::default();
-    let agent = Nanocodex {
-        commands,
-        events: events.clone(),
-        next_turn: Arc::new(AtomicU64::new(1)),
-        lineage_id: Arc::clone(&spawner.lineage_id),
-        session_id,
-        durability: durability.clone(),
-        shutdown: shutdown.clone(),
-    };
+    #[cfg(not(target_family = "wasm"))]
+    let rollout = execution.info().cloned();
+    #[cfg(target_family = "wasm")]
+    let rollout = None;
+    let agent = runtime.bind_with_rollout(
+        LocalLifecycle {
+            commands,
+            execution: execution.clone(),
+            shutdown: shutdown.clone(),
+            lineage_id: Arc::clone(&spawner.lineage_id),
+        },
+        rollout,
+    );
     // Start discovery before returning the handle so an idle CLI or TUI immediately
     // contributes its human think time to provider prewarming.
     tools.start_providers();
@@ -202,20 +219,19 @@ where
         spawner,
         initial_model,
         origin,
-        durability: durability.clone(),
+        execution: execution.clone(),
     };
     let driver_task = async move {
         let outcome = driver.run().await;
-        if shutdown.requested() {
-            let outcome = outcome.and(durability.shutdown().await);
-            shutdown.complete(outcome);
-        } else if let Err(error) = outcome {
+        let outcome = outcome.and(execution.shutdown().await);
+        if let Err(error) = &outcome {
             tracing::error!(
                 target: "nanocodex",
                 error = %error,
                 "agent driver stopped with an error"
             );
         }
+        shutdown.complete(outcome);
     };
     spawn_driver(driver_task)?;
     Ok((agent, event_stream))
@@ -226,6 +242,11 @@ pub(super) fn validate(config: &ModelConfig, prompt_cache_key: Option<&str>) -> 
         .auth
         .validate()
         .map_err(|error| NanocodexError::InvalidRequest(error.to_string()))?;
+    if config.context_window_tokens == 0 {
+        return Err(NanocodexError::InvalidRequest(
+            "model context window must be greater than zero".to_owned(),
+        ));
+    }
     if matches!(config.responses_transport, ResponsesTransport::WebSocket)
         && config.websocket_url.trim().is_empty()
     {
@@ -259,4 +280,39 @@ pub(super) fn validate(config: &ModelConfig, prompt_cache_key: Option<&str>) -> 
         ));
     }
     Ok(())
+}
+
+pub(super) fn validate_model_thinking(model: Model, thinking: Thinking) -> Result<()> {
+    if model.supports_thinking(thinking) {
+        Ok(())
+    } else {
+        Err(NanocodexError::InvalidRequest(
+            (if model == Model::Glm53 {
+                "GLM-5.3 requires low, medium, or high reasoning effort"
+            } else if model == Model::Sol {
+                "GPT-6.1 Sol requires low, medium, high, xhigh, or max reasoning effort"
+            } else {
+                "GPT-6 Astra requires low, medium, high, xhigh, or max reasoning effort"
+            })
+            .to_owned(),
+        ))
+    }
+}
+
+pub(super) fn validate_model_reasoning_mode(
+    model: Model,
+    reasoning_mode: ReasoningMode,
+) -> Result<()> {
+    if model.supports_reasoning_mode(reasoning_mode) {
+        Ok(())
+    } else {
+        Err(NanocodexError::InvalidRequest(
+            (if model == Model::Glm53 {
+                "GLM-5.3 does not support pro reasoning mode"
+            } else {
+                "GPT-6 Astra does not support pro reasoning mode"
+            })
+            .to_owned(),
+        ))
+    }
 }

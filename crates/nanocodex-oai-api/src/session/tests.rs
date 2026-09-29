@@ -58,6 +58,7 @@ impl Service<crate::ResponsesAttempt> for Scripted {
             Ok(
                 ResponsesServiceResponse::new(ResponsesOutput::Generation(GenerationOutput {
                     id: format!("resp-{call}"),
+                    reported_model: Some("@cf/zai-org/glm-5.3".to_owned()),
                     status: "completed".to_owned(),
                     end_turn: None,
                     final_message: Some(format!("answer-{call}")),
@@ -107,10 +108,11 @@ async fn response_stream_and_future_share_one_completed_operation() {
     };
 
     assert_eq!(completed.output_text(), "answer-1");
+    assert_eq!(completed.reported_model(), Some("@cf/zai-org/glm-5.3"));
     let estimated_cost = completed
         .estimated_cost()
         .expect("provider usage should produce an estimate");
-    assert_eq!(estimated_cost.amount().decimal(), "0.00021");
+    assert_eq!(estimated_cost.amount().decimal(), "0.00037");
     assert_eq!(
         completed.cost_status(),
         crate::CostStatus::EstimatedFromUsage
@@ -137,7 +139,7 @@ fn luna_usage_receives_a_model_specific_estimate() {
     };
     let (estimate, status) = estimate_cost(Some(&usage), crate::Model::Luna, false);
 
-    assert_eq!(estimate.unwrap().amount().decimal(), "1.4");
+    assert_eq!(estimate.unwrap().amount().decimal(), "0.95");
     assert_eq!(status, crate::CostStatus::EstimatedFromUsage);
 }
 
@@ -195,6 +197,8 @@ impl Service<crate::ResponsesAttempt> for RecordingScripted {
                     name: "lookup".into(),
                     namespace: None,
                     arguments: r#"{"key":"region"}"#.into(),
+                    asynchronous: false,
+                    encrypted_function_args: None,
                     call_id: "call_1".into(),
                     caller: None,
                     status: None,
@@ -219,6 +223,7 @@ impl Service<crate::ResponsesAttempt> for RecordingScripted {
         std::future::ready(Ok(ResponsesServiceResponse::new(
             ResponsesOutput::Generation(GenerationOutput {
                 id: format!("resp-{call}"),
+                reported_model: None,
                 status: "completed".to_owned(),
                 end_turn: Some(call == 2),
                 final_message,
@@ -255,13 +260,9 @@ async fn sequential_creates_send_only_the_new_delta_after_completion() {
 
     {
         let mut turn = session.turn();
-        assert_eq!(
-            turn.create("The region is us-west-2.")
-                .await
-                .unwrap()
-                .output_text(),
-            "answer-1"
-        );
+        let first = turn.create("The region is us-west-2.").await.unwrap();
+        assert_eq!(first.output_text(), "answer-1");
+        assert_eq!(first.reported_model(), None);
         assert_eq!(
             turn.create("What region did I give you?")
                 .await
@@ -470,6 +471,7 @@ impl Service<crate::ResponsesAttempt> for CompactingScripted {
             );
             ResponsesOutput::Generation(GenerationOutput {
                 id: format!("resp-{call}"),
+                reported_model: None,
                 status: "completed".to_owned(),
                 end_turn: None,
                 final_message: Some(format!("answer-{call}")),
@@ -555,8 +557,12 @@ async fn compaction_phase_controls_exact_canonical_context_ordering() {
             .history()
             .map(history_item_shape)
             .collect::<Vec<_>>(),
-        ["user:initial task", "compaction"],
-        "pre-turn compaction must install only retained user history and the summary"
+        [
+            "developer:fresh permissions",
+            "user:initial task",
+            "compaction",
+        ],
+        "pre-turn compaction must retain client developer and user history before the summary"
     );
 
     session.turn().create("next normal turn").await.unwrap();
@@ -571,6 +577,7 @@ async fn compaction_phase_controls_exact_canonical_context_ordering() {
             [
                 "additional_tools",
                 "developer:stable instructions",
+                "developer:fresh permissions",
                 "user:initial task",
                 "compaction",
                 "developer:fresh permissions",
@@ -581,7 +588,7 @@ async fn compaction_phase_controls_exact_canonical_context_ordering() {
         );
         assert_eq!(
             observations[0].input_bytes[2..4],
-            observations[2].input_bytes[4..6],
+            observations[2].input_bytes[5..7],
             "an unchanged standalone snapshot must preserve its exact request bytes"
         );
     }
@@ -600,6 +607,7 @@ async fn compaction_phase_controls_exact_canonical_context_ordering() {
             .map(history_item_shape)
             .collect::<Vec<_>>(),
         [
+            "developer:fresh permissions",
             "developer:fresh permissions",
             "user:# AGENTS.md instructions for /workspace\n\n<INSTRUCTIONS>\nfresh rules\n</INSTRUCTIONS>|<environment_context>\n<cwd>/workspace</cwd>\n</environment_context>",
             "user:mid-turn task",
@@ -825,5 +833,58 @@ fn session_ids_are_serializable_uuid_v7_values() {
         "550e8400-e29b-41d4-a716-446655440000"
             .parse::<SessionId>()
             .is_err()
+    );
+}
+
+#[tokio::test]
+async fn compaction_replays_bounded_images_and_retained_agent_instructions() {
+    let (mut session, observations) = compacting_session(false);
+    let images = crate::ResponseItem::message(
+        MessageRole::User,
+        (0..50).map(|_| ContentItem::InputImage {
+            image_url: "data:image/png;base64,YQ==".into(),
+            detail: None,
+        }),
+    );
+    let agent: crate::ResponseItem = serde_json::from_value(serde_json::json!({
+        "type": "agent_message", "author": "parent", "recipient": "child",
+        "content": [{"type": "input_text", "text": "retain delegated instructions"}]
+    }))
+    .unwrap();
+    {
+        let mut turn = session.turn();
+        turn.create(super::ResponseInput::items([images, agent]))
+            .await
+            .unwrap();
+        turn.compact().await.unwrap();
+    }
+    session.turn().create("continue").await.unwrap();
+    let observations = observations.lock().unwrap();
+    let replay = &observations[2];
+    assert!(replay.full_replay);
+    assert!(replay.previous_response_id.is_none());
+    assert_eq!(
+        replay
+            .input
+            .iter()
+            .filter(|item| item["type"] == "agent_message")
+            .count(),
+        1,
+    );
+    let image_count = replay
+        .input
+        .iter()
+        .filter_map(|item| item["content"].as_array())
+        .flatten()
+        .filter(|part| part["type"] == "input_image")
+        .count();
+    assert_eq!(image_count, 34);
+    assert_eq!(
+        replay
+            .input
+            .iter()
+            .filter(|item| item["type"] == "compaction")
+            .count(),
+        1,
     );
 }

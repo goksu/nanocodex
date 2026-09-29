@@ -86,6 +86,8 @@ impl Service<ResponsesAttempt> for UnmatchedToolCallService {
                             name: "lookup".into(),
                             namespace: None,
                             arguments: r#"{"key":"region"}"#.into(),
+                            asynchronous: false,
+                            encrypted_function_args: None,
                             call_id: "call-unmatched".into(),
                             caller: None,
                             status: None,
@@ -108,6 +110,7 @@ impl Service<ResponsesAttempt> for UnmatchedToolCallService {
                 };
                 ResponsesOutput::Generation(GenerationOutput {
                     id: format!("resp-{call}"),
+                    reported_model: None,
                     status: "completed".to_owned(),
                     end_turn,
                     final_message,
@@ -185,7 +188,11 @@ async fn agent_repairs_unmatched_tool_calls_before_continuing_and_restores_delta
     assert_eq!(healthy.input.len(), 1);
     assert_eq!(healthy.input[0]["role"], "user");
 
-    let snapshot = serde_json::to_value(second.snapshot())?;
+    let snapshot = serde_json::to_value(
+        second
+            .snapshot()
+            .expect("local turns always retain a snapshot"),
+    )?;
     let repaired_outputs = snapshot["history"]
         .as_array()
         .expect("snapshot history is an array")

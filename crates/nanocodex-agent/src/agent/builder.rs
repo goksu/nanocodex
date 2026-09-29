@@ -1,3 +1,4 @@
+use super::spawn::{validate_model_reasoning_mode, validate_model_thinking};
 use super::*;
 
 #[cfg(not(target_family = "wasm"))]
@@ -16,6 +17,27 @@ pub struct NanocodexBuilder<F = StandardServiceFactory> {
     pub(super) factory: F,
 }
 
+impl<F> BuilderBackend for OpenAi<F>
+where
+    F: ResponsesServiceFactory,
+{
+    type Builder = NanocodexBuilder<F>;
+
+    fn into_builder(self) -> Self::Builder {
+        let (config, factory) = into_openai_parts(self);
+        NanocodexBuilder {
+            config,
+            tools: ToolsConfiguration::Shared(Tools::default()),
+            workspace: None,
+            session_id: None,
+            prompt_cache: PromptCacheConfig::default(),
+            codex: CodexCompatibility::default(),
+            resume: None,
+            factory,
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub(super) struct PromptCacheConfig {
     pub(super) key: Option<String>,
@@ -25,10 +47,22 @@ pub(super) struct PromptCacheConfig {
 #[derive(Clone, Default)]
 pub(super) struct CodexCompatibility {
     pub(super) context: ContextSourceConfig,
-    pub(super) durability: DurabilityConfig,
+    pub(super) execution: ExecutionConfig,
+    pub(super) before_compaction: Option<Arc<dyn execution::BeforeCompaction>>,
 }
 
 impl<F> NanocodexBuilder<F> {
+    /// Awaits durable host preservation before automatic or manual compaction.
+    ///
+    /// The host must deduplicate by boundary ID, return only after durable success,
+    /// and bound its work. Dropping its future cancels an interrupted compaction.
+    /// Failure stops compaction without trimming history. Disabled by default.
+    #[must_use]
+    pub fn before_compaction(mut self, hook: impl execution::BeforeCompaction + 'static) -> Self {
+        self.codex.before_compaction = Some(Arc::new(hook));
+        self
+    }
+
     /// Overrides the `OpenAi` recipe's model for this agent.
     ///
     /// Without this call the agent inherits the client default. The selected
@@ -36,13 +70,27 @@ impl<F> NanocodexBuilder<F> {
     #[must_use]
     pub const fn model(mut self, model: Model) -> Self {
         self.config.model = model;
+        if !self.config.thinking_explicit {
+            self.config.thinking = model.default_thinking();
+        }
+        if self.config.context_window_tokens > model.max_context_window_tokens() {
+            self.config.context_window_tokens = model.max_context_window_tokens();
+        }
         self
     }
 
     /// Replaces the stable system/developer instructions.
     #[must_use]
     pub fn instructions(mut self, instructions: impl Into<Arc<str>>) -> Self {
-        self.config.system_prompt = instructions.into();
+        self.config.system_prompt = Some(instructions.into());
+        self
+    }
+
+    /// Adds host instructions after the selected model's built-in instructions
+    /// or the explicit replacement supplied with [`Self::instructions`].
+    #[must_use]
+    pub fn additional_instructions(mut self, instructions: impl Into<Arc<str>>) -> Self {
+        self.config.additional_instructions = Some(instructions.into());
         self
     }
 
@@ -53,6 +101,7 @@ impl<F> NanocodexBuilder<F> {
     #[must_use]
     pub const fn thinking(mut self, thinking: Thinking) -> Self {
         self.config.thinking = thinking;
+        self.config.thinking_explicit = true;
         self
     }
 
@@ -64,6 +113,17 @@ impl<F> NanocodexBuilder<F> {
     #[must_use]
     pub const fn fast_mode(mut self, enabled: bool) -> Self {
         self.config.fast_mode = enabled;
+        self
+    }
+
+    /// Sets the selected model's context window used for accounting and compaction.
+    ///
+    /// Values above the selected model's advertised maximum are clamped. The
+    /// default remains 272,000 tokens to stay below long-context pricing.
+    #[must_use]
+    pub const fn context_window_tokens(mut self, tokens: u64) -> Self {
+        let maximum = self.config.model.max_context_window_tokens();
+        self.config.context_window_tokens = if tokens > maximum { maximum } else { tokens };
         self
     }
 
@@ -90,8 +150,6 @@ impl<F> NanocodexBuilder<F> {
     /// runtime is being built. Use this for agent-relative tools such as Code
     /// Mode child-agent tools; stateless tools may continue using
     /// [`Self::tools`].
-    #[cfg(not(target_family = "wasm"))]
-    #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
     #[must_use]
     pub fn tools_factory<T>(mut self, factory: T) -> Self
     where
@@ -142,6 +200,19 @@ impl<F> NanocodexBuilder<F> {
         self
     }
 
+    /// Installs a cache identity only when the caller did not configure one.
+    ///
+    /// This is an internal composition seam for durable session owners that
+    /// need a stable pre-checkpoint lineage across process replacement.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn default_prompt_cache_key(mut self, prompt_cache_key: impl Into<String>) -> Self {
+        if self.prompt_cache.key.is_none() {
+            self.prompt_cache.key = Some(prompt_cache_key.into());
+        }
+        self
+    }
+
     /// Shares completed immutable-prefix warmups among builders cloned from
     /// this recipe.
     ///
@@ -176,7 +247,7 @@ impl<F> NanocodexBuilder<F> {
                 .context
                 .set_codex_home(rollout.codex_home().to_path_buf());
         }
-        self.codex.durability.set_rollout(rollout);
+        self.codex.execution.set_rollout(rollout);
         self
     }
 
@@ -184,12 +255,47 @@ impl<F> NanocodexBuilder<F> {
     /// and tool runtime while retaining its typed history and cache lineage.
     ///
     /// An explicitly configured session ID names the new runtime/event stream;
-    /// it does not replace the snapshot's prompt-cache lineage. Configure the
-    /// same instructions, tool definitions, and custom handlers used by the
-    /// original session; incompatible policy is rejected during [`Self::build`].
+    /// it does not replace the snapshot's prompt-cache lineage. The new runtime
+    /// supplies the instructions, tool definitions, and handlers used for
+    /// subsequent turns. Previously committed typed history remains
+    /// authoritative and is replayed on the first resumed request.
     #[must_use]
     pub fn resume(mut self, snapshot: SessionSnapshot) -> Self {
         self.resume = Some(snapshot);
+        self
+    }
+
+    /// Returns the explicitly configured resume boundary, if any.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn resume_snapshot(&self) -> Option<&SessionSnapshot> {
+        self.resume.as_ref()
+    }
+
+    /// Attaches a higher-layer execution policy at the agent's model, tool,
+    /// and committed-session boundaries.
+    ///
+    /// Persistence formats, storage, admission, and recovery remain owned by
+    /// the implementing crate. Most callers use a higher-level extension such
+    /// as `nanocodex-durability` instead of invoking this seam directly.
+    #[must_use]
+    pub fn execution_policy(mut self, policy: Arc<dyn execution::ExecutionPolicy>) -> Self {
+        self.codex.execution.set_policy(policy);
+        self
+    }
+
+    /// Builds a fresh higher-layer execution policy for every root agent.
+    ///
+    /// This internal composition seam is for stateful policy recipes whose
+    /// builder remains cloneable while each built driver requires independent
+    /// lifecycle ownership.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn execution_policy_factory<P>(mut self, factory: P) -> Self
+    where
+        P: Fn() -> Result<Arc<dyn execution::ExecutionPolicy>> + Send + Sync + 'static,
+    {
+        self.codex.execution.set_policy_factory(Arc::new(factory));
         self
     }
 }
@@ -244,6 +350,10 @@ where
     <F::Service as Service<ResponsesAttempt>>::Error: Into<ResponseError> + AgentSend + 'static,
     <F::Service as Service<ResponsesAttempt>>::Future: AgentSend,
 {
+    if builder.resume.is_none() {
+        validate_model_thinking(builder.config.model, builder.config.thinking)?;
+        validate_model_reasoning_mode(builder.config.model, builder.config.reasoning_mode)?;
+    }
     validate(&builder.config, builder.prompt_cache.key.as_deref())?;
     validate_execution_environment(builder.codex.context.execution_environment())?;
     let config = Arc::new(builder.config);
@@ -406,9 +516,28 @@ mod tests {
             MessageRole::User,
             [ContentItem::input_text("resume with the retained model")],
         );
-        let snapshot = serde_json::from_value(serde_json::json!({
+        let obsolete: SessionSnapshot = serde_json::from_value(serde_json::json!({
             "version": 1,
             "model": "gpt-5.6-luna",
+            "lineage_id": "019c0d31-c308-7d91-bff4-5dca82d15ac6",
+            "prompt_cache_key": "obsolete-model",
+            "workspace": workspace,
+            "canonical_context": canonical_context,
+            "history": [canonical_context],
+        }))
+        .expect("snapshot envelope should decode before model validation");
+        let result = Nanocodex::builder(OpenAi::builder("test-key").build().unwrap())
+            .resume(obsolete)
+            .build();
+        let error = match result {
+            Ok(_) => panic!("an obsolete snapshot model must not continue as another model"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("snapshot model is unsupported"));
+
+        let snapshot = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "model": "gpt-6-luna",
             "lineage_id": "019c0d31-c308-7d91-bff4-5dca82d15ac6",
             "prompt_cache_key": "retained-model",
             "workspace": workspace,

@@ -1,5 +1,9 @@
 use eyre::{Result, eyre};
-use nanocodex_oai_api::{OpenAi, transport::ResponsesTransport};
+use nanocodex_oai_api::{
+    OpenAi,
+    session::ResponseInput,
+    transport::{ResponsesError, ResponsesTransport},
+};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -9,8 +13,121 @@ use tokio::{
 
 const TURN_STATE_HEADER: &str = "x-codex-turn-state";
 
+enum HttpsRetryFailure {
+    ServerError,
+    DisconnectBeforeHeaders,
+}
+
+impl HttpsRetryFailure {
+    async fn fail(self, stream: TcpStream) -> Result<()> {
+        match self {
+            Self::ServerError => send_http_status(stream, 500, "Internal Server Error").await,
+            Self::DisconnectBeforeHeaders => {
+                drop(stream);
+                Ok(())
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn https_invalid_tool_schema_identifies_the_failed_request_definition() -> Result<()> {
+    let definition = json!({
+        "type": "function", "name": "lookup", "strict": true,
+        "parameters": {
+            "type": "object", "properties": { "limit": { "type": "integer" } },
+            "required": [], "additionalProperties": false
+        }
+    });
+    for streamed_error in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let api_base_url = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let mut request = read_http_json(&listener).await?;
+            let index = request.body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .position(|item| item["type"] == "tool_search_output")
+                .unwrap();
+            let error = json!({
+                "code": "invalid_function_parameters",
+                "param": format!("input[{index}].tools[0].parameters"),
+                "message": "The required array must include limit."
+            });
+            if streamed_error {
+                send_http_events(
+                    request.stream,
+                    None,
+                    [json!({
+                        "type": "response.failed", "response": { "error": error }
+                    })],
+                )
+                .await?;
+            } else {
+                let body = json!({ "error": error }).to_string();
+                request
+                    .stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
+                request.stream.shutdown().await?;
+            }
+            Result::<()>::Ok(())
+        });
+        let openai = OpenAi::builder("test-key")
+            .transport(ResponsesTransport::Https)
+            .api_base_url(api_base_url)
+            .build()?;
+        let mut session = openai.instructions("Use discovered tools.").build()?;
+        let items: Vec<nanocodex_oai_api::responses::ResponseItem> =
+            serde_json::from_value(json!([
+                { "type": "tool_search_call", "call_id": "search", "execution": "client",
+                    "arguments": { "query": "lookup" } },
+                { "type": "tool_search_output", "call_id": "search", "execution": "client",
+                    "status": "completed", "tools": [definition] }
+            ]))?;
+        let error = session
+            .turn()
+            .create(ResponseInput::items(items))
+            .await
+            .expect_err("the provider must reject the invalid schema");
+        assert_eq!(
+            error
+                .responses_error()
+                .and_then(ResponsesError::invalid_tool_schema),
+            Some(&definition)
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("The required array must include limit.")
+        );
+        timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .map_err(|_| eyre!("mock HTTPS schema server did not finish"))???;
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn https_turn_state_is_scoped_to_one_logical_turn_and_survives_retry() -> Result<()> {
+    assert_https_turn_state_survives_retry(HttpsRetryFailure::ServerError).await
+}
+
+#[tokio::test]
+async fn https_disconnect_before_response_headers_retries_with_history_and_turn_state() -> Result<()>
+{
+    assert_https_turn_state_survives_retry(HttpsRetryFailure::DisconnectBeforeHeaders).await
+}
+
+async fn assert_https_turn_state_survives_retry(failure: HttpsRetryFailure) -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let api_base_url = format!("http://{}", listener.local_addr()?);
     let server = tokio::spawn(async move {
@@ -20,7 +137,7 @@ async fn https_turn_state_is_scoped_to_one_logical_turn_and_survives_retry() -> 
         send_http_events(
             first.stream,
             Some("sticky-turn-1"),
-            [completed_response("resp-first", "first")],
+            [completed_response("resp-first", "initial response")],
         )
         .await?;
 
@@ -34,7 +151,7 @@ async fn https_turn_state_is_scoped_to_one_logical_turn_and_survives_retry() -> 
             "HTTPS turn state belongs in the private request header, not the JSON body"
         );
         observed.push(turn_state(&continuation.headers));
-        send_http_status(continuation.stream, 500, "Internal Server Error").await?;
+        failure.fail(continuation.stream).await?;
 
         let retry = read_http_json(&listener).await?;
         assert!(
@@ -42,11 +159,18 @@ async fn https_turn_state_is_scoped_to_one_logical_turn_and_survives_retry() -> 
             "the SDK-owned retry must still switch to full-history replay"
         );
         assert!(!retry.body.to_string().contains("sticky-turn-1"));
+        let replay = retry.body["input"].to_string();
+        for retained in ["initial prompt", "initial response", "continuation prompt"] {
+            assert!(
+                replay.contains(retained),
+                "full-history retry omitted `{retained}`: {replay}"
+            );
+        }
         observed.push(turn_state(&retry.headers));
         send_http_events(
             retry.stream,
             None,
-            [completed_response("resp-second", "second")],
+            [completed_response("resp-second", "continuation response")],
         )
         .await?;
 
@@ -60,7 +184,7 @@ async fn https_turn_state_is_scoped_to_one_logical_turn_and_survives_retry() -> 
         send_http_events(
             next_turn.stream,
             Some("sticky-turn-2"),
-            [completed_response("resp-third", "third")],
+            [completed_response("resp-third", "new-turn response")],
         )
         .await?;
         Result::<Vec<Option<String>>>::Ok(observed)
@@ -77,12 +201,22 @@ async fn https_turn_state_is_scoped_to_one_logical_turn_and_survives_retry() -> 
 
     {
         let mut turn = session.turn();
-        assert_eq!(turn.create("first").await?.output_text(), "first");
-        assert_eq!(turn.create("continue").await?.output_text(), "second");
+        assert_eq!(
+            turn.create("initial prompt").await?.output_text(),
+            "initial response"
+        );
+        assert_eq!(
+            turn.create("continuation prompt").await?.output_text(),
+            "continuation response"
+        );
     }
     assert_eq!(
-        session.turn().create("new turn").await?.output_text(),
-        "third"
+        session
+            .turn()
+            .create("new-turn prompt")
+            .await?
+            .output_text(),
+        "new-turn response"
     );
 
     let observed = timeout(std::time::Duration::from_secs(5), server)
@@ -97,6 +231,32 @@ async fn https_turn_state_is_scoped_to_one_logical_turn_and_survives_retry() -> 
             None,
         ]
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn https_malformed_base_url_builder_error_is_terminal() -> Result<()> {
+    let openai = OpenAi::builder("test-key")
+        .transport(ResponsesTransport::Https)
+        .api_base_url("http://[::1")
+        .build()?;
+    let mut session = openai.instructions("Answer briefly.").build()?;
+    let mut turn = session.turn();
+    let error = timeout(std::time::Duration::from_secs(1), turn.create("question"))
+        .await
+        .map_err(|_| eyre!("malformed base URL did not fail promptly"))?
+        .expect_err("malformed base URL must fail");
+    let Some(ResponsesError::HttpRequest {
+        detail,
+        retryable,
+        timeout,
+    }) = error.responses_error()
+    else {
+        return Err(eyre!("expected an HTTPS request error, got {error}"));
+    };
+    assert!(detail.contains("builder error"), "{detail}");
+    assert!(!retryable);
+    assert!(!timeout);
     Ok(())
 }
 

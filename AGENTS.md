@@ -1,210 +1,153 @@
-# Development instructions
+# Nanocodex development
 
-## Product direction
+- Define observable behavior and failure cases before implementation. Validate
+  changes with black-box, end-to-end journeys that a real user could perform:
+  invoke the shipped CLI, call the public API over its actual transport, or use
+  both when both surfaces matter. Run the real executable/runtime and assert on
+  user-visible results, including representative errors, authorization, and
+  recovery paths. Use synthetic accounts/data and safe test environments; stub
+  only unavoidable external dependencies, not the behavior under test.
+- Skip low-level unit tests as the default for both new coverage and routine
+  validation. Do not add helper-by-helper or mock-heavy tests to stand in for a
+  user journey. Prefer a small set of representative E2E scenarios over a large
+  matrix of incidental configurations. If a critical failure truly cannot be
+  observed at a public boundary, document that gap and use the narrowest
+  realistic integration check rather than silently substituting unit coverage.
+- Finish each E2E run with reproducible evidence: the command, inputs, expected
+  and observed outcomes, and an inspectable trace, transcript, log, screenshot,
+  or recording where relevant. A passing test name alone is not evidence.
+- Continuously look for ways to improve the developer experience in CI. Inspect
+  the relevant jobs' actual results, duration, failures, and artifacts; favor
+  fast, reliable user-journey feedback, actionable failure output, and easy
+  reproduction locally. Remove redundant work and flaky setup, but do not hide
+  failures, skip required checks, or trade away meaningful E2E coverage merely
+  to make CI green. When changing CI, verify the resulting workflow run.
+- When a journey or protocol check covers the same failure, remove redundant
+  lower-level cases, unused fixtures, test-only APIs, and obsolete runner
+  references. Prune mock setup that no surviving scenario uses. Use compiler,
+  lint, and package checks for static contracts; do not test source text,
+  private layouts, method presence, fixed prompt/UI copy, or a mock's own
+  behavior as a proxy for runtime behavior.
 
-- Nanocodex is a headless, library-first Rust agents SDK. The public product is
-  the embeddable API; the CLI and Harbor adapter are examples and evaluation
-  boundaries.
-- Keep the scope narrow: one supported OpenAI model family, the Responses
-  WebSocket API, one owned agent lifecycle, and caller-defined tools. Do not
-  introduce provider/model portability or a generic app-server protocol.
-- A normal consumer builds an agent, receives `(Nanocodex, AgentEvents)`, sends
-  prompts through the cheap handle, and awaits typed `TurnResult`s. Events are
-  optional and independent from results.
-- Follow-on prompts reuse the session's retained history automatically. Never
-  require callers to pass prior messages, response IDs, or tool results back
-  into the agent.
-- Builders expose deliberate policy. Queue capacities, socket tasks, mutable
-  run state, replay bookkeeping, and similar mechanics stay private.
+- Keep documentation focused on current APIs, architecture, setup, and operations.
+  Remove superseded designs, implementation plans, checklists, and review notes
+  when the work lands; Git retains their history. Update links and consumers
+  when removing documents or support files.
+- Publish per-run screenshots, videos, logs, traces, and benchmark results as CI
+  artifacts or keep them in ignored `output/`. Do not commit generated evidence;
+  retain only intentional fixtures consumed by tests or current documentation.
+- Keep only the static assets and fixture files their consumers need. Check
+  dynamic filename construction and build manifests before pruning imported
+  asset packs; preserve attribution and canonical source artwork.
 
-## Workflow
+- `macos/` owns the desktop app and native tiled workspace; `js/desktop-runtime`
+  owns its runtime. `apple/NanocodexInbox` targets iPhone and iPad.
+- `js/nanocodex` and `js/nanocodex-react` are public contracts. Cover changes
+  with relevant contract, type, package, and runtime checks.
+- `js/nanocodex-vite` owns the Vite plugin, WASM build, OAuth relay, and
+  Cloudflare Vite integration.
+- Apps and Workers deploy independently. Shared behavior belongs in a package,
+  consumed through its public API.
+- Use root `pnpm` scripts and existing Turbo/Portless/Vite/Wrangler tooling.
+  Deploy dependencies first and `account` last. Component deploy scripts build
+  their dependencies from a clean checkout. See [README.md](README.md) for setup.
+- Use synthetic identities and project data in fixtures and examples. Keep real
+  account IDs, private project inventories, and one-off personal migration plans
+  outside tracked source; pass operational data through private runtime inputs.
 
-- Follow the active work in `PLAN.md` in order. Build vertical library slices
-  with a real consumer; do not accumulate speculative abstractions.
-- Prefer deletion and direct ownership over adapters that merely move data.
-  Cleanup should materially reduce production or planning surface.
-- Use existing project tooling and patterns. Add a dependency only for a
-  concrete need in the current slice.
-- Add focused deterministic tests for public contracts and demonstrated
-  regressions, not for coverage. Compile public examples as part of validation.
-- Use `just run` for a live native smoke. Use focused Harbor trials while
-  iterating and the full configured `just eval` only for milestone/release
-  gates. Never modify benchmark tasks or verifiers to make Nanocodex pass.
-- Inspect the exact JSONL, Harbor result, trajectory, and verifier output for an
-  eval claim. Separate cold image/bootstrap time from warm agent work.
-- Preserve unrelated work. Never commit `.env`, caches, retained jobs, build
-  output, or another user's untracked files.
+- On a shared macOS Hand, invoke Xcode through `scripts/xcodebuild-guard.sh`
+  instead of raw `xcodebuild` for `apple/` and `macos/` work. The per-user OS
+  lock queues builds across agent sessions until the build actually exits; the
+  default `-jobs 3` leaves CPU for interactive use, and UI tests default to one
+  nonparallel Simulator destination. Explicit caller flags override those
+  defaults. Do not boot duplicate simulators for concurrent UI tests; shut down
+  only the simulators used by your run when finished.
 
-## Codex reference
+## Fork workflow overrides
 
-- Use the local checkout at `~/github/openai/codex/codex-rs` before making an
-  architecture or behavior claim about Codex. Do not browse the web or invoke
-  OpenAI documentation tooling unless the user explicitly asks.
-- Codex is evidence, not an API requirement. Copy relevant invariants and
-  operational behavior while keeping Nanocodex's smaller public surface.
-- The reviewed upstream checkpoint is
-  `openai/codex@35eaf3ffb0bf2001486c68c47a3d946b34d16634`. A parity review must
-  inspect every later commit, classify it as port/evaluate/defer/out-of-scope,
-  and cite adopted behavior before advancing the checkpoint.
+- Follow the user's personal isolated-worktree requirements. Create a new
+  thread-dedicated detached worktree outside the repository before changing
+  files. Keep the source checkout read-only unless the user explicitly opts
+  out. Eval-loop overrides do not waive these requirements.
+- Keep commits focused, chronological, and independently understandable. Never
+  mix unrelated cleanup into an iteration commit.
+- Preserve unrelated user work. Never commit `.env`, caches, retained jobs,
+  build output, or another user's untracked files.
 
-## Workspace boundaries
+- Use the local Codex checkout before making architecture or behavior claims
+  about Codex. Do not browse or invoke OpenAI documentation tooling unless the
+  user explicitly asks.
 
-- `nanocodex-oai-api` owns the complete OpenAI boundary: dependency-light
-  prompts/events/wire types, the managed context state machine, persistent
-  transports, typed retry policy, telemetry, and generic Tower client.
-- `nanocodex-tools` owns code mode, built-in tools, the heterogeneous registry,
-  MCP transports and discovery, deferred tool search, and remote dispatch. MCP
-  is always available on native targets.
-- `nanocodex-agent` owns the private driver, lifecycle policy, branching,
-  snapshots, Codex rollouts, and ergonomic agent builders.
-- `nanocodex` is an Alloy-style facade containing reexports, named component
-  modules, and a small prelude. It contains no runtime implementation.
-- Keep facade imports canonical: common types may appear at the crate root and
-  detailed APIs under their owning `agent`, `oai`, or `tools` module. Do not add
-  sibling convenience reexports.
-- `nanocodex-tools/macros` contains the `nanocodex-tools-macros` package that
-  implements `#[tool]`. Keep the executable under `bin/nanocodex`; do not move
-  CLI behavior into the library.
-- The unpublished experimental `nanocodex-egress` crate owns the authenticated
-  loopback HTTP(S) proxy, ephemeral CA, bounded forwarding, and ordered outbound
-  layer seam. Provider and payment behavior stays in the consuming application.
-- Tempo payment policy and `NanoUSD` support stay under `bin/`; public
-  `nanocodex-*` library crates must not depend on them.
-- The unpublished experimental `nanocodex-vm` crate owns the complete VM
-  boundary: the audited libkrun interface, VM/process configuration, gvproxy
-  and provider-neutral egress, OCI/Dockerfile image preparation, and retained
-  host/guest workspace tools. Its guest reuses the canonical local
-  workspace-tool contracts rather than introducing a second tool runtime.
-- Each lower crate must remain useful without importing the higher orchestration
-  crate. Avoid circular concepts and leaky socket/runtime types.
-- `scripts/check-crate-boundaries.sh` is the executable dependency policy.
-  Update its snapshot only for a deliberate architecture change.
+## Frontier eval iteration
 
-## Runtime invariants
+- Optimize for wall-clock time from an idea to evidence from the real benchmark
+  host. Local compilation ceremony, compatibility work, speculative tests, and
+  preserving replaceable experimental processes are subordinate to that loop.
+- Run benchmarks on `ubuntu@dev-georgios`. The canonical state directory is
+  `/mnt/nanocodex-evals/evals` and the canonical ledger is
+  `/mnt/nanocodex-evals/evals/state.sqlite3`. Imports, new worksets, resumed
+  runs, coordinator/API reads, and the eval dashboard use that ledger. Use
+  `--state-dir /mnt/nanocodex-evals/evals` for every benchmark add, run, resume,
+  migration, coordinator/API, and UI operation. Add new profiles and attempts
+  to that ledger instead of creating per-run or smoke state databases. Use
+  another host or state directory only when the user explicitly requests an
+  isolated experiment.
+- Deploy a coherent slice immediately and exercise it there. Start from fresh
+  `origin/master` plus the focused change being tested unless the user names
+  another ref. Build that exact source; if GitHub or DNS is unavailable on the
+  host, transfer the exact local source instead of waiting or using an old
+  deployment.
+- Replacement is component-scoped, not preservation-oriented. Controller/UI
+  work replaces the controller/UI and leaves workers and coordinator alone;
+  coordinator work replaces the coordinator; worker/runtime or schema work may
+  stop the controller and all workers for that benchmark before restarting the
+  whole scoped run. Never disturb unrelated profiles or services. When the user
+  asks to replace a scoped component on the box, replace every running instance
+  of that component instead of preserving stale processes.
+- Do not run `cargo test`, broad `cargo check`, Clippy, or full-workspace builds
+  during the active edit loop. Make the complete focused change, format it, use
+  cheap consumer typechecks when useful, then build once for deployment on
+  `dev-georgios`. Run a focused Rust test only for a demonstrated regression or
+  when the user explicitly asks. Reserve broad validation for an explicit
+  milestone, release gate, or final handoff where its signal justifies the
+  compile time.
+- Never test neural scheduling policy by asserting prompt text. Build, deploy,
+  and exercise orchestration changes against the real coordinator and host.
+  Record worker/VM correspondence, task deltas, completions per unit time,
+  memory, swap, load, pressure, infrastructure retries, and OOMs.
+- High utilization is the goal, not a failure. Judge saturation by productive
+  throughput, stale claims, infrastructure retries, OOM behavior, and recovery;
+  do not label a host unhealthy merely because CPU, RAM, swap, load, or pressure
+  is high. During a normal saturation measurement, never manually shed workers:
+  the OS and controller own exhaustion behavior. Scoped deployment and schema
+  resets are the explicit exception.
+- Treat live waves as telemetry, not blocking work. Continue inspecting real
+  evidence, fixing known failures, and preparing the next deployment while a
+  wave runs. Wait only when a concurrent mutation would invalidate a specific
+  measurement needed for the next decision.
+- Treat obsolete services, systemd drop-ins, scratch directories, deployments,
+  and other stale host residue as operator cleanup. Inspect their exact scope
+  and remove them directly on `dev-georgios`; do not infer a product feature,
+  compatibility path, migration, or automatic cleanup requirement merely
+  because old operational state exists.
+- Use `just run` for a live native smoke, focused trials while iterating, and the
+  full configured eval only for milestone or release gates. Never modify a
+  benchmark task or verifier to make Nanocodex pass. Inspect exact JSONL,
+  trajectories, verifier output, and retained evidence for concrete claims.
 
-- The private spawned driver is the sole owner of mutable conversation, model,
-  tool-runtime, and Tower service state. It runs until all command handles are
-  dropped.
-- One agent reuses its WebSocket, typed history, code-mode runtime, shell
-  sessions, stable cache key, and response chain across sequential turns.
-- Agent-relative tools are instantiated per driver with weak self capabilities;
-  a fork must never inherit a handler that still targets its parent driver.
-- `prompt().await` waits only for command acceptance and returns an independently
-  awaitable `Turn`. Prompt queueing order is owned by the driver.
-- Client-owned typed history is authoritative. Healthy turns send only the new
-  delta with `previous_response_id`; a replacement socket drops that ID and
-  replays complete committed history.
-- Commit only completed responses. A failed partial response must not execute a
-  tool or enter history.
-- Preserve stable prompt/cache identity and byte-stable shared prefixes across
-  turns, retries, compaction, and reconnects. Stored Responses checkpoints are
-  an optional transport optimization for branching; complete client-owned typed
-  history remains authoritative and is replayed when a checkpoint is missing.
-- Cancellation and process cleanup are explicit. Timeout or cancellation must
-  terminate subprocess groups and descendants.
+## Experimental eval state
 
-## Tower boundary
-
-- One Tower call is one complete streamed Responses attempt, through
-  `response.completed` or a typed failure. Do not return success after merely
-  sending the WebSocket frame.
-- `ResponsesClient<S>` remains generic over the caller's concrete
-  `Service<ResponsesAttempt>`; do not box or globalize the service stack.
-- The SDK owns one typed retry/reconnect policy. Caller middleware may wrap it
-  with deadlines, concurrency, load shedding, tracing, metrics, circuit
-  breaking, or error mapping without becoming a second retry owner.
-- An attempt is replayable owned state. Large history remains shared; retrying
-  must not duplicate side effects.
-
-## Events and observability
-
-- Typed events are a public library stream. JSONL is only the process adapter's
-  encoding of that stream, not the internal transport.
-- Tracing is diagnostic and belongs on stderr or in the embedding application's
-  subscriber. It must never replace contractual events.
-- Do not add a generic event bus, shared mutable collector state, or callback
-  framework without a concrete library consumer and an explicit lifecycle.
-- Tracing is a full-fidelity record of all data observed by the agent lifecycle.
-  Preserve complete prompts and instructions, model requests and responses,
-  API-visible reasoning content and summaries, opaque encrypted reasoning
-  payloads, tool arguments and results, steering, cancellations, and lifecycle
-  events in their original order. Do not redact, filter, truncate, or omit
-  observed values based on their content or sensitivity.
-- Put large ordered content in span events rather than searchable span
-  attributes. Keep attributes structural: identity, lineage, ordering, sizes,
-  status, timing, token usage, cache behavior, and routing metadata.
-- Follow init4-style span hygiene: a root span represents one bounded unit of
-  work, not a long-lived driver or session. Correlate sequential turn roots with
-  session and lineage attributes. Propagate explicit parents with the work sent
-  across channels, instrument futures before spawning them, and let concurrent
-  child work appear as overlapping sibling branches.
-- Telemetry must observe the normal runtime data path rather than performing
-  additional configuration or environment reads solely to manufacture trace
-  content. Operators must treat the trace backend as a complete copy of agent
-  conversations and tool activity and apply matching access and retention.
-
-## JSONL adapter contract
-
-- Stdout is flushed JSONL only; diagnostics go to stderr.
-- Every event contains protocol version, stable request/session ID, monotonic
-  sequence, type, and object payload.
-- Emit exactly one terminal event for every accepted prompt and preserve exact
-  input/output streams before deriving ATIF.
-- Harbor owns task containers, verification, and retained eval records. Python
-  may install/run the binary and derive ATIF, but model decisions, API calls,
-  tools, and mutations stay in Rust.
-
-## Rust practices
-
-- Follow Alloy-style Rust: small typed components, explicit ownership, and
-  builder APIs for policy.
-- Put stateful async lifecycle operations on owning structs. Reserve free
-  functions for stateless transformations.
-- Keep repeated wire shapes typed. Use `RawValue` for intentionally retained
-  opaque payloads and `Value` only at genuinely dynamic boundaries; do not turn
-  known history into a DOM for convenience.
-- Prefer moving owned protocol/tool values over cloning them to satisfy a
-  borrowed interface. Keep hot-path allocations and subprocess output bounded
-  while data is produced.
-- Return errors with context. Avoid `unwrap`, `expect`, and silent fallback in
-  runtime paths. Use focused typed errors where callers distinguish policy or
-  retry classes; keep `eyre` at application boundaries.
-- Before handoff run rustfmt, Clippy with warnings denied, relevant tests, and
-  public-example checks. Benchmark performance claims on representative retained
-  traces, not synthetic microbenchmarks alone.
-
-## TUI performance
-
-- Develop the Ratatui consumer against replayed, representative workloads, not
-  visual intuition alone. Treat retained Codex rollout traces and the longest
-  available Amp thread exports as the primary corpus. Codex traces provide
-  event ordering, streaming bursts, tool/reasoning interleaving, and timing;
-  Amp threads provide mature interactive transcript shapes, long messages, and
-  long-session behavior. Discover candidates with `amp threads list
-  --include-archived --json` and read selected payloads with `amp threads export
-  <thread-id>`.
-- Keep the retained trace corpus outside Git. Commit only deterministic derived
-  fixtures or structural workload summaries that are explicitly intended to be
-  source-controlled test data.
-- Give every TUI phase a measured baseline and an explicit regression gate for
-  the costs it changes: state-update throughput, frame construction and layout,
-  rendered frame count, changed-cell/output volume, allocations or retained
-  memory, input-to-frame latency, and resize behavior as applicable.
-- Use focused synthetic cases only to isolate a demonstrated cost or correctness
-  boundary. Validate claimed wins by replaying representative trace-derived
-  sessions at multiple terminal sizes, including streaming and long-history
-  tails.
-
-## Current non-goals
-
-- No app server, JSON-RPC daemon, provider abstraction, approval subsystem,
-  compatibility layer, skills/plugins framework, or alternate runtime mode.
-- Keep the promoted Ratatui, PyO3, and Node/browser WASM consumers as thin
-  adapters over the owned session API; they must consume, not reshape, the
-  library contract. Do not add browser/computer use, JJ review provenance,
-  graders, or a generic local multi-agent scheduler. Application-owned Code
-  Mode child tools and the Ratatui `/btw` fork remain thin consumers of the
-  owned session API rather than core scheduling concepts.
-- Do not expose raw transport response IDs or internal turn IDs. Branching may
-  be exposed through opaque checkpoints on completed typed turn results only
-  after the behavior is implemented end to end.
+- Eval ledgers, coordinator state, retained artifacts, and their schemas are
+  mutable development state, not compatibility boundaries.
+- Keep SQLite `user_version = 1`; it is a current-format marker, not migration
+  history. On every schema change, stop the scoped run, directly mutate the
+  canonical database in place to the one new layout, update the single current
+  schema definition, and restart. Preserve completed rows only when the direct
+  transformation is useful and obvious; otherwise recreate or reseed them.
+- Never add old-schema readers, migration ladders, version-specific branches,
+  dual writes, fallback runtimes, or compatibility shims unless the user
+  explicitly asks. Never return to an older binary because current code rejects
+  experimental state.
+- Do not make backups or pause iteration to preserve experimental state unless
+  the user explicitly requests one. Once the canonical database is migrated,
+  delete obsolete schema and migration code immediately.

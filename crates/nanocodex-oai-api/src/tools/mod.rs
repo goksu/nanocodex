@@ -1,5 +1,8 @@
 //! Dependency-light contract for caller-defined and runtime-provided tools.
 
+mod image_validation;
+pub use image_validation::valid_tool_image_data_url;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{
@@ -24,6 +27,34 @@ pub enum ToolOutputBody {
     Content(Vec<ToolOutputContent>),
 }
 
+impl ToolOutputBody {
+    /// Replaces malformed image envelopes before embedded outputs enter model history.
+    /// This validates MIME and base64 syntax, not image decoding or dimensions.
+    pub fn replace_invalid_image_envelopes(&mut self) {
+        let Self::Content(content) = self else {
+            return;
+        };
+        for item in content {
+            if let ToolOutputContent::InputImage { image_url, .. } = item
+                && !valid_tool_image_data_url(image_url)
+            {
+                *item = ToolOutputContent::InputText {
+                    text: "image content omitted because its data URL was malformed".to_owned(),
+                };
+            }
+        }
+    }
+
+    /// Returns the machine-readable value represented by this output.
+    #[must_use]
+    pub fn structured_result(&self) -> Value {
+        match self {
+            Self::Text(text) => Value::String(text.clone()),
+            Self::Content(content) => serde_json::to_value(content).unwrap_or(Value::Null),
+        }
+    }
+}
+
 /// One model-visible item in a multimodal tool output.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -45,6 +76,11 @@ pub enum ToolOutputContent {
         /// Data URL or provider-supported audio URL.
         audio_url: String,
     },
+    /// Opaque encrypted provider content returned without exposing plaintext.
+    EncryptedContent {
+        /// Provider-generated encrypted payload.
+        encrypted_content: String,
+    },
 }
 
 /// Complete output of one tool invocation.
@@ -59,7 +95,7 @@ pub struct ToolOutput {
     pub success: bool,
     /// Optional validated opaque metadata for events and adapters.
     pub metadata: Option<Box<RawValue>>,
-    code_mode_value: Option<Value>,
+    structured_result: Option<Value>,
     process_trace: Option<ToolProcessTrace>,
 }
 
@@ -70,7 +106,7 @@ pub struct ToolOutput {
 pub struct ToolOutputWire {
     pub output: ToolOutputBody,
     pub success: bool,
-    pub code_mode_value: Option<Box<RawValue>>,
+    pub structured_result: Option<Box<RawValue>>,
     pub metadata: Option<Box<RawValue>>,
     pub process_trace: Option<ToolProcessTraceWire>,
 }
@@ -117,7 +153,7 @@ impl ToolOutput {
             output: ToolOutputBody::Text(output.into()),
             success: true,
             metadata: None,
-            code_mode_value: None,
+            structured_result: None,
             process_trace: None,
         }
     }
@@ -129,7 +165,7 @@ impl ToolOutput {
             output: ToolOutputBody::Text(error.into()),
             success: false,
             metadata: None,
-            code_mode_value: None,
+            structured_result: None,
             process_trace: None,
         }
     }
@@ -137,16 +173,16 @@ impl ToolOutput {
     /// Serializes one successful function result as JSON text.
     #[must_use]
     pub fn json(output: &impl Serialize) -> Self {
-        match serde_json::to_string(output) {
-            Ok(output) => Self::text(output),
+        match serde_json::to_value(output) {
+            Ok(output) => Self::from_json(output, true),
             Err(error) => Self::error(format!("failed to encode tool result: {error}")),
         }
     }
 
     /// Creates a JSON result with an explicit success state.
     ///
-    /// Code Mode receives the typed JSON value while the Responses API
-    /// receives its serialized text representation.
+    /// Structured consumers receive the typed JSON value while the Responses
+    /// API receives its serialized text representation.
     #[must_use]
     pub fn from_json(output: Value, success: bool) -> Self {
         match serde_json::to_string(&output) {
@@ -154,7 +190,7 @@ impl ToolOutput {
                 output: ToolOutputBody::Text(encoded),
                 success,
                 metadata: None,
-                code_mode_value: Some(output),
+                structured_result: Some(output),
                 process_trace: None,
             },
             Err(error) => Self::error(format!("failed to encode tool result: {error}")),
@@ -168,7 +204,7 @@ impl ToolOutput {
             output: ToolOutputBody::Content(output),
             success: true,
             metadata: None,
-            code_mode_value: None,
+            structured_result: None,
             process_trace: None,
         }
     }
@@ -189,28 +225,32 @@ impl ToolOutput {
         self
     }
 
-    /// Returns the value exposed to Code Mode.
-    #[doc(hidden)]
+    /// Returns the exact machine-readable tool result.
+    ///
+    /// An explicit structured result takes precedence. Otherwise plain text
+    /// remains a string and multimodal content becomes an array.
     #[must_use]
-    pub fn code_mode_value(&self) -> Value {
-        if let Some(value) = &self.code_mode_value {
+    pub fn structured_result(&self) -> Value {
+        if let Some(value) = &self.structured_result {
             return value.clone();
         }
-        match &self.output {
-            ToolOutputBody::Text(text) => {
-                serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.clone()))
-            }
-            ToolOutputBody::Content(content) => {
-                serde_json::to_value(content).unwrap_or(Value::Null)
-            }
-        }
+        self.output.structured_result()
     }
 
-    /// Replaces the value exposed to Code Mode.
+    /// Moves the explicit machine-readable result without cloning its payload.
+    /// Falls back to the model-visible body when no explicit result is present.
     #[doc(hidden)]
     #[must_use]
-    pub fn with_code_mode_value(mut self, value: Value) -> Self {
-        self.code_mode_value = Some(value);
+    pub fn take_structured_result(&mut self) -> Value {
+        self.structured_result
+            .take()
+            .unwrap_or_else(|| self.output.structured_result())
+    }
+
+    /// Sets the exact machine-readable result independently of model-visible output.
+    #[must_use]
+    pub fn with_structured_result(mut self, value: Value) -> Self {
+        self.structured_result = Some(value);
         self
     }
 
@@ -246,14 +286,14 @@ impl ToolOutput {
     ///
     /// # Errors
     ///
-    /// Returns an error if the internal Code Mode JSON cannot be encoded.
+    /// Returns an error if the internal structured result cannot be encoded.
     #[doc(hidden)]
     pub fn into_wire(self) -> Result<ToolOutputWire, serde_json::Error> {
         Ok(ToolOutputWire {
             output: self.output,
             success: self.success,
-            code_mode_value: self
-                .code_mode_value
+            structured_result: self
+                .structured_result
                 .map(|value| to_raw_value(&value))
                 .transpose()?,
             metadata: self.metadata,
@@ -265,15 +305,15 @@ impl ToolOutput {
     ///
     /// # Errors
     ///
-    /// Returns an error if an opaque Code Mode value cannot be decoded.
+    /// Returns an error if an opaque structured result cannot be decoded.
     #[doc(hidden)]
     pub fn from_wire(wire: ToolOutputWire) -> Result<Self, serde_json::Error> {
         Ok(Self {
             output: wire.output,
             success: wire.success,
             metadata: wire.metadata,
-            code_mode_value: wire
-                .code_mode_value
+            structured_result: wire
+                .structured_result
                 .map(|value| serde_json::from_str(value.get()))
                 .transpose()?,
             process_trace: wire.process_trace.map(Into::into),
@@ -311,8 +351,11 @@ pub struct ToolContext<'a> {
     model: &'a str,
     session_id: &'a str,
     call_id: &'a str,
+    turn_id: Option<&'a str>,
     history: &'a [ResponseItem],
     output_token_budget: usize,
+    host_context: Option<&'a str>,
+    instruction_revision: Option<u64>,
 }
 
 impl<'a> ToolContext<'a> {
@@ -329,9 +372,41 @@ impl<'a> ToolContext<'a> {
             model,
             session_id,
             call_id,
+            turn_id: None,
             history,
             output_token_budget,
+            host_context: None,
+            instruction_revision: None,
         }
+    }
+
+    /// Captures the runtime instruction revision at the model call boundary.
+    #[must_use]
+    pub const fn with_instruction_revision(mut self, revision: Option<u64>) -> Self {
+        self.instruction_revision = revision;
+        self
+    }
+
+    /// Returns the captured revision, never a live runtime lookup.
+    #[must_use]
+    pub const fn instruction_revision(self) -> Option<u64> {
+        self.instruction_revision
+    }
+
+    /// Attaches embedding-owned invocation context without exposing it to tool
+    /// schemas or serialized model-visible values.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn with_host_context(mut self, host_context: Option<&'a str>) -> Self {
+        self.host_context = host_context;
+        self
+    }
+
+    /// Returns embedding-owned invocation context, when one was supplied.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn host_context(self) -> Option<&'a str> {
+        self.host_context
     }
 
     /// Returns the fixed model contract for this invocation.
@@ -350,6 +425,20 @@ impl<'a> ToolContext<'a> {
     #[must_use]
     pub const fn call_id(self) -> &'a str {
         self.call_id
+    }
+
+    /// Attaches the host's stable logical-turn identity. This is shared by all
+    /// tool calls in a turn and must not be replaced with a tool-call identity.
+    #[must_use]
+    pub const fn with_turn_id(mut self, turn_id: Option<&'a str>) -> Self {
+        self.turn_id = turn_id;
+        self
+    }
+
+    /// Returns the logical-turn identity, if supplied by the execution host.
+    #[must_use]
+    pub const fn turn_id(self) -> Option<&'a str> {
+        self.turn_id
     }
 
     /// Returns committed authoritative history visible at this call boundary.

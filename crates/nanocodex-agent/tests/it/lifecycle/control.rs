@@ -11,6 +11,55 @@ async fn forking_before_a_completed_turn_is_typed() {
 }
 
 #[tokio::test]
+async fn live_snapshot_requires_a_safe_boundary_and_does_not_change_parent() {
+    let (retained, _retained_attempts) = mpsc::unbounded_channel();
+    let openai = OpenAi::builder("test")
+        .service(move || RetainingCompletedService {
+            retained: retained.clone(),
+        })
+        .build()
+        .unwrap();
+    let tools = Tools::builder().without_defaults().build().unwrap();
+    let (agent, events) = Nanocodex::builder(openai).tools(tools).build().unwrap();
+    assert!(matches!(
+        agent.snapshot().await,
+        Err(NanocodexError::ForkBeforeCompletedTurn)
+    ));
+
+    let first = agent
+        .prompt("first request")
+        .await
+        .unwrap()
+        .result()
+        .await
+        .unwrap();
+    let first_snapshot = serde_json::to_value(first.snapshot().unwrap()).unwrap();
+    let copied = serde_json::to_value(agent.snapshot().await.unwrap()).unwrap();
+    assert_eq!(copied, first_snapshot);
+    assert_eq!(
+        serde_json::to_value(agent.snapshot().await.unwrap()).unwrap(),
+        copied
+    );
+
+    // A second turn must still be accepted by the unchanged parent, and the
+    // exported boundary must advance rather than inheriting its old value.
+    let second = agent
+        .prompt("second request")
+        .await
+        .unwrap()
+        .result()
+        .await
+        .unwrap();
+    let second_snapshot = serde_json::to_value(second.snapshot().unwrap()).unwrap();
+    assert_eq!(
+        serde_json::to_value(agent.snapshot().await.unwrap()).unwrap(),
+        second_snapshot
+    );
+    assert_ne!(copied["history"], second_snapshot["history"]);
+    drop((agent, events));
+}
+
+#[tokio::test]
 async fn steering_without_an_active_turn_is_typed() {
     let openai = OpenAi::builder("test")
         .service(|| PendingService)
@@ -51,6 +100,40 @@ async fn caller_service_factory_supports_cancellation() {
         Err(NanocodexError::TurnCancelled)
     ));
     assert_eq!(builds.load(Ordering::Relaxed), 2);
+    drop((agent, events));
+}
+
+#[tokio::test]
+async fn cancel_on_admission_never_dispatches_model_work() {
+    let openai = OpenAi::builder("test")
+        .service(|| NeverCalled)
+        .build()
+        .unwrap();
+    let (agent, mut events) = Nanocodex::builder(openai).build().unwrap();
+    let turn = agent
+        .prompt(PromptRequest::new("cancel before work").cancel_on_admission())
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        turn.result().await,
+        Err(NanocodexError::TurnCancelled)
+    ));
+    let mut observed = Vec::new();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("cancelled admission should publish its terminal events")
+            .expect("event stream should remain open");
+        let terminal = event.kind.is_terminal();
+        observed.push(event.kind);
+        if terminal {
+            break;
+        }
+    }
+    assert!(observed.contains(&nanocodex_agent::events::AgentEventKind::RunStarted));
+    assert!(observed.contains(&nanocodex_agent::events::AgentEventKind::RunFailed));
+    assert!(!observed.contains(&nanocodex_agent::events::AgentEventKind::ModelAttemptStarted));
     drop((agent, events));
 }
 
@@ -118,7 +201,17 @@ async fn adapter_developer_context_is_visible_at_safe_model_boundaries() {
         .append_developer_message("adapter session started")
         .await
         .unwrap();
-    assert!(initial.history().is_empty());
+    assert!(initial.history().iter().any(|item| matches!(
+        item,
+        ResponseItem::Message {
+            role: MessageRole::Developer,
+            content,
+            ..
+        } if content.iter().any(|part| matches!(
+            part,
+            ContentItem::InputText { text } if text.as_ref() == "adapter session started"
+        ))
+    )));
     assert!(!initial.workspace().is_empty());
 
     agent
@@ -130,19 +223,23 @@ async fn adapter_developer_context_is_visible_at_safe_model_boundaries() {
         .unwrap();
     let first = retained_attempts.recv().await.unwrap();
     let first_items = first.input_items().collect::<Vec<_>>();
+    assert!(first_items.iter().any(|item| matches!(
+        item,
+        ResponseItem::Message {
+            role: MessageRole::Developer,
+            content,
+            ..
+        } if content.iter().any(|part| matches!(
+            part,
+            ContentItem::InputText { text } if text.as_ref() == "adapter session started"
+        ))
+    )));
     assert!(matches!(
-        first_items.as_slice(),
-        [
-            ..,
-            ResponseItem::Message {
-                role: MessageRole::Developer,
-                ..
-            },
-            ResponseItem::Message {
-                role: MessageRole::User,
-                ..
-            }
-        ]
+        first_items.last(),
+        Some(ResponseItem::Message {
+            role: MessageRole::User,
+            ..
+        })
     ));
 
     let completed = agent

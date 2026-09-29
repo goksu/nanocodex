@@ -6,11 +6,12 @@ use std::{
     },
 };
 
-use nanocodex_oai_api::{auth::OpenAiAuth, tools::ToolDefinition};
+use nanocodex_oai_api::{auth::OpenAiAuth, responses::JsonSchema, tools::ToolDefinition};
 use serde::Deserialize;
 use serde_json::{Value, json, value::to_raw_value};
+use tempfile::tempdir;
 
-use crate::{ToolOutputBody, ToolResult, contract::DEFAULT_TOOL_OUTPUT_TOKENS};
+use crate::{ToolOutputBody, ToolResult, WorkspaceTools, contract::DEFAULT_TOOL_OUTPUT_TOKENS};
 
 use super::{
     DynamicToolProvider, ImageGenerationConfig, Tool, ToolContext, ToolExposure, ToolInput,
@@ -31,6 +32,8 @@ struct Search {
     activated: Arc<AtomicBool>,
 }
 
+struct NativeSearch;
+
 struct DeferredProvider {
     activated: Arc<AtomicBool>,
     started: AtomicBool,
@@ -46,6 +49,11 @@ struct StartTrackingProvider {
 }
 
 struct CollisionTool;
+
+struct NamedTool {
+    name: &'static str,
+    output: &'static str,
+}
 
 struct DeclaredProvider {
     name: &'static str,
@@ -75,7 +83,22 @@ impl Tool for Double {
 
     async fn execute(&self, input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
         let input = input.decode_json::<DoubleInput>()?;
-        Ok(ToolOutput::text((input.value * 2).to_string()))
+        Ok(ToolOutput::json(&(input.value * 2)))
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for NamedTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::function(
+            self.name,
+            format!("Returns {}.", self.output),
+            json!({ "type": "object", "properties": {} }),
+        )
+    }
+
+    async fn execute(&self, _input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
+        Ok(ToolOutput::text(self.output))
     }
 }
 
@@ -226,6 +249,26 @@ impl Tool for Search {
 }
 
 #[async_trait::async_trait]
+impl Tool for NativeSearch {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::tool_search(
+            "client",
+            "Searches deferred tools.",
+            JsonSchema::from(json!({
+                "type": "object",
+                "properties": { "query": { "type": "string" } },
+                "required": ["query"],
+                "additionalProperties": false
+            })),
+        )
+    }
+
+    async fn execute(&self, _input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
+        Ok(ToolOutput::from_json(json!([]), true))
+    }
+}
+
+#[async_trait::async_trait]
 impl DynamicToolProvider for DeferredProvider {
     fn start(&self) {
         self.started.store(true, Ordering::Release);
@@ -372,8 +415,8 @@ fn runtime_construction_starts_providers_and_preserves_eager_prewarm() {
     assert_eq!(prewarmed_state.startups.load(Ordering::Relaxed), 1);
 }
 
-#[tokio::test]
-async fn parallel_safety_follows_direct_then_provider_dispatch_precedence() {
+#[test]
+fn fixed_and_provider_catalog_collisions_are_rejected() {
     let direct_collision = Tools::builder()
         .without_defaults()
         .tool(CollisionTool)
@@ -382,26 +425,11 @@ async fn parallel_safety_follows_direct_then_provider_dispatch_precedence() {
             parallel_safe: true,
             output: "provider",
         })
-        .build()
-        .unwrap();
-    let direct_collision = ToolRuntime::new_with_tools(".", None, None, &direct_collision);
-    assert!(direct_collision.contains("collision"));
-    assert!(!direct_collision.supports_parallel_tool_calls("collision"));
-    let context = ToolContext::new(
-        "test-model",
-        "test-session",
-        "test-call",
-        &[],
-        DEFAULT_TOOL_OUTPUT_TOKENS,
-    );
-    let direct = direct_collision
-        .execute_tool(
-            "collision",
-            ToolInput::Function(to_raw_value(&json!({})).unwrap()),
-            context,
-        )
-        .await;
-    assert_eq!(direct.code_mode_value(), json!("direct"));
+        .build();
+    assert!(matches!(
+        direct_collision,
+        Err(super::ToolsBuildError::DuplicateName(name)) if name.as_ref() == "collision"
+    ));
 
     let provider_collision = Tools::builder()
         .without_defaults()
@@ -415,19 +443,12 @@ async fn parallel_safety_follows_direct_then_provider_dispatch_precedence() {
             parallel_safe: true,
             output: "second",
         })
-        .build()
-        .unwrap();
-    let provider_collision = ToolRuntime::new_with_tools(".", None, None, &provider_collision);
-    assert!(provider_collision.contains("provider_collision"));
-    assert!(!provider_collision.supports_parallel_tool_calls("provider_collision"));
-    let provider = provider_collision
-        .execute_tool(
-            "provider_collision",
-            ToolInput::Function(to_raw_value(&json!({})).unwrap()),
-            context,
-        )
-        .await;
-    assert_eq!(provider.code_mode_value(), json!("first"));
+        .build();
+    assert!(matches!(
+        provider_collision,
+        Err(super::ToolsBuildError::DuplicateName(name))
+            if name.as_ref() == "provider_collision"
+    ));
 }
 
 #[test]
@@ -447,6 +468,100 @@ fn without_defaults_allows_replacing_a_standard_workspace_tool() {
         .collect::<Vec<_>>();
 
     assert_eq!(names, ["exec_command"]);
+}
+
+#[test]
+fn workspace_tool_source_is_a_singleton() {
+    let result = Tools::builder()
+        .without_defaults()
+        .add(WorkspaceTools::new("first"))
+        .add(WorkspaceTools::new("second"))
+        .build();
+
+    assert!(matches!(
+        result,
+        Err(super::ToolsBuildError::DuplicateSource("workspace"))
+    ));
+}
+
+#[tokio::test]
+async fn workspace_tool_source_overrides_the_runtime_root_and_retains_shell_sessions() {
+    let source_workspace = tempdir().unwrap();
+    let ignored_workspace = tempdir().unwrap();
+    let tools = Tools::builder()
+        .without_defaults()
+        .add(WorkspaceTools::new(source_workspace.path()))
+        .build()
+        .unwrap();
+    let runtime = ToolRuntime::new_with_tools(ignored_workspace.path(), None, None, &tools);
+
+    assert_eq!(
+        runtime.working_directory(),
+        source_workspace.path().to_str().unwrap()
+    );
+
+    let output = runtime
+        .execute_tool(
+            "exec_command",
+            ToolInput::Function(
+                to_raw_value(&json!({
+                    "cmd": "pwd; sleep 30",
+                    "yield_time_ms": 250,
+                }))
+                .unwrap(),
+            ),
+            ToolContext::new(
+                "test-model",
+                "test-session",
+                "test-call",
+                &[],
+                DEFAULT_TOOL_OUTPUT_TOKENS,
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(output.success);
+    let session_id = output
+        .process_trace()
+        .and_then(|process| process.session_id)
+        .expect("long-running workspace command should retain a shell session");
+    assert!(runtime.has_shell_session(session_id).await);
+    let mut stdout = output.structured_result()["output"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let observed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !stdout.contains(source_workspace.path().to_str().unwrap()) {
+            let output = runtime
+                .execute_tool(
+                    "write_stdin",
+                    ToolInput::Function(
+                        to_raw_value(&json!({
+                            "session_id": session_id, "chars": "", "yield_time_ms": 100,
+                        }))
+                        .unwrap(),
+                    ),
+                    ToolContext::new(
+                        "test-model",
+                        "test-session",
+                        "poll-ready",
+                        &[],
+                        DEFAULT_TOOL_OUTPUT_TOKENS,
+                    ),
+                )
+                .await
+                .unwrap();
+            assert!(output.success);
+            stdout.push_str(
+                output.structured_result()["output"]
+                    .as_str()
+                    .unwrap_or_default(),
+            );
+        }
+    })
+    .await;
+    runtime.control().cancel().await;
+    observed.expect("workspace command must report its working directory");
 }
 
 #[test]
@@ -535,6 +650,231 @@ fn exposure_controls_direct_visibility_without_removing_code_mode_access() {
 }
 
 #[test]
+fn per_tool_exposure_selects_direct_and_code_mode_surfaces_independently() {
+    let tools = Tools::builder()
+        .without_defaults()
+        .tool(NamedTool {
+            name: "nested_only",
+            output: "nested",
+        })
+        .tool_with_exposure(
+            NamedTool {
+                name: "direct_only",
+                output: "direct",
+            },
+            ToolExposure::DirectOnly,
+        )
+        .tool_with_exposure(
+            NamedTool {
+                name: "hidden",
+                output: "hidden",
+            },
+            ToolExposure::Hidden,
+        )
+        .build()
+        .unwrap();
+    let runtime = ToolRuntime::new_with_tools(".", None, None, &tools);
+
+    assert_eq!(
+        runtime
+            .model_specs("test-session")
+            .iter()
+            .map(ToolDefinition::name)
+            .collect::<Vec<_>>(),
+        ["exec", "wait", "direct_only"]
+    );
+    assert_eq!(
+        runtime.model_contract("test-session").1,
+        [("nested_only".to_owned(), "nested_only".to_owned())]
+    );
+    assert!(
+        runtime.contains("hidden"),
+        "hidden tools remain dispatchable"
+    );
+}
+
+#[test]
+fn registered_normalized_code_mode_name_collisions_are_rejected() {
+    let result = Tools::builder()
+        .without_defaults()
+        .exposure(ToolExposure::DirectAndCodeMode)
+        .tool(NamedTool {
+            name: "normalized-alias",
+            output: "first",
+        })
+        .tool(NamedTool {
+            name: "normalized_alias",
+            output: "second",
+        })
+        .build();
+
+    assert!(matches!(
+        result,
+        Err(super::ToolsBuildError::NormalizedNameCollision {
+            first,
+            second,
+            normalized,
+        }) if first.as_ref() == "normalized-alias"
+            && second.as_ref() == "normalized_alias"
+            && normalized.as_ref() == "normalized_alias"
+    ));
+}
+
+#[test]
+fn registered_public_tool_names_match_the_wire_grammar() {
+    let too_long: &'static str = Box::leak("a".repeat(129).into_boxed_str());
+    for name in ["_starts_wrong", "has space", "unicodé", too_long] {
+        let result = Tools::builder()
+            .without_defaults()
+            .tool(NamedTool {
+                name,
+                output: "invalid",
+            })
+            .build();
+        assert!(matches!(
+            result,
+            Err(super::ToolsBuildError::InvalidPublicName(candidate)) if candidate.as_ref() == name
+        ));
+    }
+
+    assert!(
+        Tools::builder()
+            .without_defaults()
+            .tool(NamedTool {
+                name: "a.valid:tool-name_1",
+                output: "valid",
+            })
+            .build()
+            .is_ok()
+    );
+}
+
+#[test]
+fn published_catalog_names_reject_invalid_and_normalized_collisions() {
+    assert!(matches!(
+        crate::selection::validate_public_tool_catalog_names(["invalid name"]),
+        Err(crate::selection::PublicToolCatalogError::InvalidName(name))
+            if name.as_ref() == "invalid name"
+    ));
+    assert!(matches!(
+        crate::selection::validate_public_tool_catalog_names([
+            "mcp__docs__read-file",
+            "mcp__docs__read_file",
+        ]),
+        Err(crate::selection::PublicToolCatalogError::NormalizedNameCollision {
+            first,
+            second,
+            normalized,
+        }) if first.as_ref() == "mcp__docs__read-file"
+            && second.as_ref() == "mcp__docs__read_file"
+            && normalized.as_ref() == "mcp__docs__read_file"
+    ));
+}
+
+#[test]
+fn registered_tools_cannot_replace_host_owned_routing_tools() {
+    for name in ["exec", "wait", "tool_search"] {
+        let result = Tools::builder()
+            .without_defaults()
+            .tool(NamedTool {
+                name,
+                output: "replacement",
+            })
+            .build();
+        assert!(matches!(
+            result,
+            Err(super::ToolsBuildError::ReservedName(candidate)) if candidate.as_ref() == name
+        ));
+    }
+
+    assert!(
+        Tools::builder()
+            .without_defaults()
+            .tool(NativeSearch)
+            .build()
+            .is_ok()
+    );
+}
+
+#[test]
+fn composing_a_recipe_revalidates_normalized_names() {
+    let tools = Tools::builder()
+        .without_defaults()
+        .tool(NamedTool {
+            name: "read-file",
+            output: "first",
+        })
+        .build()
+        .unwrap();
+    let result = tools
+        .into_builder()
+        .tool(NamedTool {
+            name: "read_file",
+            output: "second",
+        })
+        .build();
+
+    assert!(matches!(
+        result,
+        Err(super::ToolsBuildError::NormalizedNameCollision { normalized, .. })
+            if normalized.as_ref() == "read_file"
+    ));
+}
+
+#[tokio::test]
+async fn hidden_private_names_remain_dispatchable() {
+    let tools = Tools::builder()
+        .without_defaults()
+        .tool_with_exposure(
+            NamedTool {
+                name: "_internal/tool",
+                output: "private",
+            },
+            ToolExposure::Hidden,
+        )
+        .build()
+        .unwrap();
+    let runtime = ToolRuntime::new_with_tools(".", None, None, &tools);
+    let output = runtime
+        .execute_tool(
+            "_internal/tool",
+            ToolInput::Function(to_raw_value(&json!({})).unwrap()),
+            ToolContext::new(
+                "test-model",
+                "test-session",
+                "test-call",
+                &[],
+                DEFAULT_TOOL_OUTPUT_TOKENS,
+            ),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(output.structured_result(), json!("private"));
+    assert!(
+        runtime
+            .model_specs("test-session")
+            .iter()
+            .all(|definition| {
+                !serde_json::to_string(definition)
+                    .unwrap()
+                    .contains("_internal/tool")
+            })
+    );
+    assert!(matches!(
+        Tools::builder()
+            .without_defaults()
+            .tool(NamedTool {
+                name: "_internal/tool",
+                output: "visible",
+            })
+            .build(),
+        Err(super::ToolsBuildError::InvalidPublicName(name))
+            if name.as_ref() == "_internal/tool"
+    ));
+}
+
+#[test]
 fn tool_recipe_overrides_model_visible_environment_context() {
     let tools = Tools::builder()
         .without_defaults()
@@ -606,7 +946,7 @@ async fn registered_tool_is_described_and_callable_from_code_mode() {
         .tool(Double)
         .build()
         .unwrap();
-    let runtime = ToolRuntime::new(".", None, None).with_tools(&tools);
+    let runtime = ToolRuntime::new_with_tools(".", None, None, &tools);
     let description = serde_json::to_value(runtime.model_specs("test-session")).unwrap();
     assert!(
         description[0]["description"]
@@ -630,11 +970,13 @@ text(result);
                 DEFAULT_TOOL_OUTPUT_TOKENS,
             ),
         )
-        .await;
+        .await
+        .unwrap();
     assert!(execution.success);
     assert_eq!(execution.nested_calls.len(), 1);
     assert_eq!(execution.nested_calls[0].name, "double");
     assert_eq!(execution.nested_calls[0].input, json!({ "value": 21 }));
+    assert_eq!(execution.nested_calls[0].structured_result, json!(42));
     let ToolOutputBody::Content(content) = execution.output else {
         panic!("expected content output");
     };
@@ -655,7 +997,7 @@ async fn handler_errors_become_failed_model_visible_results() {
         .tool(Fails)
         .build()
         .unwrap();
-    let runtime = ToolRuntime::new(".", None, None).with_tools(&tools);
+    let runtime = ToolRuntime::new_with_tools(".", None, None, &tools);
     let execution = runtime
         .registry
         .execute_nested(
@@ -686,7 +1028,7 @@ async fn handler_panics_become_aborted_outputs_without_escaping_the_runtime() {
         .provider(PanickingProvider)
         .build()
         .unwrap();
-    let runtime = ToolRuntime::new(".", None, None).with_tools(&tools);
+    let runtime = ToolRuntime::new_with_tools(".", None, None, &tools);
     let context = ToolContext::new(
         "test-model",
         "test-session",
@@ -711,7 +1053,8 @@ async fn handler_panics_become_aborted_outputs_without_escaping_the_runtime() {
             ToolInput::Function(to_raw_value(&json!({})).unwrap()),
             context,
         )
-        .await;
+        .await
+        .unwrap();
     assert!(!provider.success);
     assert!(matches!(
         provider.output,
@@ -730,7 +1073,7 @@ async fn direct_model_calls_reach_activated_dynamic_tools() {
         .build()
         .unwrap();
     tools.start_providers();
-    let runtime = ToolRuntime::new(".", None, None).with_tools(&tools);
+    let runtime = ToolRuntime::new_with_tools(".", None, None, &tools);
     let context = ToolContext::new(
         "test-model",
         "test-session",
@@ -745,7 +1088,8 @@ async fn direct_model_calls_reach_activated_dynamic_tools() {
             ToolInput::Function(to_raw_value(&json!({ "query": "echo" })).unwrap()),
             context,
         )
-        .await;
+        .await
+        .unwrap();
     assert!(search.success);
 
     let execution = runtime
@@ -754,9 +1098,10 @@ async fn direct_model_calls_reach_activated_dynamic_tools() {
             ToolInput::Function(to_raw_value(&json!({ "value": 21 })).unwrap()),
             context,
         )
-        .await;
+        .await
+        .unwrap();
     assert!(execution.success);
-    assert_eq!(execution.code_mode_value(), json!({ "value": 21 }));
+    assert_eq!(execution.structured_result(), json!({ "value": 21 }));
 }
 
 #[tokio::test]
@@ -770,7 +1115,7 @@ async fn code_mode_can_search_and_call_a_deferred_tool_in_one_cell() {
         .build()
         .unwrap();
     tools.start_providers();
-    let runtime = ToolRuntime::new(".", None, None).with_tools(&tools);
+    let runtime = ToolRuntime::new_with_tools(".", None, None, &tools);
     let model_specs_before = serde_json::to_vec(&runtime.model_specs("test-session")).unwrap();
     let model_specs_value = serde_json::to_value(runtime.model_specs("test-session")).unwrap();
     assert!(
@@ -794,7 +1139,8 @@ text(result.value);
                 DEFAULT_TOOL_OUTPUT_TOKENS,
             ),
         )
-        .await;
+        .await
+        .unwrap();
 
     assert!(execution.success);
     assert_eq!(

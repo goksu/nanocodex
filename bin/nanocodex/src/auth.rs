@@ -2,7 +2,7 @@ use std::{path::PathBuf, process::Command};
 
 use clap::{Args, Subcommand};
 use eyre::{Result, WrapErr};
-use nanocodex::oai::auth::{ChatGptLogin, chatgpt_auth_status, logout_chatgpt};
+use nanocodex::oai::auth::{ChatGptLogin, logout_chatgpt, resolve_chatgpt_auth_status};
 
 use crate::config::default_auth_file;
 
@@ -15,7 +15,7 @@ pub(crate) struct Auth {
 #[derive(Subcommand)]
 enum AuthCommand {
     /// Sign Codex and Nanocodex in with a `ChatGPT` subscription.
-    Login(AuthFile),
+    Login(AuthLogin),
     /// Show the locally selected `ChatGPT` account without displaying tokens.
     Status(AuthFile),
     /// Remove the shared credentials, logging Codex and Nanocodex out.
@@ -29,11 +29,20 @@ struct AuthFile {
     auth_file: Option<PathBuf>,
 }
 
+#[derive(Args)]
+struct AuthLogin {
+    #[command(flatten)]
+    auth: AuthFile,
+    /// Print the authorization URL without opening a browser.
+    #[arg(long)]
+    no_open: bool,
+}
+
 impl Auth {
     pub(crate) async fn run(self) -> Result<()> {
         match self.command {
-            AuthCommand::Login(args) => login(args.path()?).await,
-            AuthCommand::Status(args) => status(&args.path()?),
+            AuthCommand::Login(args) => login(args.auth.path()?, !args.no_open).await,
+            AuthCommand::Status(args) => status(&args.path()?).await,
             AuthCommand::Logout(args) => logout(&args.path()?),
         }
     }
@@ -45,13 +54,13 @@ impl AuthFile {
     }
 }
 
-async fn login(auth_file: PathBuf) -> Result<()> {
+async fn login(auth_file: PathBuf, open_automatically: bool) -> Result<()> {
     let login = ChatGptLogin::start(&auth_file)
         .await
         .wrap_err("failed to start ChatGPT login")?;
     let url = login.authorization_url().to_owned();
     eprintln!("Open this URL to sign in with ChatGPT:\n\n{url}\n");
-    if let Err(error) = open_browser(&url) {
+    if open_automatically && let Err(error) = open_browser(&url) {
         eprintln!("Could not open a browser automatically ({error}). Open the URL above manually.");
     }
     let account = login
@@ -70,8 +79,9 @@ async fn login(auth_file: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn status(auth_file: &PathBuf) -> Result<()> {
-    let account = chatgpt_auth_status(auth_file)
+async fn status(auth_file: &PathBuf) -> Result<()> {
+    let account = resolve_chatgpt_auth_status(auth_file)
+        .await
         .wrap_err_with(|| format!("could not load {}", auth_file.display()))?;
     println!("Logged in with ChatGPT");
     if let Some(email) = account.email {
@@ -101,7 +111,7 @@ fn logout(auth_file: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn open_browser(url: &str) -> std::io::Result<()> {
+pub(crate) fn open_browser(url: &str) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     let mut command = Command::new("open");
     #[cfg(target_os = "linux")]

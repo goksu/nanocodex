@@ -5,10 +5,112 @@ All notable changes to Nanocodex are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.6](https://github.com/gakonst/nanocodex/releases/tag/v0.6.6) - 2026-09-29
+
+### Miscellaneous Tasks
+
+- Remove obsolete docs, artifacts, and low-signal tests ([#568](https://github.com/gakonst/nanocodex/issues/568))
+
+## [0.6.5](https://github.com/gakonst/nanocodex/releases/tag/v0.6.5) - 2026-09-24
+
+### Miscellaneous Tasks
+
+- Prepare release 0.6.5 ([#584](https://github.com/gakonst/nanocodex/issues/584))
+
+### Other
+
+- Restore unchanged repository files omitted from frontier REST publication
+- Support configured Cloudflare REST transport for frontier inference ([#495](https://github.com/gakonst/nanocodex/issues/495))
+
+## [0.6.4](https://github.com/gakonst/nanocodex/releases/tag/v0.6.4) - 2026-09-19
+
+### Miscellaneous Tasks
+
+- Prepare release 0.6.4 with minified QuickJS fix ([#420](https://github.com/gakonst/nanocodex/issues/420))
+- Prepare corrected release 0.6.3 ([#418](https://github.com/gakonst/nanocodex/issues/418))
+- Prepare release 0.6.2 ([#416](https://github.com/gakonst/nanocodex/issues/416))
+
+## [0.6.1](https://github.com/gakonst/nanocodex/releases/tag/v0.6.1) - 2026-09-15
+
+### Bug Fixes
+
+- [voice] Ship verified native runtime in 0.6.1 ([#333](https://github.com/gakonst/nanocodex/issues/333))
+
+## [0.6.0](https://github.com/gakonst/nanocodex/releases/tag/v0.6.0) - 2026-09-15
+
+### Rust API migration
+
+Read the [0.5 → 0.6 Rust API changelog and migration guide](https://github.com/gakonst/nanocodex/blob/v0.6.0/docs/MIGRATING_0_6.md) before upgrading.
+
+- **Breaking:** turn usage and snapshots are optional; session IDs are strings; prompt wrappers now target `PromptRequest`.
+- **Breaking:** `hosted` tool APIs move to `embedded`; Code Mode execution/wait returns `Result`; protocol literals gain asynchronous fields.
+- **Behavior:** default model/reasoning changes to Astra/low; resumed sessions use current instructions and tools; billing-uncertainty metrics and generic MCP resource helpers are removed.
+- **Optional SDK layers:** durable execution with caller-owned storage, reusable subagent orchestration, and a managed backend. Browser, egress, VM, and voice leave experimental paths; computer and evals retain the label.
+
+### Bug Fixes
+
+- [apple] Preserve repository tree in native playtest update
+- [apple] Preserve reading position and playtest navigation edge cases
+
+### Features
+
+- [nanocodex2] Trace VM hand activity
+
+### Miscellaneous Tasks
+
+- Release nanocodex 0.6.0 ([#330](https://github.com/gakonst/nanocodex/issues/330))
+
+### Other
+
+- Merge pull request [#179](https://github.com/gakonst/nanocodex/issues/179) from gakonst/perf/minimize-agent-overhead
+- Merge remote-tracking branch 'origin/master' into agent/eval-cluster-dashboard
+
+### Performance
+
+- Reduce agent startup overhead
+
+## [0.5.0](https://github.com/gakonst/nanocodex/releases/tag/v0.5.0) - 2026-08-12
+
+### Miscellaneous Tasks
+
+- [release] Refresh 0.5.0 changelogs
+- [release] Prepare 0.5.0
+
+### Other
+
+- Merge pull request [#169](https://github.com/gakonst/nanocodex/issues/169) from gakonst/release/0.5.0
+
+## [0.4.0](https://github.com/gakonst/nanocodex/releases/tag/v0.4.0) - 2026-08-11
+
+### Bug Fixes
+
+- [tls] Standardize rustls on ring
+- [ci] Stabilize observability tests
+
+### Features
+
+- Support Luna
+
+### Miscellaneous Tasks
+
+- [release] Refresh 0.4.0 changelogs
+- [release] Prepare 0.4.0
+
+### Other
+
+- Merge pull request [#160](https://github.com/gakonst/nanocodex/issues/160) from gakonst/release/v0.4.0
+- Merge pull request [#86](https://github.com/gakonst/nanocodex/issues/86) from gakonst/fix/ring-only-rustls
+- Merge pull request [#80](https://github.com/gakonst/nanocodex/issues/80) from clabby/cl/luna
+
+### Testing
+
+- [observability] Consume OTLP request bodies
+
 ## [0.3.0](https://github.com/gakonst/nanocodex/releases/tag/v0.3.0) - 2026-07-28
 
 ### Miscellaneous Tasks
 
+- [release] Refresh 0.3.0 changelogs
 - [release] Prepare 0.3.0
 
 ### Other

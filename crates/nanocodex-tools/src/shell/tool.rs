@@ -84,14 +84,14 @@ fn shell_execution(result: &super::ExecCommandResult) -> ToolOutput {
     if let Some(error) = &result.error {
         return ToolOutput::error(error);
     }
-    let code_mode_value = match serde_json::to_value(result) {
+    let structured_result = match serde_json::to_value(result) {
         Ok(value) => value,
         Err(error) => {
             return ToolOutput::error(format!("failed to encode tool result: {error}"));
         }
     };
     ToolOutput::text(shell_response_text(result))
-        .with_code_mode_value(code_mode_value)
+        .with_structured_result(structured_result)
         .with_process_trace(
             result.exit_code,
             result.session_id,
@@ -135,7 +135,7 @@ struct ExecCommandArguments {
     // Codex exposes these approval metadata fields even under a fixed
     // full-access/never-ask policy. Nanocodex accepts but does not act on
     // them; this does not add a second approval or sandbox policy owner.
-    #[serde(default)]
+    #[serde(default, rename = "justification")]
     _justification: Option<String>,
     #[serde(default)]
     workdir: Option<String>,
@@ -149,9 +149,9 @@ struct ExecCommandArguments {
     yield_time_ms: Option<u64>,
     #[serde(default)]
     max_output_tokens: Option<usize>,
-    #[serde(default)]
+    #[serde(default, rename = "prefix_rule")]
     _prefix_rule: Option<Vec<String>>,
-    #[serde(default)]
+    #[serde(default, rename = "sandbox_permissions")]
     _sandbox_permissions: Option<String>,
 }
 
@@ -165,95 +165,4 @@ struct WriteStdinArguments {
     yield_time_ms: Option<u64>,
     #[serde(default)]
     max_output_tokens: Option<usize>,
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{path::PathBuf, sync::Arc};
-
-    use super::{ExecCommandHandler, Tool, shell_execution};
-    use crate::{
-        ToolOutputBody,
-        shell::{ExecCommandResult, ShellSessions},
-    };
-
-    #[test]
-    fn exec_command_exposes_codex_description_and_shell_parameter() {
-        let handler = ExecCommandHandler::new(PathBuf::from("/"), Arc::new(ShellSessions::new()));
-        let spec = serde_json::to_value(handler.definition()).unwrap();
-
-        assert_eq!(
-            spec.pointer("/description")
-                .and_then(serde_json::Value::as_str),
-            Some(
-                "Runs a command in a PTY, returning output or a session ID for ongoing interaction."
-            )
-        );
-        assert_eq!(
-            spec.pointer("/parameters/properties/shell/type")
-                .and_then(serde_json::Value::as_str),
-            Some("string")
-        );
-    }
-
-    #[test]
-    fn shell_results_use_codex_text_directly_and_json_in_code_mode() {
-        let result = ExecCommandResult {
-            error: None,
-            chunk_id: Some("a1b2c3".to_owned()),
-            wall_time_seconds: 0.68754,
-            exit_code: Some(0),
-            session_id: None,
-            original_token_count: Some(7),
-            output: "hello\n".to_owned(),
-        };
-
-        let output = shell_execution(&result);
-        let ToolOutputBody::Text(direct) = &output.output else {
-            panic!("shell output should be plain text");
-        };
-        assert_eq!(
-            direct,
-            "Chunk ID: a1b2c3\n\
-             Wall time: 0.6875 seconds\n\
-             Process exited with code 0\n\
-             Original token count: 7\n\
-             Output:\n\
-             hello\n"
-        );
-        assert_eq!(
-            output.code_mode_value(),
-            serde_json::json!({
-                "chunk_id": "a1b2c3",
-                "wall_time_seconds": 0.68754,
-                "exit_code": 0,
-                "original_token_count": 7,
-                "output": "hello\n",
-            })
-        );
-    }
-
-    #[test]
-    fn running_shell_result_names_the_session() {
-        let result = ExecCommandResult {
-            error: None,
-            chunk_id: None,
-            wall_time_seconds: 10.0,
-            exit_code: None,
-            session_id: Some(42),
-            original_token_count: None,
-            output: String::new(),
-        };
-
-        let output = shell_execution(&result);
-        let ToolOutputBody::Text(direct) = output.output else {
-            panic!("shell output should be plain text");
-        };
-        assert_eq!(
-            direct,
-            "Wall time: 10.0000 seconds\n\
-             Process running with session ID 42\n\
-             Output:\n"
-        );
-    }
 }

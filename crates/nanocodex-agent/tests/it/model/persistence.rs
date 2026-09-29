@@ -39,6 +39,7 @@ impl tower::Service<nanocodex_oai_api::tower::ResponsesAttempt> for FailFirstWar
             nanocodex_oai_api::tower::ResponsesOutput::Generation(
                 nanocodex_oai_api::tower::GenerationOutput {
                     id: "resp-recovered".to_owned(),
+                    reported_model: None,
                     status: "completed".to_owned(),
                     end_turn: Some(true),
                     final_message: Some("done".to_owned()),
@@ -80,9 +81,10 @@ async fn missing_stored_checkpoint_replays_local_history_once() -> Result<()> {
             &mut branch,
             json!({
                 "type": "error",
+                "status": 400,
                 "error": {
-                    "code": "previous_response_not_found",
-                    "message": "checkpoint expired"
+                    "type": "invalid_request_error",
+                    "message": "Invalid `previous_response_id`."
                 }
             }),
         )
@@ -152,7 +154,10 @@ async fn serialized_session_and_codex_rollout_share_committed_history() -> Resul
         let (stream, _) = listener.accept().await?;
         let mut original = accept_async(stream).await?;
         let warmup = next_json(&mut original).await?;
+        assert_eq!(warmup["model"], "gpt-6.1-sol");
         assert_eq!(warmup["prompt_cache_key"], "durable-cache");
+        let original_tools_id = warmup["input"][0]["id"].clone();
+        let original_instructions_id = warmup["input"][1]["id"].clone();
         send_warmup(&mut original, "resp-warmup").await?;
         let first = next_json(&mut original).await?;
         assert_eq!(first["previous_response_id"], "resp-warmup");
@@ -162,16 +167,21 @@ async fn serialized_session_and_codex_rollout_share_committed_history() -> Resul
         let mut resumed = accept_async(stream).await?;
         let replay = next_json(&mut resumed).await?;
         assert!(replay.get("previous_response_id").is_none());
-        assert_eq!(
-            replay["prompt_cache_key"],
-            "019c0d31-c308-7d91-bff4-5dca82d15ac6"
-        );
+        assert_eq!(replay["model"], "gpt-6.1-sol");
+        assert_eq!(replay["prompt_cache_key"], "durable-cache");
         assert_eq!(replay["input"][0]["type"], "additional_tools");
-        assert!(replay["input"][0].get("id").is_none());
+        assert_eq!(
+            replay["input"][0]["id"], original_tools_id,
+            "unchanged tools must retain their exact ID across rollout resume"
+        );
         assert_eq!(replay["input"][1]["role"], "developer");
+        assert_ne!(
+            replay["input"][1]["id"], original_instructions_id,
+            "changed instructions must receive a payload-sensitive ID"
+        );
         assert_eq!(
             replay["input"][1]["content"][0]["text"],
-            "durable instructions"
+            "instructions from the resumed rollout"
         );
         let replay_text = replay.to_string();
         assert!(replay_text.contains("first prompt"));
@@ -184,10 +194,11 @@ async fn serialized_session_and_codex_rollout_share_committed_history() -> Resul
     let rollout_home = temporary_workspace("serialized-resume-rollout")?;
     let openai = || {
         OpenAi::builder("test-key")
+            .model(Model::Sol)
             .websocket_url(endpoint.clone())
             .build()
     };
-    let (agent, events) = Nanocodex::builder(openai()?)
+    let (agent, mut events) = Nanocodex::builder(openai()?)
         .instructions("durable instructions")
         .thinking(Thinking::Low)
         .workspace(&workspace)
@@ -200,8 +211,18 @@ async fn serialized_session_and_codex_rollout_share_committed_history() -> Resul
         .ok_or_else(|| eyre!("rollout was not configured"))?
         .path()
         .to_path_buf();
-    let first = agent.prompt("first prompt").await?.result().await?;
-    let encoded = serde_json::to_vec(&first.snapshot())?;
+    let turn = agent.prompt("first prompt").await?;
+    let canonical_turn_id = turn.id().to_owned();
+    let first = turn.result().await?;
+    let mut live_events = Vec::new();
+    while let Some(event) = events.try_recv_timed() {
+        live_events.push(serde_json::to_value(event.event)?);
+    }
+    let encoded = serde_json::to_vec(
+        &first
+            .snapshot()
+            .expect("local turns always retain a snapshot"),
+    )?;
     agent.flush_rollout().await?;
     let durable_config = RolloutConfig::new(&rollout_home);
     let durable = durable_config.load_session("019c0d31-c308-7d91-bff4-5dca82d15ac6")?;
@@ -221,8 +242,16 @@ async fn serialized_session_and_codex_rollout_share_committed_history() -> Resul
         workspace.canonicalize()?.to_string_lossy().as_ref()
     );
     assert_eq!(request_prefix[0]["type"], "additional_tools");
-    assert!(request_prefix[0].get("id").is_none());
-    assert!(request_prefix[1].get("id").is_none());
+    assert!(
+        request_prefix[0]["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("at_"))
+    );
+    assert!(
+        request_prefix[1]["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("msg_"))
+    );
     assert!(
         snapshot_json["history"]
             .as_array()
@@ -234,6 +263,47 @@ async fn serialized_session_and_codex_rollout_share_committed_history() -> Resul
         .lines()
         .map(serde_json::from_str::<Value>)
         .collect::<serde_json::Result<Vec<_>>>()?;
+    assert_eq!(
+        rollout_lines[0]["payload"]["prompt_cache_key"],
+        "durable-cache"
+    );
+    assert!(
+        rollout_lines
+            .iter()
+            .any(|line| line["payload"]["turn_id"] == canonical_turn_id)
+    );
+    for category in ["run.started", "run.completed"] {
+        assert!(
+            live_events.iter().any(|event| event["type"] == category
+                && event["payload"]["turn_id"] == canonical_turn_id)
+        );
+    }
+    let input = live_events
+        .iter()
+        .find(|event| event["type"] == "input.accepted")
+        .expect("accepted input is observable");
+    assert_eq!(input["payload"]["input"], "first prompt");
+    assert_eq!(input["payload"]["turn_id"], canonical_turn_id);
+    assert!(
+        rollout_lines
+            .iter()
+            .any(|line| line["payload"]["type"] == "input_accepted"
+                && line["payload"]["item_id"] == input["payload"]["item_id"])
+    );
+    assert_eq!(
+        agent.rollout().unwrap().committed_bytes(),
+        std::fs::metadata(&rollout_path)?.len()
+    );
+    let assistant = live_events
+        .iter()
+        .find(|event| event["type"] == "assistant.message")
+        .expect("completed response emits its final assistant item");
+    assert!(
+        rollout_lines
+            .iter()
+            .any(|line| line["type"] == "response_item"
+                && line["payload"]["id"] == assistant["payload"]["item_id"])
+    );
     let persisted_context = rollout_lines
         .iter()
         .find(|line| line["type"] == "world_state")
@@ -252,16 +322,6 @@ async fn serialized_session_and_codex_rollout_share_committed_history() -> Resul
         Some(&rollout_history),
         "rollout resume must materialize the recorded committed history"
     );
-    let incompatible_rollout = Nanocodex::builder(openai()?)
-        .instructions("changed instructions")
-        .thinking(Thinking::Low)
-        .resume(durable.snapshot().clone())
-        .build();
-    assert!(matches!(
-        incompatible_rollout,
-        Err(NanocodexError::InvalidSessionSnapshot(message))
-            if message.contains("instructions do not match")
-    ));
     let snapshot: SessionSnapshot = serde_json::from_slice(&encoded)?;
     agent.shutdown().await?;
     drop((agent, events, first));
@@ -276,16 +336,47 @@ async fn serialized_session_and_codex_rollout_share_committed_history() -> Resul
             if message.contains("unsupported format version")
     ));
 
+    let mut astra_snapshot: Value = serde_json::from_slice(&encoded)?;
+    astra_snapshot["model"] = json!("gpt-6-astra");
+    let astra_snapshot: SessionSnapshot = serde_json::from_value(astra_snapshot)?;
     let incompatible = Nanocodex::builder(openai()?)
-        .instructions("changed instructions")
-        .thinking(Thinking::Low)
+        .thinking(Thinking::None)
+        .resume(astra_snapshot)
+        .build();
+    assert!(matches!(
+        incompatible,
+        Err(NanocodexError::InvalidRequest(message))
+            if message.contains("GPT-6 Astra requires")
+    ));
+
+    let mut retired: Value = serde_json::from_slice(&encoded)?;
+    retired["model"] = json!("gpt-6-sol");
+    let retired: SessionSnapshot = serde_json::from_value(retired)?;
+    assert!(
+        Nanocodex::builder(openai()?)
+            .resume(retired)
+            .build()
+            .is_err()
+    );
+
+    let incompatible = Nanocodex::builder(openai()?)
+        .thinking(Thinking::None)
         .resume(snapshot.clone())
         .build();
     assert!(matches!(
         incompatible,
-        Err(NanocodexError::InvalidSessionSnapshot(message))
-            if message.contains("instructions or tool definitions")
+        Err(NanocodexError::InvalidRequest(message))
+            if message.contains("GPT-6.1 Sol requires")
     ));
+
+    let (compatible, compatible_events) = Nanocodex::builder(openai()?)
+        .model(Model::Astra)
+        .thinking(Thinking::Low)
+        .resume(snapshot.clone())
+        .build()?;
+    compatible.shutdown().await?;
+    drop((compatible, compatible_events));
+
     let other_workspace = temporary_workspace("serialized-resume-other")?;
     let incompatible = Nanocodex::builder(openai()?)
         .instructions("durable instructions")
@@ -312,7 +403,7 @@ async fn serialized_session_and_codex_rollout_share_committed_history() -> Resul
 
     let (thread_id, snapshot, rollout) = durable.into_parts();
     let (resumed, resumed_events) = Nanocodex::builder(openai()?)
-        .instructions("durable instructions")
+        .instructions("instructions from the resumed rollout")
         .thinking(Thinking::Low)
         .session_id(thread_id.parse()?)
         .resume(snapshot)
@@ -366,22 +457,36 @@ async fn serialized_session_and_codex_rollout_share_committed_history() -> Resul
 }
 
 #[tokio::test]
-async fn serialized_session_resumes_over_ephemeral_https() -> Result<()> {
+async fn serialized_session_rebinds_deployed_instructions_and_tools() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("http://{}", listener.local_addr()?);
     let server = tokio::spawn(async move {
         let first = next_http_json(&listener).await?;
-        assert_eq!(first.body["model"], "gpt-5.6-luna");
+        assert_eq!(first.body["model"], "gpt-6-luna");
         assert_eq!(first.body["store"], false);
         assert!(first.body.get("previous_response_id").is_none());
         assert!(first.body.to_string().contains("first prompt"));
         send_http_final(first.stream, "resp-first").await?;
 
         let resumed = next_http_json(&listener).await?;
-        assert_eq!(resumed.body["model"], "gpt-5.6-luna");
+        assert_eq!(resumed.body["model"], "gpt-6-luna");
         assert_eq!(resumed.body["store"], false);
         assert!(resumed.body.get("previous_response_id").is_none());
         let replay = resumed.body.to_string();
+        assert_eq!(
+            resumed.body["input"][1]["content"][0]["text"],
+            "instructions from the new deployment"
+        );
+        assert_eq!(
+            resumed.body["input"][0]["tools"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|tool| tool["name"].as_str())
+                .collect::<Vec<_>>(),
+            ["exec", "wait"]
+        );
+        assert!(!replay.contains("instructions from the old deployment"));
         assert!(replay.contains("first prompt"));
         assert!(replay.contains("done"));
         assert!(replay.contains("resume prompt"));
@@ -395,15 +500,19 @@ async fn serialized_session_resumes_over_ephemeral_https() -> Result<()> {
         .api_base_url(endpoint.clone())
         .build()?;
     let (agent, events) = Nanocodex::builder(openai)
-        .instructions("durable instructions")
+        .instructions("instructions from the old deployment")
         .model(Model::Luna)
         .thinking(Thinking::Low)
         .workspace(&workspace)
         .prompt_cache_key("durable-cache")
         .build()?;
     let first = agent.prompt("first prompt").await?.result().await?;
-    let snapshot_json = serde_json::to_value(first.snapshot())?;
-    assert_eq!(snapshot_json["model"], "gpt-5.6-luna");
+    let snapshot_json = serde_json::to_value(
+        first
+            .snapshot()
+            .expect("local turns always retain a snapshot"),
+    )?;
+    assert_eq!(snapshot_json["model"], "gpt-6-luna");
     let snapshot = serde_json::from_value(snapshot_json)?;
     drop((agent, events, first));
 
@@ -413,7 +522,8 @@ async fn serialized_session_resumes_over_ephemeral_https() -> Result<()> {
         .api_base_url(endpoint)
         .build()?;
     let (resumed, resumed_events) = Nanocodex::builder(openai)
-        .instructions("durable instructions")
+        .instructions("instructions from the new deployment")
+        .tools(Tools::builder().without_defaults().build()?)
         .thinking(Thinking::Low)
         .resume(snapshot)
         .build()?;

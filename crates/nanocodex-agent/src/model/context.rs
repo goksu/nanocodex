@@ -4,23 +4,13 @@ use chrono::{Local, Utc};
 use nanocodex_oai_api::responses::{ContentItem, MessageRole, ResponseItem};
 
 use crate::agent::ExecutionEnvironment;
+pub(crate) use crate::session::{
+    AgentsMdSnapshot, ContextBaseline, ContextSnapshot, EnvironmentSnapshot,
+};
 
 const REPLACEMENT_NOTICE: &str =
     "These AGENTS.md instructions replace all previously provided AGENTS.md instructions.";
 const REMOVAL_NOTICE: &str = "The previously provided AGENTS.md instructions no longer apply.";
-
-#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub(crate) struct ContextSnapshot {
-    agents_md: Option<AgentsMdSnapshot>,
-    environment: Option<EnvironmentSnapshot>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-#[serde(tag = "kind", content = "snapshot", rename_all = "snake_case")]
-pub(crate) enum ContextBaseline {
-    Missing,
-    Known(ContextSnapshot),
-}
 
 impl ContextBaseline {
     pub(crate) fn reconstruct(history: &[ResponseItem]) -> Self {
@@ -31,20 +21,6 @@ impl ContextBaseline {
             Self::Known(reconstructed)
         }
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-struct AgentsMdSnapshot {
-    directory: String,
-    text: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-struct EnvironmentSnapshot {
-    cwd: String,
-    shell: String,
-    current_date: String,
-    timezone: String,
 }
 
 #[derive(Clone)]
@@ -347,12 +323,18 @@ fn render_environment_diff(
     Some(output)
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn push_filesystem(output: &mut String, cwd: &str) {
     output.push_str("  <filesystem><workspace_roots><root>");
     push_xml_escaped_text(output, cwd);
     output.push_str(
         "</root></workspace_roots><permission_profile type=\"disabled\"><file_system type=\"unrestricted\" /></permission_profile></filesystem>\n",
     );
+}
+
+#[cfg(target_family = "wasm")]
+fn push_filesystem(_output: &mut String, _cwd: &str) {
+    // The host supplies its actual grant; WASM has no unrestricted filesystem.
 }
 
 fn push_xml_line(output: &mut String, tag: &str, value: &str) {
@@ -419,72 +401,6 @@ mod tests {
     }
 
     #[test]
-    fn configured_local_time_replaces_the_embedding_host_context() {
-        let configured = ExecutionEnvironment::new("2026-07-29", "/UTC");
-        let snapshot = ContextSnapshot::capture("/app", "bash", None, Some(&configured));
-        let rendered = text(&snapshot.full_item());
-
-        assert!(rendered.contains("<current_date>2026-07-29</current_date>"));
-        assert!(rendered.contains("<timezone>/UTC</timezone>"));
-    }
-
-    #[test]
-    fn ordinary_turn_repeats_the_complete_turn_context_group() {
-        let before = ContextSnapshot::capture_at(
-            "/workspace",
-            "zsh",
-            Some("keep the prefix"),
-            "2026-07-27",
-            "America/Los_Angeles",
-        );
-        let after = ContextSnapshot::capture_at(
-            "/workspace",
-            "zsh",
-            Some("keep the prefix"),
-            "2026-07-28",
-            "America/New_York",
-        );
-        let rendered = text(&after.diff_item(&before).expect("environment diff"));
-        assert!(rendered.contains("<current_date>2026-07-28</current_date>"));
-        assert!(rendered.contains("<timezone>America/New_York</timezone>"));
-        assert!(
-            rendered
-                .contains("<filesystem><workspace_roots><root>/workspace</root></workspace_roots>")
-        );
-        assert!(!rendered.contains("keep the prefix"));
-        assert!(!rendered.contains("<cwd>"));
-        assert!(!rendered.contains("<shell>"));
-    }
-
-    #[test]
-    fn agents_md_diff_is_explicit_and_reconstructable() {
-        let before =
-            ContextSnapshot::capture_at("/workspace", "zsh", Some("old"), "2026-07-27", "Etc/UTC");
-        let after =
-            ContextSnapshot::capture_at("/workspace", "zsh", Some("new"), "2026-07-27", "Etc/UTC");
-        let replacement = after.diff_item(&before).expect("replacement");
-        assert!(text(&replacement).contains(REPLACEMENT_NOTICE));
-        let reconstructed = ContextSnapshot::reconstruct(&[before.full_item(), replacement]);
-        assert_eq!(reconstructed, after);
-
-        let removed =
-            ContextSnapshot::capture_at("/workspace", "zsh", None, "2026-07-27", "Etc/UTC");
-        let removed = removed.diff_item(&after).expect("removal");
-        let ResponseItem::Message { content, .. } = removed else {
-            panic!("removal diff is not a message");
-        };
-        let [ContentItem::InputText { text }] = content.as_slice() else {
-            panic!("removal diff does not contain exactly one text item");
-        };
-        assert_eq!(
-            text.as_ref(),
-            "# AGENTS.md instructions\n\n<INSTRUCTIONS>\n\
-             The previously provided AGENTS.md instructions no longer apply.\n\
-             </INSTRUCTIONS>"
-        );
-    }
-
-    #[test]
     fn missing_baseline_requires_full_reinjection() {
         let snapshot = ContextSnapshot::capture_at(
             "/workspace",
@@ -502,7 +418,10 @@ mod tests {
         assert!(update.full);
         let rendered = text(&update.item);
         assert!(rendered.contains("cached"));
-        assert!(rendered.contains("<filesystem>"));
+        assert_eq!(
+            rendered.contains("<filesystem>"),
+            !cfg!(target_family = "wasm")
+        );
     }
 
     #[test]

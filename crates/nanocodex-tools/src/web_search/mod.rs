@@ -9,7 +9,7 @@ use nanocodex_oai_api::{
     tools::ToolDefinition,
 };
 use reqwest::header::{AUTHORIZATION, USER_AGENT};
-use serde_json::{Value, json};
+use serde_json::json;
 use tokio::time::{sleep, timeout};
 
 use self::{
@@ -35,6 +35,7 @@ pub(super) struct WebSearchHandler {
 impl WebSearchHandler {
     #[cfg(test)]
     pub(super) fn new(config: WebSearchConfig) -> Self {
+        nanocodex_oai_api::transport::install_default_rustls_crypto_provider();
         Self::with_client(config, reqwest::Client::new())
     }
 
@@ -69,85 +70,28 @@ impl WebSearchHandler {
                 }
             }
         };
-        if let Err(error) = commands.validate() {
-            return ToolOutput::error(error);
-        }
-
-        let commands = commands.into_requests();
-        let request_count = commands.len();
         let input = recent_input(context.history());
-        let mut outputs = Vec::with_capacity(request_count);
-        let mut failures = Vec::new();
-        let mut results = Vec::new();
-        let mut saw_results = false;
-
-        for (index, commands) in commands.iter().enumerate() {
-            let request = SearchRequest {
-                id: context.session_id(),
-                model: context.model(),
-                input: input.as_deref(),
-                commands,
-                settings: SearchSettings {
-                    allowed_callers: ["direct"],
-                    external_web_access: true,
-                },
-                max_output_tokens: request_token_budget(
-                    context.output_token_budget(),
-                    index,
-                    request_count,
-                ),
-            };
-            let response = match self.search(&request).await {
-                Ok(response) => response,
-                Err(error) => {
-                    failures.push(format!("web search request {} failed: {error}", index + 1));
-                    continue;
-                }
-            };
-            let SearchResponse {
-                output,
-                results: response_results,
-                _encrypted_output: _,
-            } = response;
-            if let Some(response_results) = response_results {
-                saw_results = true;
-                results.extend(response_results);
-            }
-            if has_semantic_error(&output) {
-                failures.push(format!(
-                    "web search request {} returned an API error in its output",
-                    index + 1
-                ));
-            } else {
-                let missing = commands.missing_specialized_results(&output);
-                if !missing.is_empty() {
-                    failures.push(format!(
-                        "web search request {} omitted results for: {}",
-                        index + 1,
-                        missing.join(", ")
-                    ));
-                }
-            }
-            if !output.is_empty() {
-                outputs.push(output);
-            }
-        }
-
-        let output = outputs.join("\n");
-        let mut execution = if failures.is_empty() {
-            ToolOutput::text(output.clone()).with_code_mode_value(Value::String(output))
-        } else {
-            let mut error = failures.join("\n");
-            if !output.is_empty() {
-                error.push_str("\n\nWeb search output:\n");
-                error.push_str(&output);
-            }
-            ToolOutput::error(error)
+        let request = SearchRequest {
+            id: context.session_id(),
+            model: context.model(),
+            input: input.as_deref(),
+            commands: &commands,
+            settings: SearchSettings {
+                allowed_callers: ["direct"],
+                external_web_access: true,
+            },
+            max_output_tokens: u64::try_from(context.output_token_budget()).unwrap_or(u64::MAX),
         };
-        if saw_results {
-            execution = execution.with_metadata(json!({ "results": results }));
+        match self.search(&request).await {
+            Ok(response) => {
+                let mut output = ToolOutput::text(response.output);
+                if let Some(results) = response.results {
+                    output = output.with_metadata(json!({ "results": results }));
+                }
+                output
+            }
+            Err(error) => ToolOutput::error(error),
         }
-        execution
     }
 
     async fn search(&self, request: &SearchRequest<'_>) -> Result<SearchResponse, String> {
@@ -315,47 +259,114 @@ fn response_too_large() -> RequestFailure {
     }
 }
 
-fn request_token_budget(total: usize, index: usize, request_count: usize) -> u64 {
-    let base = total / request_count;
-    let remainder = total % request_count;
-    u64::try_from(base + usize::from(index < remainder))
-        .unwrap_or(u64::MAX)
-        .max(1)
-}
-
-fn has_semantic_error(output: &str) -> bool {
-    output.lines().any(|line| {
-        let line = line.trim();
-        line.starts_with("Error parsing function call:")
-            || line.starts_with("Found no tool response.")
-            || line == "Internal Error ()"
-    })
-}
-
 #[cfg(test)]
 mod tests {
+    use nanocodex_oai_api::tools::{ToolContext, ToolOutputBody};
     use serde_json::json;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
-    use super::{Tool, WebSearchConfig, WebSearchHandler};
+    use super::{WebSearchConfig, WebSearchHandler};
 
     #[test]
-    fn exposes_codex_web_run_schema_and_description() {
+    fn web_schema_matches_pinned_upstream_fixture() {
+        let expected: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/codex-parity/web.json"))
+                .unwrap();
+        assert_eq!(super::schema::commands_schema(), expected);
+    }
+
+    #[tokio::test]
+    async fn decoded_success_does_not_infer_errors_from_output_text() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let output = concat!(
+            "Error parsing function call: quoted page content\n",
+            "Found no tool response.\n",
+            "Internal Error ()\n",
+            "Finance data returned without an internal citation marker."
+        );
+        let response_body = serde_json::to_vec(&json!({
+            "output": output,
+            "results": [{"title": "Recovered page", "url": "https://example.com/recovered"}]
+        }))
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 8_192];
+            let _ = stream.read(&mut request).await.unwrap();
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                response_body.len()
+            );
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            stream.write_all(&response_body).await.unwrap();
+        });
         let handler = WebSearchHandler::new(WebSearchConfig {
-            endpoint: "http://127.0.0.1:1/v1/alpha/search".to_owned(),
+            endpoint: format!("http://{address}/v1/alpha/search"),
             auth: nanocodex_oai_api::auth::OpenAiAuth::api_key("test-key"),
         });
-        let spec = serde_json::to_value(handler.definition()).unwrap();
 
-        assert_eq!(spec["name"], "web__run");
-        assert_eq!(spec["strict"], false);
+        let result = handler
+            .run_inner(
+                r#"{"finance":[{"ticker":"ACME","type":"equity","market":"USA"}]}"#,
+                ToolContext::new("gpt-5", "session", "call", &[], 1_000),
+            )
+            .await;
+        server.await.unwrap();
+
+        assert!(result.success);
+        assert!(matches!(result.output, ToolOutputBody::Text(ref text) if text == output));
+        let metadata: serde_json::Value =
+            serde_json::from_str(result.metadata.as_ref().unwrap().get()).unwrap();
         assert_eq!(
-            spec.pointer("/parameters/properties/time/description"),
-            Some(&json!("Get time for the given UTC offsets."))
+            metadata,
+            json!({
+                "results": [{
+                    "title": "Recovered page",
+                    "url": "https://example.com/recovered"
+                }]
+            })
         );
-        assert!(
-            spec["description"]
-                .as_str()
-                .is_some_and(|description| description.contains("turn2search5"))
-        );
+    }
+
+    #[tokio::test]
+    async fn malformed_success_response_remains_a_tool_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let response_body = br#"{"results":[]}"#;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 8_192];
+            let _ = stream.read(&mut request).await.unwrap();
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                response_body.len()
+            );
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            stream.write_all(response_body).await.unwrap();
+        });
+        let handler = WebSearchHandler::new(WebSearchConfig {
+            endpoint: format!("http://{address}/v1/alpha/search"),
+            auth: nanocodex_oai_api::auth::OpenAiAuth::api_key("test-key"),
+        });
+
+        let result = handler
+            .run_inner(
+                r#"{"time":[{"utc_offset":"+00:00"}]}"#,
+                ToolContext::new("gpt-5", "session", "call", &[], 1_000),
+            )
+            .await;
+        server.await.unwrap();
+
+        assert!(!result.success);
+        assert!(matches!(
+            result.output,
+            ToolOutputBody::Text(ref text)
+                if text.contains("failed to decode standalone web search response")
+                    && text.contains("missing field `output`")
+        ));
     }
 }

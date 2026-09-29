@@ -18,6 +18,9 @@ use tokio::sync::mpsc;
 use crate::stream::{CompactionOutput, GenerationOutput};
 
 const RESPONSE_MAX_ATTEMPTS: NonZeroU32 = NonZeroU32::new(5).unwrap();
+// Match codex-rs remote compaction: the initial request plus two retries
+// on each transport, before fallback or returning the exhausted error.
+const COMPACTION_MAX_ATTEMPTS: u32 = 3;
 
 /// Kind of Responses operation passed through the Tower service stack.
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -72,7 +75,6 @@ pub struct TransportStats {
     pub(crate) websocket_reconnects: AtomicU32,
     pub(crate) response_attempts: AtomicU32,
     pub(crate) response_retries: AtomicU32,
-    pub(crate) billing_uncertain_response_attempts: AtomicU32,
     pub(crate) connection_duration_ns: AtomicU64,
     pub(crate) retry_backoff_duration_ns: AtomicU64,
 }
@@ -84,7 +86,6 @@ pub struct TransportStatsSnapshot {
     websocket_reconnects: u32,
     response_attempts: u32,
     response_retries: u32,
-    billing_uncertain_response_attempts: u32,
     connection_duration_ns: u64,
     retry_backoff_duration_ns: u64,
 }
@@ -98,9 +99,6 @@ impl TransportStats {
             websocket_reconnects: self.websocket_reconnects.load(Ordering::Relaxed),
             response_attempts: self.response_attempts.load(Ordering::Relaxed),
             response_retries: self.response_retries.load(Ordering::Relaxed),
-            billing_uncertain_response_attempts: self
-                .billing_uncertain_response_attempts
-                .load(Ordering::Relaxed),
             connection_duration_ns: self.connection_duration_ns.load(Ordering::Relaxed),
             retry_backoff_duration_ns: self.retry_backoff_duration_ns.load(Ordering::Relaxed),
         }
@@ -123,9 +121,6 @@ impl TransportStats {
             response_retries: after
                 .response_retries
                 .saturating_sub(before.response_retries),
-            billing_uncertain_response_attempts: after
-                .billing_uncertain_response_attempts
-                .saturating_sub(before.billing_uncertain_response_attempts),
             connection_duration_ns: after
                 .connection_duration_ns
                 .saturating_sub(before.connection_duration_ns),
@@ -147,8 +142,6 @@ pub struct TransportStatsDelta {
     pub response_attempts: u32,
     /// Responses retries after the first physical attempt.
     pub response_retries: u32,
-    /// Sent attempts that ended before provider usage was observed.
-    pub billing_uncertain_response_attempts: u32,
     /// Nanoseconds spent establishing connections.
     pub connection_duration_ns: u64,
     /// Nanoseconds spent waiting for owned retry backoff.
@@ -271,7 +264,7 @@ impl ResponsesAttempt {
             profile,
             observer,
             attempt: 1,
-            max_attempts: RESPONSE_MAX_ATTEMPTS.get(),
+            max_attempts: COMPACTION_MAX_ATTEMPTS,
             full_replay: previous_response_id.is_none(),
             logical_turn: 0,
             session_transport,
@@ -526,7 +519,7 @@ impl ResponsesAttemptFactory {
     /// Returns an attempt factory scoped to one client-side logical turn.
     pub fn for_logical_turn(&self, logical_turn: u64) -> Self {
         Self {
-            profile: Arc::clone(&self.profile),
+            profile: Arc::new((*self.profile).clone().with_logical_turn(logical_turn)),
             observer: self.observer.clone(),
             logical_turn,
             session_transport: Arc::clone(&self.session_transport),
@@ -537,6 +530,30 @@ impl ResponsesAttemptFactory {
     #[must_use]
     pub fn profile(&self) -> &RequestProfile {
         &self.profile
+    }
+
+    /// Reconstructs retained request content on the current event and transport owner.
+    #[doc(hidden)]
+    pub fn with_request_content(
+        &self,
+        prompt_cache_key: String,
+        prefix: Arc<[ResponseItem]>,
+        model_id_prefix: Option<String>,
+        reasoning_mode: crate::ReasoningMode,
+        store_responses: bool,
+    ) -> Self {
+        Self {
+            profile: Arc::new((*self.profile).clone().with_request_content(
+                prompt_cache_key,
+                prefix,
+                model_id_prefix,
+                reasoning_mode,
+                store_responses,
+            )),
+            observer: self.observer.clone(),
+            logical_turn: self.logical_turn,
+            session_transport: Arc::clone(&self.session_transport),
+        }
     }
 
     /// Builds a WebSocket warmup attempt.
@@ -621,13 +638,63 @@ impl ResponsesAttemptFactory {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::VecDeque, sync::Arc};
+
     use super::{ResponseHistory, ResponsesAttemptFactory, TransportStats};
     use crate::{
         ContentItem, EventSink, MessageRole, Model, ResponseItem, ResponsesTransport, Thinking,
         responses::RequestProfile,
     };
     use serde_json::json;
-    use std::sync::Arc;
+    use tokio_tungstenite::tungstenite::Utf8Bytes;
+
+    struct FixtureSource {
+        lines: VecDeque<String>,
+    }
+
+    impl crate::stream::ResponseEventSource for FixtureSource {
+        async fn next_text(
+            &mut self,
+        ) -> Result<crate::socket::ReceivedText, crate::ResponsesError> {
+            let text = self
+                .lines
+                .pop_front()
+                .expect("captured response fixture should end with a completion event");
+            Ok(crate::socket::ReceivedText {
+                text: Utf8Bytes::from(text),
+                received_ns: crate::monotonic_now_ns(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn generation_output_keeps_model_from_captured_completion_event() {
+        let fixture = include_str!("../../tests/fixtures/workers_ai_events.jsonl");
+        let mut source = FixtureSource {
+            lines: fixture.lines().map(str::to_owned).collect(),
+        };
+        let (events, _receiver) = EventSink::channel("reported-model-fixture".to_owned());
+        let observer = super::ResponsesObserver {
+            events,
+            stats: Arc::new(TransportStats::default()),
+            response_events: None,
+        };
+
+        let output = crate::stream::receive(
+            &mut source,
+            "fixture",
+            &observer,
+            1,
+            web_time::Instant::now(),
+        )
+        .await
+        .expect("captured response stream should decode");
+
+        assert_eq!(
+            output.reported_model.as_deref(),
+            Some("@cf/zai-org/glm-5.3")
+        );
+    }
 
     #[test]
     fn retry_preserves_the_attempts_turn_policy() {

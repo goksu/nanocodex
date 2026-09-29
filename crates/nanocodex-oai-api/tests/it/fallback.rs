@@ -238,6 +238,80 @@ async fn upgrade_required_falls_back_without_another_websocket_attempt() -> Resu
     Ok(())
 }
 
+#[tokio::test]
+async fn forbidden_websocket_handshake_retries_then_falls_back_to_https() -> Result<()> {
+    let websocket_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let websocket_url = format!("ws://{}", websocket_listener.local_addr()?);
+    let http_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let api_base_url = format!("http://{}", http_listener.local_addr()?);
+
+    let websocket_server = tokio::spawn(async move {
+        for attempt in 1..=2 {
+            let (stream, _) = websocket_listener.accept().await?;
+            let cf_ray = format!("ray-{attempt}").parse()?;
+            let rejected =
+                accept_hdr_async(stream, move |_request: &Request, response: Response| {
+                    let mut response = response.map(|()| Some(String::new()));
+                    *response.status_mut() = StatusCode::FORBIDDEN;
+                    response.headers_mut().insert("cf-ray", cf_ray);
+                    Err(response)
+                })
+                .await;
+            assert!(rejected.is_err());
+        }
+        assert!(
+            timeout(
+                std::time::Duration::from_millis(250),
+                websocket_listener.accept()
+            )
+            .await
+            .is_err(),
+            "HTTP 403 recovery exceeded the configured WebSocket attempt budget"
+        );
+        Result::<()>::Ok(())
+    });
+    let http_server = tokio::spawn(async move {
+        let request = read_http_json(&http_listener).await?;
+        assert!(request.body.get("previous_response_id").is_none());
+        assert!(
+            request
+                .body
+                .to_string()
+                .contains("recover forbidden upgrade")
+        );
+        send_http_events(
+            request.stream,
+            None,
+            [completed_response("resp-forbidden", "recovered")],
+        )
+        .await
+    });
+
+    let openai = OpenAi::builder("test-key")
+        .websocket_url(websocket_url)
+        .api_base_url(api_base_url)
+        .max_attempts(NonZeroU32::new(2).unwrap())
+        .build()?;
+    let mut session = openai
+        .instructions("Recover transient WebSocket upgrade failures.")
+        .build()?;
+    assert_eq!(
+        session
+            .turn()
+            .create("recover forbidden upgrade")
+            .await?
+            .output_text(),
+        "recovered"
+    );
+    timeout(std::time::Duration::from_secs(5), websocket_server)
+        .await
+        .map_err(|_| eyre!("mock 403 WebSocket server did not finish"))???;
+    timeout(std::time::Duration::from_secs(5), http_server)
+        .await
+        .map_err(|_| eyre!("mock 403 fallback HTTP server did not finish"))???;
+    Ok(())
+}
+
 async fn next_ws_json<S>(socket: &mut WebSocketStream<S>) -> Result<Value>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -350,4 +424,83 @@ fn completed_response(response_id: &str, text: &str) -> Value {
             "usage": null
         }
     })
+}
+
+#[tokio::test]
+async fn compaction_falls_back_after_two_retries_and_preserves_history_on_exhaustion() -> Result<()>
+{
+    let websocket_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let websocket_url = format!("ws://{}", websocket_listener.local_addr()?);
+    let http_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let api_base_url = format!("http://{}", http_listener.local_addr()?);
+    let websocket_server = tokio::spawn(async move {
+        for attempt in 0..3 {
+            let (stream, _) = websocket_listener.accept().await?;
+            let mut socket = accept_async(stream).await?;
+            if attempt == 0 {
+                next_ws_json(&mut socket).await?;
+                send_ws_json(&mut socket, completed_response("resp-before", "remembered")).await?;
+            }
+            let compact = next_ws_json(&mut socket).await?;
+            assert_eq!(
+                compact["input"].as_array().unwrap().last().unwrap()["type"],
+                "compaction_trigger"
+            );
+            if attempt > 0 {
+                assert!(compact.get("previous_response_id").is_none());
+                assert!(compact.to_string().contains("keep build req_7f3"));
+            }
+            // Abrupt closure reproduces the incident's transport error.
+            drop(socket);
+        }
+        Ok::<_, eyre::Report>(websocket_listener)
+    });
+    let http_server = tokio::spawn(async move {
+        for _ in 0..3 {
+            let mut request = read_http_json(&http_listener).await?;
+            assert!(request.body.get("previous_response_id").is_none());
+            assert!(request.body.get("type").is_none());
+            assert_eq!(request.body["stream"], true);
+            assert!(request.body.to_string().contains("keep build req_7f3"));
+            assert_eq!(
+                request.body["input"].as_array().unwrap().last().unwrap()["type"],
+                "compaction_trigger"
+            );
+            request.stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
+            request.stream.shutdown().await?;
+        }
+        Ok::<_, eyre::Report>(http_listener)
+    });
+    let openai = OpenAi::builder("test-key")
+        .websocket_url(websocket_url)
+        .api_base_url(api_base_url)
+        .build()?;
+    let mut session = openai.instructions("Preserve exact identifiers.").build()?;
+    session.turn().create("keep build req_7f3").await?;
+    let original_history = serde_json::to_value(session.history().collect::<Vec<_>>())?;
+    let error = timeout(std::time::Duration::from_secs(10), session.turn().compact())
+        .await?
+        .err()
+        .expect("both transport budgets must exhaust");
+    assert!(error.to_string().contains("503"), "{error}");
+    assert_eq!(
+        serde_json::to_value(session.history().collect::<Vec<_>>())?,
+        original_history
+    );
+    let websocket_listener = websocket_server.await??;
+    let http_listener = http_server.await??;
+    assert!(
+        timeout(
+            std::time::Duration::from_millis(50),
+            websocket_listener.accept()
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        timeout(std::time::Duration::from_millis(50), http_listener.accept())
+            .await
+            .is_err()
+    );
+    Ok(())
 }

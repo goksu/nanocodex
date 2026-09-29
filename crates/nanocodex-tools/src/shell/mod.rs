@@ -15,7 +15,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicI64, AtomicU64, Ordering},
+        atomic::{AtomicI64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -28,7 +28,6 @@ const DEFAULT_WRITE_YIELD_MS: u64 = 250;
 const DEFAULT_POLL_YIELD_MS: u64 = 5_000;
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
-const MAX_LIVE_SESSIONS: usize = 64;
 
 pub(crate) struct ExecCommand {
     script: String,
@@ -102,9 +101,9 @@ pub(crate) struct ExecCommandResult {
 }
 
 pub(crate) struct ShellSessions {
-    sessions: Mutex<SessionStore>,
+    lifecycle: Mutex<()>,
+    sessions: Mutex<HashMap<i64, Arc<Session>>>,
     next_session_id: AtomicI64,
-    current_turn: Arc<AtomicU64>,
     default_shell: selection::Shell,
     environment: Arc<Vec<(OsString, OsString)>>,
 }
@@ -115,19 +114,11 @@ impl ShellSessions {
         Self::with_environment(Arc::new(Vec::new()))
     }
 
-    #[cfg(test)]
     pub(crate) fn with_environment(environment: Arc<Vec<(OsString, OsString)>>) -> Self {
-        Self::with_environment_and_turn(environment, Arc::new(AtomicU64::new(0)))
-    }
-
-    pub(crate) fn with_environment_and_turn(
-        environment: Arc<Vec<(OsString, OsString)>>,
-        current_turn: Arc<AtomicU64>,
-    ) -> Self {
         Self {
-            sessions: Mutex::new(SessionStore::default()),
+            lifecycle: Mutex::new(()),
+            sessions: Mutex::new(HashMap::new()),
             next_session_id: AtomicI64::new(1),
-            current_turn,
             default_shell: selection::default_user_shell(),
             environment,
         }
@@ -136,6 +127,11 @@ impl ShellSessions {
     #[cfg(feature = "native")]
     pub(crate) const fn default_shell_name(&self) -> &'static str {
         self.default_shell.name()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn contains(&self, session_id: i64) -> bool {
+        self.sessions.lock().await.contains_key(&session_id)
     }
 
     pub(crate) async fn execute(
@@ -151,6 +147,10 @@ impl ShellSessions {
             selection::get_shell_by_model_provided_path,
         );
         let (environment, secrets) = process::sanitized_environment(&self.environment);
+        // Registration and full cleanup are one linearized lifecycle. Once a
+        // process has spawned, terminate_all must either observe it in the
+        // store or have completed before this execution began spawning.
+        let lifecycle_guard = self.lifecycle.lock().await;
         let spawned = match process::spawn(
             &command.script,
             &workdir,
@@ -171,25 +171,20 @@ impl ShellSessions {
                 );
             }
         };
-        let session = Session::new(
-            session_id,
-            self.current_turn.load(Ordering::Acquire),
-            spawned,
-            secrets,
-        );
+        let session = Session::new(session_id, spawned, secrets);
         let _interaction_guard = session.interaction.lock().await;
-        let pruned = self.sessions.lock().await.insert(Arc::clone(&session));
-        if let Some(pruned) = pruned {
-            pruned.terminate().await;
-        }
+        self.sessions
+            .lock()
+            .await
+            .insert(session_id, Arc::clone(&session));
+        drop(lifecycle_guard);
 
         let yield_time = duration_ms(command.yield_time_ms, DEFAULT_EXEC_YIELD_MS, 250, 30_000);
-        let _interaction = session.begin_interaction();
         let result = session
             .wait_for_output(yield_time, command.max_output_tokens, started_at)
             .await;
         if result.exit_code.is_some() {
-            self.sessions.lock().await.remove(session_id);
+            self.sessions.lock().await.remove(&session_id);
         }
         result
     }
@@ -197,7 +192,7 @@ impl ShellSessions {
     pub(crate) async fn write_stdin(&self, request: WriteStdin) -> ExecCommandResult {
         let started_at = Instant::now();
         let session_id = i64::from(request.session_id);
-        let session = self.sessions.lock().await.get(session_id);
+        let session = self.sessions.lock().await.get(&session_id).cloned();
         let Some(session) = session else {
             return ExecCommandResult::failed(
                 started_at.elapsed(),
@@ -209,10 +204,6 @@ impl ShellSessions {
         };
 
         let _interaction_guard = session.interaction.lock().await;
-        session
-            .turn_id
-            .store(self.current_turn.load(Ordering::Acquire), Ordering::Release);
-        let _interaction = session.begin_interaction();
         if !request.chars.is_empty() {
             let written = if !session.tty {
                 if request.chars == "\u{3}" {
@@ -244,17 +235,18 @@ impl ShellSessions {
             .wait_for_output(yield_time, request.max_output_tokens, started_at)
             .await;
         if result.exit_code.is_some() {
-            self.sessions.lock().await.remove(session_id);
+            self.sessions.lock().await.remove(&session_id);
         }
         result
     }
 
     pub(crate) async fn terminate_all(&self) {
+        // Keep concurrent cleanup acknowledgements behind the same boundary,
+        // and do not allow a process to spawn between draining and reaping.
+        let _lifecycle_guard = self.lifecycle.lock().await;
         let sessions = {
             let mut store = self.sessions.lock().await;
-            store.recency.clear();
             store
-                .sessions
                 .drain()
                 .map(|(_, session)| session)
                 .collect::<Vec<_>>()
@@ -263,97 +255,22 @@ impl ShellSessions {
             session.terminate().await;
         }
     }
-
-    #[cfg(feature = "native")]
-    pub(crate) async fn terminate_turn(&self, turn_id: u64) {
-        let sessions = {
-            let mut store = self.sessions.lock().await;
-            let ids = store
-                .sessions
-                .iter()
-                .filter_map(|(id, session)| {
-                    (session.turn_id.load(Ordering::Acquire) == turn_id).then_some(*id)
-                })
-                .collect::<Vec<_>>();
-            ids.into_iter()
-                .filter_map(|id| store.remove(id))
-                .collect::<Vec<_>>()
-        };
-        for session in sessions {
-            session.terminate().await;
-        }
-    }
-}
-
-#[derive(Default)]
-struct SessionStore {
-    sessions: HashMap<i64, Arc<Session>>,
-    recency: VecDeque<i64>,
-}
-
-impl SessionStore {
-    fn insert(&mut self, session: Arc<Session>) -> Option<Arc<Session>> {
-        let pruned = (self.sessions.len() >= MAX_LIVE_SESSIONS)
-            .then(|| {
-                let protected_from = self.recency.len().saturating_sub(8);
-                self.recency.iter().take(protected_from).position(|id| {
-                    self.sessions
-                        .get(id)
-                        .is_some_and(|session| !session.is_active())
-                })
-            })
-            .flatten()
-            .and_then(|index| {
-                let id = self.recency.remove(index)?;
-                self.sessions.remove(&id)
-            });
-        self.recency.push_back(session.id);
-        self.sessions.insert(session.id, session);
-        pruned
-    }
-
-    fn get(&mut self, id: i64) -> Option<Arc<Session>> {
-        let session = self.sessions.get(&id).cloned()?;
-        self.touch(id);
-        Some(session)
-    }
-
-    fn remove(&mut self, id: i64) -> Option<Arc<Session>> {
-        if let Some(index) = self.recency.iter().position(|candidate| *candidate == id) {
-            self.recency.remove(index);
-        }
-        self.sessions.remove(&id)
-    }
-
-    fn touch(&mut self, id: i64) {
-        if let Some(index) = self.recency.iter().position(|candidate| *candidate == id) {
-            self.recency.remove(index);
-        }
-        self.recency.push_back(id);
-    }
 }
 
 struct Session {
     id: i64,
-    turn_id: AtomicU64,
     tty: bool,
     interaction: Mutex<()>,
     child: Mutex<process::ProcessChild>,
     stdin: Mutex<Option<process::ProcessStdin>>,
-    process_group: Mutex<process::ProcessGroupGuard>,
+    process_group: process::SharedProcessGroup,
     drains: Mutex<Option<Vec<JoinHandle<()>>>>,
     captured: Arc<Mutex<CapturedOutput>>,
     secrets: Vec<String>,
-    active_interactions: AtomicU64,
 }
 
 impl Session {
-    fn new(
-        id: i64,
-        turn_id: u64,
-        spawned: process::SpawnedProcess,
-        secrets: Vec<String>,
-    ) -> Arc<Self> {
+    fn new(id: i64, spawned: process::SpawnedProcess, secrets: Vec<String>) -> Arc<Self> {
         let tty = matches!(spawned.stdin.as_ref(), Some(process::ProcessStdin::Pty(_)));
         let captured = Arc::new(Mutex::new(CapturedOutput::default()));
         let drains = match spawned.output {
@@ -377,34 +294,22 @@ impl Session {
         };
         Arc::new(Self {
             id,
-            turn_id: AtomicU64::new(turn_id),
             tty,
             interaction: Mutex::new(()),
             child: Mutex::new(spawned.child),
             stdin: Mutex::new(spawned.stdin),
-            process_group: Mutex::new(spawned.process_group),
+            process_group: spawned.process_group,
             drains: Mutex::new(Some(drains)),
             captured,
             secrets,
-            active_interactions: AtomicU64::new(0),
         })
-    }
-
-    fn begin_interaction(&self) -> ActiveInteraction<'_> {
-        self.active_interactions.fetch_add(1, Ordering::AcqRel);
-        ActiveInteraction { session: self }
-    }
-
-    fn is_active(&self) -> bool {
-        self.active_interactions.load(Ordering::Acquire) > 0
     }
 
     async fn terminate(&self) {
         // Signal first: a direct caller can hold the interaction lock while
         // awaiting this child, and waiting for that lock before terminating
         // would make cancellation wait for the command's full yield timeout.
-        self.stdin.lock().await.take();
-        if let Err(error) = self.process_group.lock().await.terminate_and_disarm() {
+        if let Err(error) = self.process_group.terminate_and_disarm() {
             tracing::warn!(
                 shell.session.id = self.id,
                 %error,
@@ -415,6 +320,9 @@ impl Session {
         // wait path. Own it before the idempotent reap/drain cleanup so a
         // cancellation acknowledgement is a real process-cleanup boundary.
         let _interaction = self.interaction.lock().await;
+        // No write can remain active after taking the interaction lock, so the
+        // stdin handle can now be dropped without delaying the kill signal.
+        self.stdin.lock().await.take();
         if let Err(error) = self.child.lock().await.wait().await {
             tracing::warn!(
                 shell.session.id = self.id,
@@ -426,7 +334,7 @@ impl Session {
     }
 
     async fn interrupt(&self) -> std::io::Result<()> {
-        self.process_group.lock().await.interrupt()
+        self.process_group.interrupt()
     }
 
     async fn write(&self, chars: &str) -> std::io::Result<()> {
@@ -449,12 +357,12 @@ impl Session {
         };
         let exit_code = match status {
             Ok(Ok(exit_code)) => {
-                let _ = self.process_group.lock().await.terminate_and_disarm();
+                let _ = self.process_group.terminate_and_disarm();
                 self.finish_drains().await;
                 Some(exit_code)
             }
             Ok(Err(error)) => {
-                let _ = self.process_group.lock().await.terminate_and_disarm();
+                let _ = self.process_group.terminate_and_disarm();
                 let message = format!("failed to wait for shell command: {error}");
                 self.captured
                     .lock()
@@ -506,18 +414,6 @@ impl Session {
         let limit = output::effective_token_limit(max_output_tokens);
         let (output, _) = output::redact_and_limit(raw, &self.secrets, limit);
         (output, Some(captured.total_bytes.saturating_add(3) / 4))
-    }
-}
-
-struct ActiveInteraction<'a> {
-    session: &'a Session,
-}
-
-impl Drop for ActiveInteraction<'_> {
-    fn drop(&mut self) {
-        self.session
-            .active_interactions
-            .fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -654,7 +550,8 @@ mod tests {
     #[cfg(unix)]
     use std::{
         ffi::OsString,
-        sync::Arc,
+        io::Write,
+        sync::{Arc, Barrier},
         time::{Duration, SystemTime},
     };
 
@@ -725,6 +622,116 @@ mod tests {
             result.output,
             "injected|http://nanocodex:[REDACTED]@127.0.0.1:1234"
         );
+    }
+
+    // Yield is an observation deadline, not a promise that a scheduled child
+    // has produced output. Wait for its explicit readiness before releasing it.
+    #[cfg(unix)]
+    async fn ready_child(
+        sessions: &ShellSessions,
+        mut result: super::ExecCommandResult,
+    ) -> super::ExecCommandResult {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !result.output.contains('\n') {
+                let id = i32::try_from(
+                    result
+                        .session_id
+                        .expect("child must remain active before readiness"),
+                )
+                .unwrap();
+                let next = sessions
+                    .write_stdin(WriteStdin::new(id, String::new(), Some(100), None))
+                    .await;
+                result.output.push_str(&next.output);
+                result.session_id = next.session_id;
+                result.exit_code = next.exit_code;
+            }
+            result
+        })
+        .await
+        .expect("child must announce readiness")
+    }
+
+    #[cfg(unix)]
+    async fn assert_unpolled_child_is_reaped(tty: bool) {
+        use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let release = directory.path().join("release");
+        let sessions = ShellSessions::new();
+        let first = sessions.execute(
+            ExecCommand::new(
+                format!("printf '%s\\n' \"$$\"; while [ ! -f '{}' ]; do sleep 0.02; done; printf 'retained-output'; exit 23", release.display()),
+                None, Some("/bin/sh".to_owned()), Some(false), tty, Some(250), None,
+            ),
+            std::path::Path::new("/"),
+        ).await;
+        assert_eq!(first.session_id, Some(1));
+        let first = ready_child(&sessions, first).await;
+        let pid = Pid::from_raw(first.output.trim().parse().expect("shell PID"));
+        std::fs::write(&release, "exit").expect("release child");
+        // kill(pid, 0) still succeeds for a zombie: ESRCH proves the child was
+        // reaped, without a tool poll (or waitpid in the test) doing that work.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while kill(pid, None) != Err(Errno::ESRCH) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("unpolled child should be reaped");
+        let later = sessions
+            .write_stdin(WriteStdin::new(1, String::new(), Some(5_000), None))
+            .await;
+        assert_eq!(later.exit_code, Some(23));
+        assert_eq!(later.session_id, None);
+        assert_eq!(later.output, "retained-output");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unpolled_pipe_child_is_reaped_and_retains_output_and_status() {
+        assert_unpolled_child_is_reaped(false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unpolled_pty_child_is_reaped_and_retains_output_and_status() {
+        assert_unpolled_child_is_reaped(true).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_unpolled_sessions_terminates_and_reaps_children() {
+        use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
+
+        for tty in [false, true] {
+            let sessions = ShellSessions::new();
+            let first = sessions
+                .execute(
+                    ExecCommand::new(
+                        "printf '%s\\n' \"$$\"; sleep 30".to_owned(),
+                        None,
+                        Some("/bin/sh".to_owned()),
+                        Some(false),
+                        tty,
+                        Some(250),
+                        None,
+                    ),
+                    std::path::Path::new("/"),
+                )
+                .await;
+            assert_eq!(first.session_id, Some(1));
+            let first = ready_child(&sessions, first).await;
+            let pid = Pid::from_raw(first.output.trim().parse().expect("shell PID"));
+            drop(sessions);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while kill(pid, None) != Err(Errno::ESRCH) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("dropped session child should terminate and be reaped");
+        }
     }
 
     #[cfg(unix)]
@@ -922,7 +929,7 @@ mod tests {
         };
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if !sessions.sessions.lock().await.sessions.is_empty() {
+                if !sessions.sessions.lock().await.is_empty() {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -943,6 +950,171 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn concurrent_full_cancellations_wait_for_the_same_process_cleanup() {
+        let sessions = Arc::new(ShellSessions::new());
+        let started = sessions
+            .execute(
+                ExecCommand::new(
+                    "sleep 30".to_owned(),
+                    None,
+                    None,
+                    Some(false),
+                    false,
+                    Some(250),
+                    None,
+                ),
+                std::path::Path::new("/"),
+            )
+            .await;
+        assert_eq!(started.session_id, Some(1));
+
+        let session = sessions
+            .sessions
+            .lock()
+            .await
+            .get(&1)
+            .cloned()
+            .expect("yielded shell session should remain registered");
+        let interaction = session.interaction.lock().await;
+        let first = {
+            let sessions = Arc::clone(&sessions);
+            tokio::spawn(async move { sessions.terminate_all().await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !sessions.sessions.lock().await.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first cancellation should drain the session store");
+
+        let mut second = {
+            let sessions = Arc::clone(&sessions);
+            tokio::spawn(async move { sessions.terminate_all().await })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut second)
+                .await
+                .is_err(),
+            "a concurrent cancellation acknowledged before process cleanup finished"
+        );
+
+        drop(interaction);
+        tokio::time::timeout(Duration::from_secs(2), first)
+            .await
+            .expect("first cancellation should finish after cleanup is released")
+            .expect("first cancellation task should not panic");
+        tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .expect("second cancellation should finish with the first")
+            .expect("second cancellation task should not panic");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn full_cancellation_signals_before_waiting_for_a_blocked_pty_write()
+    -> Result<(), Box<dyn std::error::Error>> {
+        struct BlockingWriter {
+            entered: std::sync::mpsc::SyncSender<()>,
+            release: Arc<Barrier>,
+        }
+
+        impl Write for BlockingWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.entered
+                    .send(())
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                self.release.wait();
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)?
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "nanocodex-blocked-pty-cancel-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory)?;
+        let marker = directory.join("escaped");
+        let sessions = Arc::new(ShellSessions::new());
+        let started = sessions
+            .execute(
+                ExecCommand::new(
+                    format!("(sleep 1; printf escaped > '{}') & wait", marker.display()),
+                    None,
+                    None,
+                    Some(false),
+                    true,
+                    Some(250),
+                    None,
+                ),
+                std::path::Path::new("/"),
+            )
+            .await;
+        assert_eq!(started.session_id, Some(1));
+
+        let session = sessions
+            .sessions
+            .lock()
+            .await
+            .get(&1)
+            .cloned()
+            .expect("yielded PTY session should remain registered");
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let release = Arc::new(Barrier::new(2));
+        let writer: Box<dyn Write + Send> = Box::new(BlockingWriter {
+            entered: entered_tx,
+            release: Arc::clone(&release),
+        });
+        *session.stdin.lock().await = Some(super::process::ProcessStdin::Pty(Arc::new(
+            std::sync::Mutex::new(writer),
+        )));
+
+        let write = {
+            let sessions = Arc::clone(&sessions);
+            tokio::spawn(async move {
+                sessions
+                    .write_stdin(WriteStdin::new(1, "x".to_owned(), Some(250), None))
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(2)))
+            .await??;
+
+        let cancellation = {
+            let sessions = Arc::clone(&sessions);
+            tokio::spawn(async move { sessions.terminate_all().await })
+        };
+        tokio::time::sleep(Duration::from_millis(1_250)).await;
+        let escaped = marker.exists();
+
+        release.wait();
+        tokio::time::timeout(Duration::from_secs(2), write)
+            .await
+            .expect("blocked write should finish after release")
+            .expect("write task should not panic");
+        tokio::time::timeout(Duration::from_secs(2), cancellation)
+            .await
+            .expect("cancellation should finish after the write releases")
+            .expect("cancellation task should not panic");
+        std::fs::remove_dir_all(directory)?;
+
+        assert!(
+            !escaped,
+            "a blocked PTY write delayed the process-group signal"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn direct_non_tty_cancellation_signals_before_waiting_for_the_interaction() {
         assert_direct_cancellation_finishes(/*tty*/ false).await;
     }
@@ -951,6 +1123,77 @@ mod tests {
     #[tokio::test]
     async fn direct_pty_cancellation_reuses_the_completed_wait_result() {
         assert_direct_cancellation_finishes(/*tty*/ true).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn opening_more_than_64_processes_preserves_every_yielded_session() {
+        let sessions = ShellSessions::new();
+        let mut started = Vec::new();
+        // Let each batch yield before opening the next. These children are
+        // still running even though no tool call is currently polling them.
+        for _ in 0..5 {
+            started.extend(
+                futures_util::future::join_all((0..16).map(|_| {
+                    sessions.execute(
+                        ExecCommand::new(
+                            "stty -echo; printf 'ready\\n'; read value; printf 'got:%s' \"$value\""
+                                .to_owned(),
+                            None,
+                            Some("/bin/sh".to_owned()),
+                            Some(false),
+                            true,
+                            Some(250),
+                            None,
+                        ),
+                        std::path::Path::new("/"),
+                    )
+                }))
+                .await,
+            );
+        }
+        let started = futures_util::future::join_all(
+            started
+                .into_iter()
+                .map(|result| ready_child(&sessions, result)),
+        )
+        .await;
+        let finished = futures_util::future::join_all((1..=80).map(|id| {
+            let sessions = &sessions;
+            async move {
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    let mut result = sessions
+                        .write_stdin(WriteStdin::new(
+                            id,
+                            format!("release-{id}\n"),
+                            Some(100),
+                            None,
+                        ))
+                        .await;
+                    while result.exit_code.is_none() {
+                        let next = sessions
+                            .write_stdin(WriteStdin::new(id, String::new(), Some(100), None))
+                            .await;
+                        result.output.push_str(&next.output);
+                        result.exit_code = next.exit_code;
+                        result.session_id = next.session_id;
+                    }
+                    result
+                })
+                .await
+                .expect("released child must terminate")
+            }
+        }))
+        .await;
+        sessions.terminate_all().await;
+
+        for (index, (start, finish)) in started.iter().zip(&finished).enumerate() {
+            let id = i64::try_from(index + 1).unwrap();
+            assert_eq!(start.session_id, Some(id), "{}", start.output);
+            assert_eq!(finish.exit_code, Some(0), "session {id}: {}", finish.output);
+            assert!(finish.output.contains(&format!("got:release-{id}")));
+            assert!(!sessions.contains(id).await);
+        }
     }
 
     #[cfg(unix)]

@@ -3,7 +3,6 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use nanocodex_agent::{Nanocodex, OpenAi};
 use nanocodex_vm::tools::{VmCommandOutput, VmCommandPartialOutput};
 use nix::unistd::getpgrp;
 
@@ -12,16 +11,21 @@ use super::*;
 // VM lifecycle regression tests are kept beside the backend that owns the
 // behavior rather than in the CLI adapter.
 #[test]
-fn evaluator_vm_builder_records_the_backend_environment() {
-    let output = tempfile::tempdir().unwrap();
-    let backend = VmBackend::builder().build();
-    let openai = OpenAi::new("test").unwrap();
-    let evaluator = crate::Evaluator::builder(Nanocodex::builder(openai), backend)
-        .output_directory(output.path())
-        .build()
-        .unwrap();
+fn run_scoped_judge_credentials_are_verifier_only() {
+    let task =
+        Task::load(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../tasks/write-greeting"))
+            .unwrap();
+    let runtime = BTreeMap::from([("NANOCODEX_JUDGE_TOKEN".to_owned(), "run-secret".to_owned())]);
 
-    assert_eq!(evaluator.attempt_environment(), EvalEnvironment::MicroVm);
+    let candidate = base_guest_environment(&task, "/workspace")
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    let verifier = verifier_guest_environment(&task, "/workspace", &runtime)
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+
+    assert!(!candidate.contains_key("NANOCODEX_JUDGE_TOKEN"));
+    assert_eq!(verifier["NANOCODEX_JUDGE_TOKEN"], "run-secret");
 }
 
 #[test]
@@ -33,6 +37,89 @@ fn eval_guest_memory_cap_only_reduces_large_task_allocations() {
     assert_eq!(
         effective_guest_memory_mb(u64::MAX, None),
         u64::from(u32::MAX)
+    );
+}
+
+#[test]
+fn guest_executables_are_installed_by_the_task_image_recipe() {
+    let context = tempfile::tempdir().unwrap();
+    fs::write(context.path().join("Dockerfile"), "FROM ubuntu:24.04\n").unwrap();
+    let binary = context.path().join("codex");
+    fs::write(&binary, b"codex-binary").unwrap();
+
+    let installed = materialize_guest_executables(
+        context.path(),
+        &[VmGuestExecutable {
+            source: binary,
+            guest_path: "/usr/local/bin/codex".to_owned(),
+        }],
+    )
+    .unwrap();
+
+    assert_eq!(installed, 12);
+    assert_eq!(
+        fs::read_to_string(context.path().join("Dockerfile")).unwrap(),
+        "FROM ubuntu:24.04\n\nCOPY .nanocodex/guest-executables/0 /usr/local/bin/codex\n"
+    );
+    let staged = context.path().join(".nanocodex/guest-executables/0");
+    assert_eq!(fs::read(staged).unwrap(), b"codex-binary");
+}
+
+#[test]
+fn artifact_archive_options_precede_the_path_terminator() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("tests")).unwrap();
+    fs::create_dir(directory.path().join("environment")).unwrap();
+    fs::write(
+        directory.path().join("task.toml"),
+        r#"
+schema_version = "1.1"
+artifacts = [
+  { source = "/workspace", exclude = ["Dockerfile", "instruction.md"] },
+  "/--option-shaped-output",
+]
+
+[task]
+name = "adapter/artifact-order"
+
+[agent]
+timeout_sec = 1.0
+
+[verifier]
+timeout_sec = 1.0
+
+[environment]
+docker_image = "example/task:latest"
+cpus = 1
+memory_mb = 1
+storage_mb = 1
+"#,
+    )
+    .unwrap();
+    fs::write(directory.path().join("instruction.md"), "Create output.").unwrap();
+    fs::write(directory.path().join("tests/test.sh"), "exit 0\n").unwrap();
+    fs::write(
+        directory.path().join("environment/Dockerfile"),
+        "FROM scratch\n",
+    )
+    .unwrap();
+    let task = Task::load(directory.path()).unwrap();
+
+    let arguments = artifact_archive_arguments(&task).unwrap();
+
+    assert_eq!(
+        arguments,
+        [
+            "-C",
+            "/",
+            "-cf",
+            "/tmp/nanoeval-artifacts.tar",
+            "--exclude=workspace/Dockerfile",
+            "--exclude=workspace/instruction.md",
+            "--",
+            "workspace",
+            "--option-shaped-output",
+        ]
     );
 }
 
@@ -139,18 +226,15 @@ fn backend_configuration_is_single_assignment() {
 }
 
 #[tokio::test]
-async fn attempt_vmm_isolated_while_preparation_vmm_inherits_terminal_group() {
-    let inherited = recorded_vm_process_group(VmProcessGroup::Inherited).await;
-    let isolated = recorded_vm_process_group(VmProcessGroup::Isolated).await;
+async fn evaluator_vmm_inherits_the_worker_process_group() {
+    let inherited = recorded_vm_process_group().await;
     let parent_group = getpgrp().as_raw();
 
     assert_eq!(inherited.1, parent_group);
     assert_ne!(inherited.0, inherited.1);
-    assert_eq!(isolated.0, isolated.1);
-    assert_ne!(isolated.1, parent_group);
 }
 
-async fn recorded_vm_process_group(process_group: VmProcessGroup) -> (i32, i32) {
+async fn recorded_vm_process_group() -> (i32, i32) {
     let directory = tempfile::tempdir().unwrap();
     let vmm = directory.path().join("fake-vmm");
     let record = directory.path().join("process-group");
@@ -179,7 +263,7 @@ async fn recorded_vm_process_group(process_group: VmProcessGroup) -> (i32, i32) 
         shared_directories: Vec::new(),
     };
 
-    let session = launch.spawn(None, process_group).unwrap();
+    let session = launch.spawn(None).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     let values = loop {
         if let Ok(contents) = fs::read_to_string(&record)
@@ -472,8 +556,10 @@ fn verifier_with_launch_root(root: VmLaunchRoot, retain_failed_rootfs: bool) -> 
         retain_passed_rootfs: false,
         retain_failed_rootfs,
         root_disks_finalized: false,
-        memory: VmAttemptMemory::default(),
+        artifact_directory: directory,
+        verifier_environment: Arc::new(BTreeMap::new()),
         _network: None,
+        _verifier_network: None,
     }
 }
 
@@ -783,8 +869,10 @@ done
         retain_passed_rootfs: false,
         retain_failed_rootfs: true,
         root_disks_finalized: false,
-        memory: VmAttemptMemory::default(),
+        artifact_directory: control.path().to_path_buf(),
+        verifier_environment: Arc::new(BTreeMap::new()),
         _network: None,
+        _verifier_network: None,
     };
 
     let (_, session) = verifier.start_verifier_session(&task).await.unwrap();

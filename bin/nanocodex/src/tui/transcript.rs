@@ -23,10 +23,13 @@ use super::app::PlanStepStatus;
 use super::composer::ComposerLayout;
 use super::diff::{PatchPresentation, present_apply_patch};
 use super::markdown::{
-    LogicalMarkdown, MarkdownFormula, RenderedAgentMarkdown, StreamingFormulaFrame,
-    heal_streaming_markdown, render_agent_markdown, render_finalized_agent_markdown_with_math,
+    LinkSpan, LogicalMarkdown, MarkdownFormula, StreamingFormulaFrame, heal_streaming_markdown,
+    render_agent_markdown_layout, render_finalized_agent_markdown_with_math,
     render_streaming_agent_markdown_with_math, restore_markdown_links_from_sources,
 };
+
+#[cfg(test)]
+use super::markdown::render_agent_markdown;
 
 #[derive(Clone, Copy)]
 pub(super) struct InlineEdit<'a> {
@@ -93,7 +96,6 @@ impl Clone for Transcript {
 }
 
 impl Transcript {
-    #[cfg(test)]
     pub(super) const fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -358,6 +360,66 @@ impl Transcript {
         )
     }
 
+    pub(super) fn link_destination_at(
+        &self,
+        area: Rect,
+        scroll_from_bottom: usize,
+        selected: Option<usize>,
+        inline_edit: Option<InlineEdit<'_>>,
+        position: Position,
+    ) -> Option<String> {
+        if area.is_empty() || !area.contains(position) {
+            return None;
+        }
+        let viewport = selected
+            .filter(|index| *index < self.entries.len())
+            .map(|selected| {
+                selection_viewport(
+                    &self.entries,
+                    area,
+                    scroll_from_bottom,
+                    selected,
+                    inline_edit,
+                )
+            })
+            .unwrap_or_else(|| {
+                bottom_viewport(
+                    &self.entries,
+                    area,
+                    scroll_from_bottom,
+                    usize::MAX,
+                    inline_edit,
+                )
+                .0
+            });
+        let mut local_scroll = viewport.local_scroll;
+        let mut screen_y = viewport.screen_y;
+        let row = usize::from(position.y.saturating_sub(area.y));
+        let column = position.x.saturating_sub(area.x);
+        for (index, entry) in self.entries.iter().enumerate().skip(viewport.first) {
+            if screen_y >= usize::from(area.height) {
+                break;
+            }
+            let height = rendered_height(entry, index, area.width, inline_edit);
+            let visible_height = height
+                .saturating_sub(local_scroll)
+                .min(usize::from(area.height).saturating_sub(screen_y));
+            if row >= screen_y && row < screen_y.saturating_add(visible_height) {
+                if inline_edit.is_some_and(|edit| edit.index == index) {
+                    return None;
+                }
+                return entry.link_destination_at(
+                    area.width,
+                    local_scroll.saturating_add(row.saturating_sub(screen_y)),
+                    column,
+                );
+            }
+            screen_y = screen_y.saturating_add(visible_height);
+            local_scroll = 0;
+        }
+        None
+    }
+
     pub(super) fn prefix_before(&self, index: usize) -> Self {
         let end = index.min(self.entries.len());
         Self {
@@ -392,10 +454,19 @@ impl Transcript {
         let parent_id = call_id
             .split_once("/code-")
             .map_or(call_id, |(parent, _)| parent);
-        if let Some(entry) = self.entries.iter_mut().rev().find(
-            |entry| matches!(&entry.kind, EntryKind::Tool { call_id } if call_id == parent_id),
-        ) {
-            Arc::make_mut(entry).set_tool_result(
+        // A nested call that starts after exec yields can be rendered before its
+        // parent exists. Prefer that standalone row over a later parent row.
+        let index = self
+            .entries
+            .iter()
+            .rposition(|entry| matches!(&entry.kind, EntryKind::Tool { call_id: id } if id == call_id))
+            .or_else(|| {
+                self.entries.iter().rposition(
+                    |entry| matches!(&entry.kind, EntryKind::Tool { call_id } if call_id == parent_id),
+                )
+            });
+        if let Some(index) = index {
+            Arc::make_mut(&mut self.entries[index]).set_tool_result(
                 call_id,
                 status,
                 started_after_ns,
@@ -879,6 +950,7 @@ struct RenderedText {
     text: Text<'static>,
     line_heights: Vec<usize>,
     prewrapped_lines: Vec<Option<Vec<Line<'static>>>>,
+    link_rows: Vec<Vec<LinkSpan>>,
     formulas: Vec<RenderedFormula>,
     height: usize,
 }
@@ -1093,6 +1165,13 @@ impl TranscriptEntry {
 
     fn user_message(&self) -> Option<&str> {
         self.user_message.as_deref()
+    }
+
+    fn link_destination_at(&self, width: u16, row: usize, column: u16) -> Option<String> {
+        let EntryContent::Markdown(markdown) = &self.content else {
+            return None;
+        };
+        markdown.link_destination_at(width, row, column)
     }
 
     fn remove_trailing_user_separator(&mut self) {
@@ -1335,14 +1414,22 @@ impl ToolActivity {
 
     fn refresh_plain_detail(&mut self) {
         self.plain_detail = (self.children.is_empty()
-            && self.name != "exec"
             && self.patch.is_none()
             && (!self.arguments.is_empty()
                 || self
                     .result
                     .as_deref()
                     .is_some_and(|result| !result.is_empty())))
-        .then(|| StreamingText::tool_detail(&self.arguments, self.result.as_deref()));
+        .then(|| {
+            StreamingText::tool_detail(
+                if self.name == "exec" {
+                    ""
+                } else {
+                    &self.arguments
+                },
+                self.result.as_deref(),
+            )
+        });
     }
 
     fn uses_plain_detail(&self) -> bool {
@@ -1442,7 +1529,15 @@ impl ToolActivity {
         let (icon, color) = tool_style(self.status);
         let display_name = if self.name == "exec" {
             if self.children.is_empty() {
-                "Working"
+                if self
+                    .result
+                    .as_deref()
+                    .is_some_and(|result| !result.is_empty())
+                {
+                    "Output"
+                } else {
+                    "Working"
+                }
             } else {
                 "Tools"
             }
@@ -1473,7 +1568,15 @@ impl ToolActivity {
         let (icon, color) = tool_style(self.status);
         let display_name = if self.name == "exec" {
             if self.children.is_empty() {
-                "Working"
+                if self
+                    .result
+                    .as_deref()
+                    .is_some_and(|result| !result.is_empty())
+                {
+                    "Output"
+                } else {
+                    "Working"
+                }
             } else {
                 "Tools"
             }
@@ -1494,7 +1597,7 @@ impl ToolActivity {
         if !self.children.is_empty()
             && let Some(result) = self.result.as_deref().filter(|result| !result.is_empty())
         {
-            details.push(result.to_owned());
+            details.push(result.lines().next().unwrap_or_default().to_owned());
         }
 
         if !details_expanded {
@@ -1503,8 +1606,12 @@ impl ToolActivity {
 
         let mut lines = vec![tool_header_line(icon, color, display_name, &details)];
 
-        if self.children.is_empty() && self.name != "exec" {
-            let mut activity_detail = self.arguments.clone();
+        if self.children.is_empty() {
+            let mut activity_detail = if self.name == "exec" {
+                String::new()
+            } else {
+                self.arguments.clone()
+            };
             if let Some(result) = self.result.as_deref().filter(|result| !result.is_empty()) {
                 push_detail(&mut activity_detail, result);
             }
@@ -1531,6 +1638,18 @@ impl ToolActivity {
                     lines.extend(child_lines(child, connector, continuation, width));
                 }
             }
+        }
+        if !self.children.is_empty()
+            && let Some(result) = self
+                .result
+                .as_deref()
+                .filter(|result| result.contains('\n'))
+        {
+            lines.extend(
+                result.lines().skip(1).map(|line| {
+                    Line::styled(format!("  {line}"), Style::default().fg(Color::Gray))
+                }),
+            );
         }
         lines.push(Line::raw(""));
         Text::from(lines)
@@ -1600,7 +1719,11 @@ fn child_lines(
         push_styled_detail(&mut detail, format_duration(duration_ns), detail_style);
     }
     if let Some(result) = child.result.as_deref().filter(|result| !result.is_empty()) {
-        push_styled_detail(&mut detail, result.to_owned(), detail_style);
+        push_styled_detail(
+            &mut detail,
+            result.lines().next().unwrap_or_default().to_owned(),
+            detail_style,
+        );
     }
     let child_name = match (child.name.as_str(), child.status) {
         ("exec_command", ToolStatus::Running) => "Running",
@@ -1627,6 +1750,14 @@ fn child_lines(
                 Span::styled(format!("  {argument}"), Style::default().fg(Color::Gray)),
             ]));
         }
+    }
+    if let Some(result) = &child.result {
+        lines.extend(result.lines().skip(1).map(|line| {
+            Line::from(vec![
+                Span::styled(continuation, Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("  {line}"), Style::default().fg(Color::Gray)),
+            ])
+        }));
     }
     lines
 }
@@ -2016,6 +2147,10 @@ impl MarkdownContent {
         self.with_rendered(width, |rendered| rendered.height)
     }
 
+    fn link_destination_at(&self, width: u16, row: usize, column: u16) -> Option<String> {
+        self.with_rendered(width, |rendered| rendered.link_destination_at(row, column))
+    }
+
     #[cfg(test)]
     fn render(
         &self,
@@ -2067,12 +2202,7 @@ impl MarkdownContent {
                 .filter(|frames| frames.width == width)
                 .map_or_else(Vec::new, |frames| frames.formulas.clone());
             let mut rendered = self.math_renderer.as_ref().map_or_else(
-                || RenderedAgentMarkdown {
-                    text: render_agent_markdown(&source, width),
-                    formulas: Vec::new(),
-                    formula_sources: Vec::new(),
-                    math_generation: None,
-                },
+                || render_agent_markdown_layout(&source, width),
                 |renderer| {
                     if self.streaming {
                         render_streaming_agent_markdown_with_math(
@@ -2087,6 +2217,9 @@ impl MarkdownContent {
             );
             if !self.show_header && !rendered.text.lines.is_empty() {
                 let _ = rendered.text.lines.remove(0);
+                if !rendered.links.is_empty() {
+                    let _ = rendered.links.remove(0);
+                }
                 for formula in &mut rendered.formulas {
                     formula.line = formula.line.saturating_sub(1);
                 }
@@ -2097,9 +2230,15 @@ impl MarkdownContent {
                         .is_some_and(|span| span.content.as_ref() == "  ")
                     {
                         let _ = line.spans.remove(0);
+                        if let Some(links) = rendered.links.get_mut(index) {
+                            shift_link_columns(links, -2);
+                        }
                     }
                     if index > 0 && !line.spans.is_empty() {
                         line.spans.insert(0, Span::raw("  "));
+                        if let Some(links) = rendered.links.get_mut(index) {
+                            shift_link_columns(links, 2);
+                        }
                     }
                 }
             }
@@ -2141,7 +2280,7 @@ impl MarkdownContent {
                 .math_frames
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner) = next_math_frames;
-            RenderedText::with_formulas(rendered.text, width, rendered.formulas)
+            RenderedText::with_formulas(rendered.text, width, rendered.formulas, rendered.links)
         });
         read(rendered)
     }
@@ -2149,10 +2288,15 @@ impl MarkdownContent {
 
 impl RenderedText {
     fn new(text: Text<'static>, width: u16) -> Self {
-        Self::with_formulas(text, width, Vec::new())
+        Self::with_formulas(text, width, Vec::new(), Vec::new())
     }
 
-    fn with_formulas(text: Text<'static>, width: u16, formulas: Vec<MarkdownFormula>) -> Self {
+    fn with_formulas(
+        text: Text<'static>,
+        width: u16,
+        formulas: Vec<MarkdownFormula>,
+        links: Vec<Vec<LinkSpan>>,
+    ) -> Self {
         let mut formula_rows = vec![false; text.lines.len()];
         for formula in &formulas {
             if !formula.block {
@@ -2168,6 +2312,7 @@ impl RenderedText {
         }
         let mut line_heights = Vec::with_capacity(text.lines.len());
         let mut prewrapped_lines = Vec::with_capacity(text.lines.len());
+        let mut link_rows = Vec::new();
         for (index, line) in text.lines.iter().enumerate() {
             let (height, rows) = if formula_rows[index] {
                 (1, None)
@@ -2176,6 +2321,18 @@ impl RenderedText {
             };
             line_heights.push(height);
             prewrapped_lines.push(rows);
+            let mut rows = if formula_rows[index] {
+                Vec::new()
+            } else {
+                wrapped_link_spans(
+                    line,
+                    text.style,
+                    width,
+                    links.get(index).map_or(&[], Vec::as_slice),
+                )
+            };
+            rows.resize_with(height, Vec::new);
+            link_rows.extend(rows);
         }
         let height = line_heights.iter().copied().sum();
         let formulas = formulas
@@ -2193,6 +2350,7 @@ impl RenderedText {
             text,
             line_heights,
             prewrapped_lines,
+            link_rows,
             formulas,
             height,
         }
@@ -2250,6 +2408,8 @@ impl RenderedText {
             self.height = self.height.saturating_sub(height);
         }
         let _ = self.prewrapped_lines.pop();
+        let new_len = self.height;
+        self.link_rows.truncate(new_len);
     }
 
     fn push_line(&mut self, line: Line<'static>) {
@@ -2258,6 +2418,8 @@ impl RenderedText {
         self.text.lines.push(line);
         self.line_heights.push(height);
         self.prewrapped_lines.push(rows);
+        self.link_rows
+            .extend(std::iter::repeat_with(Vec::new).take(height));
     }
 
     fn render(
@@ -2380,6 +2542,14 @@ impl RenderedText {
         self.line_heights[index]
     }
 
+    fn link_destination_at(&self, row: usize, column: u16) -> Option<String> {
+        self.link_rows
+            .get(row)?
+            .iter()
+            .find(|link| (link.start..link.end).contains(&column))
+            .map(|link| link.destination.to_string())
+    }
+
     fn line_at_visual_row(&self, row: usize, total_height: usize) -> Option<(usize, usize)> {
         if row >= total_height {
             return None;
@@ -2432,6 +2602,13 @@ fn rendered_line_layout(
                 .max(1),
             None,
         )
+    }
+}
+
+fn shift_link_columns(links: &mut [LinkSpan], amount: i16) {
+    for link in links {
+        link.start = link.start.saturating_add_signed(amount);
+        link.end = link.end.saturating_add_signed(amount);
     }
 }
 
@@ -2631,6 +2808,7 @@ impl StreamingLine {
 struct StyledPart<'a> {
     symbol: &'a str,
     style: Style,
+    link: Option<&'a Arc<str>>,
 }
 
 fn wrap_parts<'a>(
@@ -2727,6 +2905,7 @@ fn wrap_line(content: &str, width: u16) -> Vec<String> {
         UnicodeSegmentation::graphemes(content, true).map(|symbol| StyledPart {
             symbol,
             style: Style::default(),
+            link: None,
         }),
         width,
     )
@@ -2747,6 +2926,7 @@ fn wrap_styled_line(
             .map(|grapheme| StyledPart {
                 symbol: grapheme.symbol,
                 style: grapheme.style,
+                link: None,
             }),
         width,
     )
@@ -2771,6 +2951,60 @@ fn wrap_styled_line(
         let mut row = Line::from(spans);
         row.alignment = alignment;
         row
+    })
+    .collect()
+}
+
+fn wrapped_link_spans(
+    line: &Line<'static>,
+    base_style: Style,
+    width: u16,
+    links: &[LinkSpan],
+) -> Vec<Vec<LinkSpan>> {
+    let mut column = 0_u16;
+    wrap_parts(
+        line.styled_graphemes(base_style).map(|grapheme| {
+            let start = column;
+            let grapheme_width =
+                u16::try_from(UnicodeWidthStr::width(grapheme.symbol)).unwrap_or(u16::MAX);
+            column = column.saturating_add(grapheme_width);
+            StyledPart {
+                symbol: grapheme.symbol,
+                style: grapheme.style,
+                link: links
+                    .iter()
+                    .find(|link| (link.start..link.end).contains(&start))
+                    .map(|link| &link.destination),
+            }
+        }),
+        width,
+    )
+    .into_iter()
+    .map(|row| {
+        let mut links = Vec::<LinkSpan>::new();
+        let mut column = 0_u16;
+        for part in row {
+            let part_width = u16::try_from(UnicodeWidthStr::width(part.symbol)).unwrap_or(u16::MAX);
+            if let Some(destination) = part.link
+                && part_width > 0
+            {
+                let end = column.saturating_add(part_width);
+                if let Some(last) = links.last_mut()
+                    && last.destination == *destination
+                    && last.end == column
+                {
+                    last.end = end;
+                } else {
+                    links.push(LinkSpan {
+                        destination: Arc::clone(destination),
+                        start: column,
+                        end,
+                    });
+                }
+            }
+            column = column.saturating_add(part_width);
+        }
+        links
     })
     .collect()
 }
@@ -2831,7 +3065,7 @@ mod tests {
         Terminal,
         backend::TestBackend,
         buffer::Buffer,
-        layout::Rect,
+        layout::{Position, Rect},
         style::{Color, Modifier, Style},
         text::Line,
         widgets::{Paragraph, Widget, Wrap},
@@ -2843,6 +3077,73 @@ mod tests {
     };
 
     const ASYNC_RENDER_TIMEOUT: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn wrapped_markdown_links_retain_hit_ranges() {
+        let markdown = MarkdownContent::new("[abcdefghij](https://example.com)", None);
+        markdown.with_rendered(5, |rendered| {
+            let hits = rendered
+                .link_rows
+                .iter()
+                .flat_map(|row| row.iter())
+                .collect::<Vec<_>>();
+            assert_eq!(hits.len(), 3);
+            assert!(
+                hits.iter()
+                    .all(|hit| hit.destination.as_ref() == "https://example.com")
+            );
+            assert_eq!(
+                hits.iter()
+                    .map(|hit| (hit.start, hit.end))
+                    .collect::<Vec<_>>(),
+                vec![(2, 5), (0, 5), (0, 2)]
+            );
+        });
+    }
+
+    #[test]
+    fn scrolled_wrapped_markdown_link_uses_the_rendered_row() {
+        let mut transcript = Transcript::default();
+        transcript.push(TranscriptItem::Assistant(
+            "[qwertyuiop](https://example.com/scrolled)".to_owned(),
+        ));
+        for _ in 0..4 {
+            transcript.push(TranscriptItem::Assistant("tail".to_owned()));
+        }
+
+        let area = Rect::new(0, 0, 5, 3);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        let hit = (0..=transcript.max_scroll_from_bottom(area.width, area.height))
+            .find_map(|scroll| {
+                terminal
+                    .draw(|frame| {
+                        frame.render_widget(
+                            transcript.widget(scroll, None, None, "empty"),
+                            frame.area(),
+                        );
+                    })
+                    .unwrap();
+                let position = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .position(|cell| cell.symbol() == "q")?;
+                Some((
+                    scroll,
+                    Position::new((position % 5) as u16, (position / 5) as u16),
+                ))
+            })
+            .expect("a scrolled viewport should render the wrapped link");
+
+        assert!(hit.0 > 0);
+        assert_eq!(
+            transcript
+                .link_destination_at(area, hit.0, None, None, hit.1)
+                .as_deref(),
+            Some("https://example.com/scrolled")
+        );
+    }
 
     fn wait_for_math_render(wake_rx: &mpsc::Receiver<()>) {
         wake_rx
@@ -3410,6 +3711,43 @@ R_{\mu\nu}-\frac12R\,g_{\mu\nu}+\Lambda g_{\mu\nu}
             })
             .unwrap();
         assert!(narrow.backend().to_string().contains("┌─ row 1"));
+    }
+
+    #[test]
+    fn standalone_nested_tool_finishes_even_when_parent_is_materialized_later() {
+        for materialize_parent in [false, true] {
+            let mut transcript = Transcript::default();
+            transcript.push(TranscriptItem::Tool {
+                call_id: "call-1/code-1".to_owned(),
+                name: "exec_command".to_owned(),
+                arguments: "printf deferred".to_owned(),
+                status: ToolStatus::Running,
+            });
+            if materialize_parent {
+                transcript.push(TranscriptItem::Tool {
+                    call_id: "call-1".to_owned(),
+                    name: "exec".to_owned(),
+                    arguments: "text(await pending);".to_owned(),
+                    status: ToolStatus::Completed,
+                });
+            }
+            assert!(transcript.set_tool_result_timing(
+                "call-1/code-1",
+                ToolStatus::Completed,
+                Some(1_000_000),
+                Some(2_000_000),
+                Some("deferred output".to_owned()),
+            ));
+            let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
+            terminal
+                .draw(|frame| {
+                    frame.render_widget(transcript.widget(0, None, None, "empty"), frame.area());
+                })
+                .unwrap();
+            let rendered = terminal.backend().to_string();
+            assert!(rendered.contains("deferred output"), "{rendered}");
+            assert!(!rendered.contains('◌'), "{rendered}");
+        }
     }
 
     #[test]

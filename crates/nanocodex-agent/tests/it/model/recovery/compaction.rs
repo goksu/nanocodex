@@ -289,7 +289,7 @@ async fn manual_compaction_uses_current_defaults_and_a_fresh_logical_turn() -> R
             "warmup and generation belong to one logical turn"
         );
         assert_eq!(first["reasoning"]["effort"], "low");
-        assert!(first.get("service_tier").is_none());
+        assert_eq!(first["service_tier"], "default");
         send_final(&mut socket, "resp-first").await?;
 
         let compact = next_json(&mut socket).await?;
@@ -554,6 +554,7 @@ impl Service<ResponsesAttempt> for ActiveReplacementService {
                     order.lock().unwrap().push("queued_generation");
                     ResponsesOutput::Generation(GenerationOutput {
                         id: "resp-queued".to_owned(),
+                        reported_model: None,
                         status: "completed".to_owned(),
                         end_turn: Some(true),
                         final_message: Some("done".to_owned()),
@@ -699,6 +700,7 @@ impl Service<ResponsesAttempt> for PreTurnCompactionService {
                 let answer = format!("answer-{call}");
                 ResponsesOutput::Generation(GenerationOutput {
                     id: format!("resp-{call}"),
+                    reported_model: None,
                     status: "completed".to_owned(),
                     end_turn: Some(true),
                     final_message: Some(answer.clone()),
@@ -828,7 +830,11 @@ async fn pre_turn_compaction_keeps_creation_time_agents_md() -> Result<()> {
     );
     assert_eq!(follow_on.input[6]["content"][0]["text"], "second prompt");
 
-    let snapshot = serde_json::to_value(second.snapshot())?;
+    let snapshot = serde_json::to_value(
+        second
+            .snapshot()
+            .expect("local turns always retain a snapshot"),
+    )?;
     let history = snapshot["history"]
         .as_array()
         .expect("snapshot history is an array");
@@ -847,5 +853,198 @@ async fn pre_turn_compaction_keeps_creation_time_agents_md() -> Result<()> {
         "second prompt"
     );
     drop((observations, agent));
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_developer_provenance_survives_snapshot_resume_and_compaction() -> Result<()> {
+    client_developer_provenance_survives_resume_and_compaction(false).await
+}
+
+#[tokio::test]
+async fn client_developer_provenance_survives_rollout_reload_and_compaction() -> Result<()> {
+    client_developer_provenance_survives_resume_and_compaction(true).await
+}
+
+async fn client_developer_provenance_survives_resume_and_compaction(
+    durable_resume: bool,
+) -> Result<()> {
+    const CLIENT: &str = "Client developer instruction retained across resume";
+    const NOTICE: &str =
+        "<image_resize_notice>Client-authored independent instruction</image_resize_notice>";
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut original = accept_async(stream).await?;
+        let mut first = next_json(&mut original).await?;
+        if first["generate"] == false {
+            send_warmup(&mut original, "resp-warmup").await?;
+            first = next_json(&mut original).await?;
+        }
+        assert!(first.to_string().contains(CLIENT));
+        send_final(&mut original, "resp-first").await?;
+        let second = next_json(&mut original).await?;
+        assert!(second.to_string().contains(NOTICE));
+        send_final(&mut original, "resp-second").await?;
+
+        let (stream, _) = listener.accept().await?;
+        let mut resumed = accept_async(stream).await?;
+        let compact = next_json(&mut resumed).await?;
+        assert!(compact.get("previous_response_id").is_none());
+        assert!(compact.to_string().contains(CLIENT));
+        assert!(compact.to_string().contains(NOTICE));
+        assert!(compact.to_string().contains("<permissions instructions>"));
+        send_compaction(&mut resumed, "resp-compact").await?;
+
+        let replay = next_json(&mut resumed).await?;
+        assert!(replay.get("previous_response_id").is_none());
+        let input = replay["input"]
+            .as_array()
+            .expect("replayed input is an array");
+        let summary = input
+            .iter()
+            .position(|item| item["type"] == "compaction")
+            .expect("compaction summary is replayed");
+        for text in [CLIENT, NOTICE] {
+            assert_eq!(
+                input[..summary]
+                    .iter()
+                    .filter(|item| {
+                        item["role"] == "developer" && item["content"][0]["text"] == text
+                    })
+                    .count(),
+                1,
+                "client developer input must survive independently: {text}"
+            );
+        }
+        assert!(
+            !input[..summary].iter().any(|item| {
+                item["role"] == "developer"
+                    && item.to_string().contains("<permissions instructions>")
+            }),
+            "historical harness developer context must be dropped"
+        );
+        assert!(
+            !input[..summary]
+                .iter()
+                .any(|item| item["role"] == "assistant"),
+            "notice-shaped client input must survive even when its preceding assistant is dropped"
+        );
+        assert!(
+            input[summary + 1..].iter().any(|item| {
+                item["role"] == "developer"
+                    && item.to_string().contains("<permissions instructions>")
+            }),
+            "current harness context must be reinjected after compaction"
+        );
+        send_final(&mut resumed, "resp-resumed").await
+    });
+
+    let workspace = tempfile::tempdir()?;
+    let rollout_home = tempfile::tempdir()?;
+    let openai = || {
+        OpenAi::builder("test-key")
+            .websocket_url(endpoint.clone())
+            .build()
+    };
+    let (agent, events) = Nanocodex::builder(openai()?)
+        .workspace(workspace.path())
+        .session_id(test_session_id())
+        .rollout(RolloutConfig::new(rollout_home.path()))
+        .build()?;
+    agent.append_developer_message(CLIENT).await?;
+    agent.prompt("first request").await?.result().await?;
+    agent.append_developer_message(NOTICE).await?;
+    let second = agent.prompt("save this boundary").await?.result().await?;
+    let encoded = serde_json::to_vec(&second.snapshot().expect("local snapshot"))?;
+    let serialized: Value = serde_json::from_slice(&encoded)?;
+    let history = serialized["history"].as_array().expect("snapshot history");
+    let client_ids = [CLIENT, NOTICE].map(|text| {
+        history
+            .iter()
+            .find(|item| item["content"][0]["text"] == text)
+            .expect("client input persisted")["id"]
+            .clone()
+    });
+    assert_eq!(
+        serialized["client_authored"].as_array().map(Vec::len),
+        Some(2)
+    );
+    for id in &client_ids {
+        assert!(
+            serialized["client_authored"]
+                .as_array()
+                .unwrap()
+                .contains(id)
+        );
+    }
+    let notice_index = history
+        .iter()
+        .position(|item| item["content"][0]["text"] == NOTICE)
+        .expect("notice persisted");
+    assert_eq!(history[notice_index - 1]["role"], "assistant");
+    assert!(
+        history.iter().any(|item| {
+            item["role"] == "developer"
+                && item.to_string().contains("<permissions instructions>")
+                && !serialized["client_authored"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&item["id"])
+        }),
+        "generated harness context must not acquire client provenance"
+    );
+    agent.shutdown().await?;
+    drop((agent, events));
+
+    let durable = RolloutConfig::new(rollout_home.path()).load_session(TEST_SESSION_ID)?;
+    assert_eq!(
+        serde_json::to_value(durable.snapshot())?["client_authored"],
+        serialized["client_authored"],
+        "rollout reload must restore client provenance"
+    );
+    let (thread_id, durable_snapshot, rollout) = durable.into_parts();
+    let snapshot = if durable_resume {
+        durable_snapshot
+    } else {
+        serde_json::from_slice::<SessionSnapshot>(&encoded)?
+    };
+    let (resumed, resumed_events) = Nanocodex::builder(openai()?)
+        .session_id(thread_id.parse()?)
+        .resume(snapshot)
+        .rollout(rollout)
+        .build()?;
+    resumed.compact().await?;
+    let final_turn = resumed.prompt("after compaction").await?.result().await?;
+    assert_eq!(final_turn.final_message(), "done");
+    let final_snapshot = serde_json::to_value(final_turn.snapshot().expect("resumed snapshot"))?;
+    assert_eq!(
+        final_snapshot["client_authored"],
+        serialized["client_authored"]
+    );
+    for id in &client_ids {
+        assert!(
+            final_snapshot["history"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| &item["id"] == id),
+            "compaction must preserve the original client item ID"
+        );
+    }
+    resumed.shutdown().await?;
+    drop((resumed, resumed_events));
+    let compacted = RolloutConfig::new(rollout_home.path()).load_session(TEST_SESSION_ID)?;
+    let compacted_snapshot = serde_json::to_value(compacted.snapshot())?;
+    assert_eq!(
+        compacted_snapshot["client_authored"],
+        final_snapshot["client_authored"]
+    );
+    assert_eq!(compacted_snapshot["history"], final_snapshot["history"]);
+    timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .map_err(|_| eyre!("provenance mock server did not finish"))???;
     Ok(())
 }

@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{collections::BTreeSet, fmt};
 
 use serde::{Deserialize, Serialize};
 
@@ -100,6 +100,7 @@ pub enum SessionIdError {
 #[derive(Clone)]
 pub struct ManagedSessionState {
     context: ContextManager,
+    client_authored: BTreeSet<String>,
     delta_start: usize,
     previous_response_id: Option<String>,
     history_revision: u64,
@@ -113,6 +114,7 @@ impl ManagedSessionState {
         assign_missing_response_item_ids(&mut items);
         Self {
             context: ContextManager::new(items),
+            client_authored: BTreeSet::new(),
             delta_start: 0,
             previous_response_id: None,
             history_revision: 0,
@@ -143,6 +145,9 @@ impl ManagedSessionState {
         let mut state = Self::new(items);
         if state.context.len() != history_len {
             return Err(ManagedSessionStateError::UnsupportedHistoryItem);
+        }
+        if state.context.replace_invalid_tool_images() > 0 {
+            state.history_revision = state.history_revision.saturating_add(1);
         }
         state.context.commit_tail();
         state.delta_start = state.context.len();
@@ -210,6 +215,84 @@ impl ManagedSessionState {
     /// applied by the underlying context manager.
     pub fn append(&mut self, items: impl IntoIterator<Item = ResponseItem>) {
         self.context.record_items(items);
+    }
+
+    /// Records explicitly client-authored input, preserving developer provenance
+    /// separately from the provider-visible response items.
+    pub fn append_client(&mut self, items: impl IntoIterator<Item = ResponseItem>) {
+        let mut items: Vec<_> = items.into_iter().collect();
+        assign_missing_response_item_ids(&mut items);
+        self.client_authored.extend(items.iter().filter_map(|item| {
+            matches!(
+                item,
+                ResponseItem::Message {
+                    role: crate::MessageRole::Developer,
+                    ..
+                }
+            )
+            .then(|| item.id().map(ToString::to_string))
+            .flatten()
+        }));
+        self.append(items);
+    }
+
+    /// Client provenance sidecar for durable snapshots. Never send it to the model.
+    #[must_use]
+    pub const fn client_authored(&self) -> &BTreeSet<String> {
+        &self.client_authored
+    }
+
+    /// Restores explicit provenance. Legacy histories without this sidecar have
+    /// no client-authored developer messages; text is never used to infer origin.
+    pub fn restore_client_authored(&mut self, ids: BTreeSet<String>) {
+        self.client_authored = self
+            .context
+            .iter()
+            .filter_map(|item| {
+                let id = item.id()?;
+                (matches!(
+                    item,
+                    ResponseItem::Message {
+                        role: crate::MessageRole::Developer,
+                        ..
+                    }
+                ) && ids.contains(id.as_str()))
+                .then(|| id.to_string())
+            })
+            .collect();
+    }
+
+    /// Usage baseline needed to preserve compaction decisions across recovery.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn context_usage(&self) -> (Option<&Usage>, bool) {
+        (
+            self.context.last_token_usage.as_ref(),
+            self.server_reasoning_included,
+        )
+    }
+
+    /// Whether the saved usage covers every retained item, including local input.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn context_usage_is_estimate(&self) -> bool {
+        self.context.token_usage_is_estimate
+    }
+
+    /// Restores accounting for unchanged durable history. Image repairs retain
+    /// their newly computed baseline instead of reinstalling stale usage.
+    #[doc(hidden)]
+    pub fn restore_context_usage(
+        &mut self,
+        usage: Option<&Usage>,
+        server_reasoning_included: bool,
+        is_estimate: bool,
+    ) {
+        self.observe_server_reasoning(server_reasoning_included);
+        if self.history_revision == 0 {
+            self.context.update_token_info(usage);
+            self.context.token_usage_is_estimate = usage.is_some() && is_estimate;
+        }
     }
 
     /// Records usage from the most recent completed provider operation.
@@ -290,6 +373,32 @@ impl ManagedSessionState {
         self.context.commit_tail();
     }
 
+    /// Replaces image inputs after the provider rejects their encoded data.
+    ///
+    /// The returned count is the number of image parts replaced with a stable
+    /// text diagnostic so a later full replay cannot resend poisoned bytes.
+    #[doc(hidden)]
+    pub fn replace_rejected_images(&mut self) -> usize {
+        let replaced = self.context.replace_rejected_images();
+        if replaced > 0 {
+            self.reset_for_full_request();
+            self.history_revision = self.history_revision.saturating_add(1);
+        }
+        replaced
+    }
+
+    /// Removes exact matches from discovery metadata while retaining transcript items.
+    /// A changed history must be replayed without its old provider continuation.
+    #[doc(hidden)]
+    pub fn remove_tool_definition(&mut self, definition: &serde_json::Value) -> usize {
+        let removed = self.context.remove_tool_definition(definition);
+        if removed > 0 {
+            self.reset_for_full_request();
+            self.history_revision = self.history_revision.saturating_add(1);
+        }
+        removed
+    }
+
     /// Commits the active tail without changing continuation state.
     ///
     /// The agent uses this only when publishing a safe in-turn fork boundary.
@@ -309,9 +418,24 @@ impl ManagedSessionState {
         request_prefix: &[ResponseItem],
     ) {
         let initial_context = initial_context.into_iter().collect::<Vec<_>>();
-        let history =
-            compaction::install_history(&self.context.flattened_items(), &initial_context, item);
+        let history = compaction::install_history_with_provenance(
+            &self.context.flattened_items(),
+            &initial_context,
+            item,
+            &self.client_authored,
+        );
         self.context.replace_and_recompute(history, request_prefix);
+        let provenance = std::mem::take(&mut self.client_authored);
+        self.restore_client_authored(provenance);
+        self.reset_for_full_request();
+        self.history_revision = self.history_revision.saturating_add(1);
+    }
+
+    /// Installs image-prepared replay history and marks its durable baseline changed.
+    #[doc(hidden)]
+    pub fn replace_prepared_history(&mut self, history: Vec<ResponseItem>) {
+        self.context.replace_and_recompute(history, &[]);
+        self.context.commit_tail();
         self.reset_for_full_request();
         self.history_revision = self.history_revision.saturating_add(1);
     }
@@ -343,7 +467,103 @@ pub enum ManagedSessionStateError {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::{ManagedSessionState, ManagedSessionStateError};
+
+    #[test]
+    fn developer_provenance_survives_restore_and_compaction_without_leaking_to_wire() {
+        use crate::{ContentItem, MessageRole, ResponseItem};
+        let dev = |text: &str| {
+            ResponseItem::message(MessageRole::Developer, [ContentItem::input_text(text)])
+        };
+        let mut state = ManagedSessionState::new(vec![dev("generated context")]);
+        state.append_client([dev("client instructions")]);
+        let ids = state.client_authored().clone();
+        assert_eq!(ids.len(), 1);
+        let wire = serde_json::to_string(&state.flattened_history()).unwrap();
+        assert!(!wire.contains("client_authored"));
+        let mut restored =
+            ManagedSessionState::resume(serde_json::from_str(&wire).unwrap()).unwrap();
+        assert!(restored.client_authored().is_empty());
+        restored.restore_client_authored(ids.clone());
+        restored.install_compaction(
+            serde_json::from_value(json!({"type":"compaction", "encrypted_content":"opaque"}))
+                .unwrap(),
+            [],
+            &[],
+        );
+        assert_eq!(restored.client_authored(), &ids);
+        let history = serde_json::to_string(&restored.flattened_history()).unwrap();
+        assert!(history.contains("client instructions"));
+        assert!(!history.contains("generated context"));
+    }
+
+    #[test]
+    fn removing_a_tool_definition_preserves_transcript_and_corrected_schemas() {
+        let rejected = json!({
+            "type": "function", "name": "lookup", "parameters": {
+                "type": "object", "properties": { "limit": { "type": "integer" } },
+                "required": []
+            }
+        });
+        let mut corrected = rejected.clone();
+        corrected["parameters"]["required"] = json!(["limit"]);
+        let sibling = json!({
+            "type": "function", "name": "other",
+            "parameters": { "type": "object", "tools": [rejected] }
+        });
+        let mut state = ManagedSessionState::new(
+            serde_json::from_value(json!([
+                { "type": "message", "role": "user", "content": [] },
+                { "type": "tool_search_call", "id": "tsc-original", "call_id": "search",
+                    "execution": "client", "arguments": { "query": "lookup" } },
+                { "type": "tool_search_output", "id": "tso-original", "call_id": "search",
+                    "status": "completed", "execution": "client", "tools": [
+                        rejected, corrected, sibling,
+                        { "type": "namespace", "name": "keep", "description": "Keep metadata",
+                            "tools": [rejected, corrected] },
+                        { "type": "namespace", "name": "prune", "tools": [
+                            { "type": "namespace", "name": "nested", "tools": [rejected] }
+                        ]}
+                    ] },
+                { "type": "function_call", "call_id": "completed", "name": "other",
+                    "arguments": "{}" },
+            { "type": "function_call_output", "call_id": "completed", "output": "already done" },
+            { "type": "tool_search_call", "call_id": "duplicate", "execution": "client",
+                "arguments": { "query": "lookup" } },
+            { "type": "tool_search_output", "call_id": "duplicate", "execution": "client",
+                "status": "completed", "tools": [rejected] }
+            ]))
+            .unwrap(),
+        );
+        state.set_previous_response_id("resp-before");
+        state.commit().unwrap();
+        let mut expected = serde_json::to_value(state.flattened_history()).unwrap();
+        expected[2]["tools"] = json!([
+            corrected, sibling,
+            { "type": "namespace", "name": "keep", "description": "Keep metadata",
+                "tools": [corrected] }
+        ]);
+
+        expected[6]["tools"] = json!([]);
+        assert_eq!(state.remove_tool_definition(&rejected), 4);
+        assert_eq!(
+            serde_json::to_value(state.flattened_history()).unwrap(),
+            expected
+        );
+        assert_eq!(state.previous_response_id(), None);
+        assert_eq!(state.delta_start(), 0);
+        assert_eq!(state.history_revision(), 1);
+        assert!(!state.prompt_history_with_repair().1);
+
+        state.set_previous_response_id("resp-after");
+        state.commit().unwrap();
+        assert_eq!(state.remove_tool_definition(&rejected), 0);
+        assert_eq!(state.previous_response_id(), Some("resp-after"));
+        assert_eq!(state.delta_start(), state.history_len());
+        assert_eq!(state.history_revision(), 1);
+    }
 
     #[test]
     fn empty_response_id_cannot_commit_an_incremental_checkpoint() {

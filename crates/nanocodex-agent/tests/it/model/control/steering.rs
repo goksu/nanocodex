@@ -94,16 +94,20 @@ async fn assistant_events_preserve_commentary_and_final_answer_phases() -> Resul
 }
 
 fn assert_assistant_phase_events(deltas: &[Value], messages: &[Value], timeline: &[Value]) {
+    let turn_id = deltas[0]["turn_id"].as_str().expect("turn identity");
+    assert!(!turn_id.is_empty());
     let expected_messages = [
         json!({
             "model_call_index": 1,
             "item_id": "msg-commentary",
+            "turn_id": turn_id,
             "phase": "commentary",
             "text": "I’ll verify."
         }),
         json!({
             "model_call_index": 2,
             "item_id": "msg-final",
+            "turn_id": turn_id,
             "phase": "final_answer",
             "text": "Done."
         }),
@@ -388,6 +392,205 @@ async fn compaction_resumes_tool_continuation_before_queued_steering() -> Result
     timeout(std::time::Duration::from_secs(5), server)
         .await
         .map_err(|_| eyre!("mock Responses server did not finish"))???;
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn steer_withdrawal_only_removes_latest_unconsumed_input() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let (first_seen, first_seen_rx) = tokio::sync::oneshot::channel();
+    let (release_first, release_first_rx) = tokio::sync::oneshot::channel();
+    let (second_seen, second_seen_rx) = tokio::sync::oneshot::channel();
+    let (release_second, release_second_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut socket = accept_async(stream).await?;
+        assert_warmup(&next_json(&mut socket).await?);
+        send_warmup(&mut socket, "resp-warmup").await?;
+        next_json(&mut socket).await?;
+        let _ = first_seen.send(());
+        release_first_rx.await?;
+        send_final(&mut socket, "resp-first").await?;
+        let steered = next_json(&mut socket).await?;
+        assert_eq!(steered["input"].as_array().map(Vec::len), Some(1));
+        assert_eq!(steered["input"][0]["content"][0]["text"], "keep this");
+        let _ = second_seen.send(());
+        release_second_rx.await?;
+        send_final(&mut socket, "resp-second").await
+    });
+    let workspace = temporary_workspace("steer-withdraw")?;
+    let openai = OpenAi::builder("test-key")
+        .websocket_url(endpoint)
+        .build()?;
+    let (agent, mut events) = Nanocodex::builder(openai)
+        .thinking(Thinking::Low)
+        .workspace(&workspace)
+        .session_id(test_session_id())
+        .build()?;
+    let turn = agent.prompt("initial task").await?;
+    first_seen_rx.await?;
+    turn.steer_with_id("keep".into(), "keep this").await?;
+    turn.steer_with_id("undo".into(), "never send this").await?;
+    assert!(!turn.withdraw_steer("keep".into()).await?);
+    assert!(!turn.withdraw_steer("unknown".into()).await?);
+    assert!(turn.withdraw_steer("undo".into()).await?);
+    assert!(!turn.withdraw_steer("undo".into()).await?);
+    assert!(
+        turn.steer_with_id("undo".into(), "duplicate id")
+            .await
+            .is_err()
+    );
+    // Undo frees bounded queue capacity immediately, before a model boundary.
+    for index in 0..7 {
+        turn.steer_with_id(format!("slot-{index}"), format!("temporary {index}"))
+            .await?;
+    }
+    assert!(matches!(
+        turn.steer("overflow").await,
+        Err(NanocodexError::SteerQueueFull)
+    ));
+    assert!(turn.withdraw_steer("slot-6".into()).await?);
+    turn.steer_with_id("replacement".into(), "replacement")
+        .await?;
+    assert!(turn.withdraw_steer("replacement".into()).await?);
+    for index in (0..6).rev() {
+        assert!(turn.withdraw_steer(format!("slot-{index}")).await?);
+    }
+    let _ = release_first.send(());
+    second_seen_rx.await?;
+    assert!(!turn.withdraw_steer("keep".into()).await?);
+    let control = turn.control();
+    let _ = release_second.send(());
+    turn.result().await?;
+    assert!(!control.withdraw_steer("keep".into()).await?);
+    drop(control);
+    drop(agent);
+    let mut delivered = 0;
+    while let Some(event) = events.recv().await {
+        if event.kind == AgentEventKind::RunSteered {
+            delivered += 1;
+        }
+    }
+    assert_eq!(delivered, 1);
+    timeout(std::time::Duration::from_secs(5), server).await???;
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+struct RevisionProbe {
+    observed: tokio::sync::mpsc::UnboundedSender<Option<u64>>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+#[nanocodex_tools::contract::async_trait]
+impl nanocodex_tools::Tool for RevisionProbe {
+    fn definition(&self) -> nanocodex_tools::ToolDefinition {
+        nanocodex_tools::ToolDefinition::function(
+            "revision_probe",
+            "Reports captured instruction revision.",
+            json!({"type":"object","properties":{},"additionalProperties":false}),
+        )
+    }
+
+    async fn execute(
+        &self,
+        _input: nanocodex_tools::ToolInput,
+        context: nanocodex_tools::ToolContext<'_>,
+    ) -> nanocodex_tools::ToolResult {
+        self.observed.send(context.instruction_revision()).unwrap();
+        self.release.acquire().await.unwrap().forget();
+        Ok(nanocodex_tools::ToolOutput::text("observed"))
+    }
+}
+
+#[tokio::test]
+async fn instruction_revision_follows_consumed_steering_and_resets_on_new_prompt() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut socket = accept_async(stream).await?;
+        assert_eq!(next_json(&mut socket).await?["generate"], false);
+        send_warmup(&mut socket, "revision-warmup").await?;
+        for index in 0..5 {
+            let request = next_json(&mut socket).await?;
+            assert!(!request.to_string().contains("instruction_revision"));
+            if index == 3 {
+                send_final(&mut socket, "revision-final").await?;
+                continue;
+            }
+            let call = json!({
+                "id": format!("revision-item-{index}"), "type": "function_call",
+                "call_id": format!("revision-call-{index}"),
+                "name": "revision_probe", "arguments": "{}"
+            });
+            send_json(
+                &mut socket,
+                completed_response(&format!("revision-response-{index}"), &[call]),
+            )
+            .await?;
+        }
+        next_json(&mut socket).await?;
+        send_final(&mut socket, "revision-new-final").await
+    });
+    let workspace = temporary_workspace("instruction-revision")?;
+    let (observed, mut observations) = tokio::sync::mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let tools = Tools::builder()
+        .without_defaults()
+        .tool(RevisionProbe {
+            observed,
+            release: release.clone(),
+        })
+        .build()?;
+    let openai = OpenAi::builder("test-key")
+        .websocket_url(endpoint)
+        .build()?;
+    let (agent, _events) = Nanocodex::builder(openai)
+        .thinking(Thinking::Low)
+        .workspace(&workspace)
+        .session_id(test_session_id())
+        .tools(tools)
+        .build()?;
+    let turn = agent
+        .prompt(Prompt::new("initial").with_instruction_revision(7))
+        .await?;
+    assert_eq!(
+        timeout(std::time::Duration::from_secs(5), observations.recv()).await?,
+        Some(Some(7))
+    );
+    turn.steer(Prompt::new("changed").with_instruction_revision(8))
+        .await?;
+    release.add_permits(1);
+    assert_eq!(
+        timeout(std::time::Duration::from_secs(5), observations.recv()).await?,
+        Some(Some(8))
+    );
+    turn.steer_with_id(
+        "withdrawn-revision".to_owned(),
+        Prompt::new("withdraw this change").with_instruction_revision(9),
+    )
+    .await?;
+    assert!(turn.withdraw_steer("withdrawn-revision".to_owned()).await?);
+    turn.steer("ordinary steering preserves revision").await?;
+    release.add_permits(1);
+    assert_eq!(
+        timeout(std::time::Duration::from_secs(5), observations.recv()).await?,
+        Some(Some(8))
+    );
+    release.add_permits(1);
+    turn.result().await?;
+    let next = agent.prompt("unrelated prompt").await?;
+    assert_eq!(
+        timeout(std::time::Duration::from_secs(5), observations.recv()).await?,
+        Some(None)
+    );
+    release.add_permits(1);
+    next.result().await?;
+    drop(agent);
+    timeout(std::time::Duration::from_secs(5), server).await???;
     std::fs::remove_dir_all(workspace)?;
     Ok(())
 }

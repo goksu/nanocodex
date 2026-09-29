@@ -22,14 +22,22 @@ fn truncate_text_only(
     content: Vec<ToolOutputContent>,
     max_output_tokens: usize,
 ) -> Vec<ToolOutputContent> {
-    let text = content
+    let segments = content
         .iter()
         .filter_map(|item| match item {
             ToolOutputContent::InputText { text } => Some(text.as_str()),
-            ToolOutputContent::InputImage { .. } | ToolOutputContent::InputAudio { .. } => None,
+            ToolOutputContent::InputImage { .. }
+            | ToolOutputContent::InputAudio { .. }
+            | ToolOutputContent::EncryptedContent { .. } => None,
         })
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect::<Vec<_>>();
+    let mut text = String::new();
+    for segment in segments {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(segment);
+    }
     let byte_budget = max_output_tokens.saturating_mul(APPROX_BYTES_PER_TOKEN);
     if text.len() <= byte_budget {
         return content;
@@ -52,9 +60,13 @@ fn truncate_mixed(
     let mut output = Vec::with_capacity(content.len());
     let mut remaining = max_output_tokens;
     let mut omitted_text_items = 0_usize;
+    let mut omitted_audio_items = 0_usize;
     for item in content {
         match item {
             ToolOutputContent::InputText { text } => {
+                if text.is_empty() {
+                    continue;
+                }
                 if remaining == 0 {
                     omitted_text_items = omitted_text_items.saturating_add(1);
                     continue;
@@ -74,12 +86,26 @@ fn truncate_mixed(
                 }
             }
             image @ ToolOutputContent::InputImage { .. } => output.push(image),
-            ToolOutputContent::InputAudio { .. } => {}
+            encrypted @ ToolOutputContent::EncryptedContent { .. } => output.push(encrypted),
+            ToolOutputContent::InputAudio { audio_url } => {
+                let cost = super::audio::estimate_audio_token_count(&audio_url);
+                if cost <= remaining {
+                    output.push(ToolOutputContent::InputAudio { audio_url });
+                    remaining = remaining.saturating_sub(cost);
+                } else {
+                    omitted_audio_items = omitted_audio_items.saturating_add(1);
+                }
+            }
         }
     }
     if omitted_text_items > 0 {
         output.push(ToolOutputContent::InputText {
             text: format!("[omitted {omitted_text_items} text items ...]"),
+        });
+    }
+    if omitted_audio_items > 0 {
+        output.push(ToolOutputContent::InputText {
+            text: format!("[omitted {omitted_audio_items} audio items ...]"),
         });
     }
     output
@@ -112,7 +138,11 @@ fn truncate_middle(text: &str, byte_budget: usize, use_tokens: bool) -> String {
     let suffix_start =
         ceil_char_boundary(text, text.len().saturating_sub(right_budget)).max(prefix_end);
     let removed = &text[prefix_end..suffix_start];
-    let marker = truncation_marker(use_tokens, removed.len(), removed.chars().count());
+    let marker = truncation_marker(
+        use_tokens,
+        text.len().saturating_sub(byte_budget),
+        removed.chars().count(),
+    );
     format!("{}{marker}{}", &text[..prefix_end], &text[suffix_start..])
 }
 
@@ -194,5 +224,94 @@ mod tests {
             ToolOutputContent::InputText { text }
                 if text == "Warning: truncated output (original token count: 5)\nTotal output lines: 2\n\nabcd…3 tokens truncated…mnop"
         ));
+    }
+
+    #[test]
+    fn preserves_encrypted_content_without_exposing_it_as_text() {
+        let ciphertext = "gAAAA-opaque-provider-payload";
+        let output = truncate_content(
+            vec![
+                ToolOutputContent::InputText {
+                    text: "discarded".to_owned(),
+                },
+                ToolOutputContent::EncryptedContent {
+                    encrypted_content: ciphertext.to_owned(),
+                },
+            ],
+            Some(0),
+        );
+
+        assert!(matches!(
+            &output[0],
+            ToolOutputContent::EncryptedContent { encrypted_content }
+                if encrypted_content == ciphertext
+        ));
+        assert!(!output.iter().any(|item| {
+            matches!(item, ToolOutputContent::InputText { text } if text.contains(ciphertext))
+        }));
+    }
+}
+
+#[cfg(test)]
+mod upstream_differential_tests {
+    use super::*;
+
+    #[test]
+    fn truncation_matches_executed_upstream_utf8_and_zero_budgets() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("native-behavior.json")).unwrap();
+        for case in fixture["truncations"].as_array().unwrap() {
+            assert_eq!(
+                truncate_middle_tokens(
+                    case["text"].as_str().unwrap(),
+                    case["tokens"].as_u64().unwrap() as usize
+                ),
+                case["result"].as_str().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn text_merge_omits_separator_after_empty_leading_items() {
+        assert_eq!(
+            truncate_content(
+                vec![
+                    ToolOutputContent::InputText {
+                        text: String::new()
+                    },
+                    ToolOutputContent::InputText {
+                        text: "abcd".into()
+                    }
+                ],
+                Some(1)
+            )
+            .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn mixed_output_accounts_for_audio_and_skips_empty_text() {
+        let audio = ToolOutputContent::InputAudio {
+            audio_url: "data:audio/wav;base64,AAAA".into(),
+        };
+        let output = truncate_content(
+            vec![
+                ToolOutputContent::InputText {
+                    text: String::new(),
+                },
+                audio.clone(),
+                ToolOutputContent::InputText {
+                    text: "abcd".into(),
+                },
+                audio,
+            ],
+            Some(8),
+        );
+        assert!(matches!(&output[0], ToolOutputContent::InputAudio { .. }));
+        assert!(matches!(&output[1], ToolOutputContent::InputText { text } if text == "abcd"));
+        assert!(
+            matches!(&output[2], ToolOutputContent::InputText { text } if text == "[omitted 1 audio items ...]")
+        );
     }
 }

@@ -12,11 +12,15 @@ use std::{
 use async_trait::async_trait;
 use clap::{ArgAction, Args};
 use eyre::{Result, WrapErr, bail, eyre};
-use nanocodex::tools::mcp::{Mcp, McpHandle, McpOAuthCredentials, McpOAuthStore, McpServer};
+use nanocodex::tools::mcp::{
+    Mcp, McpHandle, McpOAuthCredentials, McpOAuthRefreshGuard, McpOAuthStore, McpServer,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const DEFAULT_MCP_SERVERS: [(&str, &str, &str); 3] = [
+use crate::login::{APP_ID, APP_ORIGIN, ScopedManagedCredential};
+
+const DEFAULT_MCP_SERVERS: [(&str, &str, &str); 6] = [
     (
         "openaiDeveloperDocs",
         "https://developers.openai.com/mcp",
@@ -28,15 +32,49 @@ const DEFAULT_MCP_SERVERS: [(&str, &str, &str); 3] = [
         "Tempo network and protocol tools.",
     ),
     (
+        "mercator",
+        MERCATOR_MCP_URL,
+        "Discovers and composes Tempo services and MPP flows; paid jobs require explicit payment authority.",
+    ),
+    (
         "cloudflare",
         "https://docs.mcp.cloudflare.com/mcp",
         "Search Cloudflare developer documentation.",
     ),
+    (
+        "viem",
+        "https://viem.sh/api/mcp",
+        "Search Viem developer documentation.",
+    ),
+    (
+        "vocs",
+        "https://vocs.dev/api/mcp",
+        "Search Vocs developer documentation.",
+    ),
 ];
+pub(crate) const MERCATOR_MCP_URL: &str = "https://mercator.sh/mcp";
+
+fn default_parallel_tools(name: &str) -> &'static [&'static str] {
+    match name {
+        "openaiDeveloperDocs" => &["fetch_openai_doc", "search_openai_docs"],
+        "tempo" => &["code", "search"],
+        "mercator" => &[
+            "get_suggested_queries",
+            "get_connection_status",
+            "search_services",
+        ],
+        "cloudflare" => &["search_cloudflare_documentation"],
+        "viem" | "vocs" => &["list_pages", "read_page", "search_docs", "search_source"],
+        _ => &[],
+    }
+}
 
 #[derive(Args)]
 pub(crate) struct McpArgs {
-    /// Load the standard `OpenAI`, Tempo, and Cloudflare MCP servers.
+    #[arg(skip)]
+    disabled: bool,
+
+    /// Load the public MCP catalog, including Mercator discovery. Paid calls require separate authority.
     #[arg(
         long,
         env = "NANOCODEX_MCP_DEFAULTS",
@@ -95,12 +133,14 @@ struct ServerConfig {
     environment: BTreeMap<String, String>,
     cwd: Option<PathBuf>,
     bearer_env: Option<String>,
+    bearer: Option<String>,
     headers: BTreeMap<String, String>,
     header_env: Vec<(String, String)>,
     startup_timeout: Option<Duration>,
     tool_timeout: Option<Duration>,
     enabled_tools: Option<Vec<String>>,
     disabled_tools: Vec<String>,
+    parallel_tools: Vec<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -129,6 +169,8 @@ struct CodexOAuthEntry {
     expires_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     refresh_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    issuer: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     scopes: Vec<String>,
 }
@@ -173,7 +215,27 @@ struct NamedHeaderValue {
 }
 
 impl McpArgs {
-    pub(crate) fn build(self, codex_home: &Path) -> Result<Option<ConfiguredMcp>> {
+    pub(crate) const fn loads_managed(&self) -> bool {
+        !self.disabled
+    }
+
+    pub(crate) fn disable(&mut self) {
+        self.disabled = true;
+        self.mcp_defaults = false;
+        self.mcp_codex_config = false;
+        self.http.clear();
+        self.stdio.clear();
+        self.arguments.clear();
+        self.bearer_env.clear();
+        self.header_env.clear();
+    }
+
+    pub(crate) fn build(
+        self,
+        codex_home: &Path,
+        tempo: Option<&crate::mpp::MppAdapter>,
+        managed: Option<&ScopedManagedCredential>,
+    ) -> Result<Option<ConfiguredMcp>> {
         if self.mcp_startup_timeout == 0 || self.mcp_tool_timeout == 0 {
             bail!("MCP timeouts must be greater than zero");
         }
@@ -214,14 +276,24 @@ impl McpArgs {
                         environment: BTreeMap::new(),
                         cwd: None,
                         bearer_env: None,
+                        bearer: None,
                         headers: BTreeMap::new(),
                         header_env: Vec::new(),
                         startup_timeout: None,
                         tool_timeout: None,
                         enabled_tools: None,
                         disabled_tools: Vec::new(),
+                        parallel_tools: default_parallel_tools(name)
+                            .iter()
+                            .map(|tool| (*tool).to_owned())
+                            .collect(),
                     });
             }
+        }
+        if !self.disabled
+            && let Some(managed) = managed
+        {
+            insert_managed_mcp_servers(&mut servers, managed)?;
         }
         if servers.is_empty() {
             if self.arguments.is_empty() && self.bearer_env.is_empty() && self.header_env.is_empty()
@@ -264,8 +336,98 @@ impl McpArgs {
             startup_timeout,
             tool_timeout,
             oauth_store,
+            tempo,
         )?))
     }
+}
+
+fn insert_managed_mcp_servers(
+    servers: &mut BTreeMap<String, ServerConfig>,
+    credential: &ScopedManagedCredential,
+) -> Result<()> {
+    for connection in credential.mcp_connections() {
+        let name = unique_managed_server_name(connection.name(), connection.id(), servers);
+        servers.insert(
+            name,
+            managed_mcp_server_config(
+                credential.origin(),
+                credential.grant_id(),
+                credential.bearer_token(),
+                connection,
+            )?,
+        );
+    }
+    Ok(())
+}
+
+fn managed_mcp_server_config(
+    origin: &reqwest::Url,
+    grant_id: &str,
+    bearer: &str,
+    connection: &crate::login::ManagedMcpConnection,
+) -> Result<ServerConfig> {
+    let url = origin
+        .join(&format!("/v1/grants/{grant_id}/mcp/{}", connection.id()))
+        .wrap_err("invalid managed MCP proxy URL")?;
+    Ok(ServerConfig {
+        transport: Transport::Http(url.into()),
+        description: Some(format!(
+            "Managed {} connection through Nanocodex Connect.",
+            connection.name()
+        )),
+        arguments: Vec::new(),
+        environment: BTreeMap::new(),
+        cwd: None,
+        bearer_env: None,
+        bearer: Some(bearer.to_owned()),
+        headers: BTreeMap::from([
+            ("origin".to_owned(), APP_ORIGIN.to_owned()),
+            ("x-nanocodex-app-id".to_owned(), APP_ID.to_owned()),
+        ]),
+        header_env: Vec::new(),
+        startup_timeout: None,
+        tool_timeout: None,
+        enabled_tools: None,
+        disabled_tools: Vec::new(),
+        parallel_tools: Vec::new(),
+    })
+}
+
+fn unique_managed_server_name(
+    display_name: &str,
+    connection_id: &str,
+    servers: &BTreeMap<String, ServerConfig>,
+) -> String {
+    let mut slug = String::new();
+    let mut separator = false;
+    for character in display_name.chars() {
+        if character.is_ascii_alphanumeric() {
+            if separator && !slug.is_empty() {
+                slug.push('-');
+            }
+            separator = false;
+            if slug.len() < 40 {
+                slug.push(character.to_ascii_lowercase());
+            }
+        } else {
+            separator = true;
+        }
+    }
+    if slug.is_empty() {
+        slug.push_str("connection");
+    }
+    let id_prefix = &connection_id[..8];
+    let base = format!("managed-{slug}-{id_prefix}");
+    if !servers.contains_key(&base) {
+        return base;
+    }
+    for suffix in 2_u32.. {
+        let candidate = format!("{base}-{suffix}");
+        if !servers.contains_key(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("an unbounded numeric suffix always has a free MCP server name")
 }
 
 fn build_mcp(
@@ -273,6 +435,7 @@ fn build_mcp(
     startup_timeout: Duration,
     tool_timeout: Duration,
     oauth_store: Option<Arc<CodexOAuthStore>>,
+    tempo: Option<&crate::mpp::MppAdapter>,
 ) -> Result<ConfiguredMcp> {
     let mut builder = Mcp::builder();
     if let Some(store) = oauth_store {
@@ -280,6 +443,12 @@ fn build_mcp(
     }
     for (name, server) in servers {
         let description = server.description;
+        let payment = match &server.transport {
+            Transport::Http(url) if name == "mercator" => tempo
+                .map(|tempo| tempo.mcp_payment_provider(url))
+                .transpose()?,
+            _ => None,
+        };
         let mut configured = match server.transport {
             Transport::Http(url) => McpServer::http(url),
             Transport::Stdio(command) => {
@@ -298,8 +467,14 @@ fn build_mcp(
         if let Some(description) = description {
             configured = configured.description(description);
         }
+        if let Some(payment) = payment {
+            configured = configured.payment_provider(payment);
+        }
         if let Some(variable) = server.bearer_env {
             configured = configured.bearer_token_env(variable);
+        }
+        if let Some(token) = server.bearer {
+            configured = configured.bearer_token(token);
         }
         for (header, value) in server.headers {
             configured = configured.header(header, value);
@@ -310,7 +485,9 @@ fn build_mcp(
         if let Some(enabled_tools) = server.enabled_tools {
             configured = configured.enabled_tools(enabled_tools);
         }
-        configured = configured.disabled_tools(server.disabled_tools);
+        configured = configured
+            .disabled_tools(server.disabled_tools)
+            .parallel_tools(server.parallel_tools);
         builder = builder.server(name, configured);
     }
     let provider = builder.build()?;
@@ -373,6 +550,9 @@ impl CodexOAuthStore {
         if let Some(refresh_token) = entry.refresh_token.filter(|token| !token.trim().is_empty()) {
             credentials = credentials.refresh_token(refresh_token);
         }
+        if let Some(issuer) = entry.issuer.filter(|issuer| !issuer.trim().is_empty()) {
+            credentials = credentials.issuer(issuer);
+        }
         if let Some(expires_at) = entry.expires_at {
             credentials = credentials.expires_at_millis(expires_at);
         }
@@ -399,6 +579,7 @@ impl CodexOAuthStore {
                 access_token: credentials.access_token().to_owned(),
                 expires_at: credentials.expires_at(),
                 refresh_token: credentials.refresh_token_value().map(ToOwned::to_owned),
+                issuer: credentials.authorization_issuer().map(ToOwned::to_owned),
                 scopes: credentials.granted_scopes().to_vec(),
             },
         );
@@ -437,6 +618,28 @@ impl McpOAuthStore for CodexOAuthStore {
         .await
         .map_err(|error| format!("MCP OAuth credential writer stopped: {error}"))?
     }
+
+    async fn acquire_refresh_lock(
+        &self,
+        server_name: &str,
+        server_url: &str,
+    ) -> Result<Box<dyn McpOAuthRefreshGuard>, String> {
+        let codex_home = self.codex_home.clone();
+        let server_name = server_name.to_owned();
+        let server_url = server_url.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let store_key = codex_oauth_key(&server_name, &server_url)?;
+            let mut hasher = Sha256::new();
+            hasher.update(store_key.as_bytes());
+            let path = codex_home
+                .join("mcp-oauth-locks")
+                .join(format!("{}.lock", hex::encode(hasher.finalize())));
+            acquire_oauth_file_lock(&path, "refresh transaction")
+                .map(|file| Box::new(file) as Box<dyn McpOAuthRefreshGuard>)
+        })
+        .await
+        .map_err(|error| format!("MCP OAuth refresh-lock task stopped: {error}"))?
+    }
 }
 
 struct CodexOAuthFileLock {
@@ -445,44 +648,48 @@ struct CodexOAuthFileLock {
 
 impl CodexOAuthFileLock {
     fn acquire(codex_home: &Path) -> Result<Self, String> {
-        let directory = codex_home.join("mcp-oauth-locks");
-        fs::create_dir_all(&directory).map_err(|error| {
-            format!(
-                "failed to create MCP OAuth lock directory {}: {error}",
-                directory.display()
-            )
-        })?;
-        let path = directory.join("file-store.lock");
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|error| {
-                format!("failed to open MCP OAuth lock {}: {error}", path.display())
-            })?;
-        let started = std::time::Instant::now();
-        loop {
-            match file.try_lock() {
-                Ok(()) => return Ok(Self { _file: file }),
-                Err(std::fs::TryLockError::WouldBlock)
-                    if started.elapsed() >= Duration::from_mins(1) =>
-                {
-                    return Err(format!(
-                        "timed out waiting for MCP OAuth lock {}",
-                        path.display()
-                    ));
-                }
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    thread::sleep(Duration::from_millis(50));
-                }
-                Err(error) => {
-                    return Err(format!(
-                        "failed to lock MCP OAuth store {}: {error}",
-                        path.display()
-                    ));
-                }
+        let path = codex_home.join("mcp-oauth-locks/file-store.lock");
+        acquire_oauth_file_lock(&path, "credential store").map(|file| Self { _file: file })
+    }
+}
+
+fn acquire_oauth_file_lock(path: &Path, purpose: &str) -> Result<File, String> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| format!("MCP OAuth lock path has no parent: {}", path.display()))?;
+    fs::create_dir_all(directory).map_err(|error| {
+        format!(
+            "failed to create MCP OAuth lock directory {}: {error}",
+            directory.display()
+        )
+    })?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|error| format!("failed to open MCP OAuth lock {}: {error}", path.display()))?;
+    let started = std::time::Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock)
+                if started.elapsed() >= Duration::from_mins(1) =>
+            {
+                return Err(format!(
+                    "timed out waiting for MCP OAuth {purpose} lock {}",
+                    path.display()
+                ));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "failed to lock MCP OAuth {purpose} {}: {error}",
+                    path.display()
+                ));
             }
         }
     }
@@ -607,12 +814,14 @@ impl CodexMcpServer {
             environment: self.env,
             cwd: self.cwd,
             bearer_env: self.bearer_token_env_var,
+            bearer: None,
             headers: self.http_headers,
             header_env: self.env_http_headers.into_iter().collect(),
             startup_timeout,
             tool_timeout,
             enabled_tools: self.enabled_tools,
             disabled_tools: self.disabled_tools,
+            parallel_tools: Vec::new(),
         }))
     }
 }
@@ -642,12 +851,14 @@ fn insert_server(
                 environment: BTreeMap::new(),
                 cwd: None,
                 bearer_env: None,
+                bearer: None,
                 headers: BTreeMap::new(),
                 header_env: Vec::new(),
                 startup_timeout: None,
                 tool_timeout: None,
                 enabled_tools: None,
                 disabled_tools: Vec::new(),
+                parallel_tools: Vec::new(),
             },
         )
         .is_some()
@@ -719,8 +930,9 @@ mod tests {
 
     fn args() -> McpArgs {
         McpArgs {
+            disabled: false,
             mcp_defaults: true,
-            mcp_codex_config: false,
+            mcp_codex_config: true,
             http: Vec::new(),
             stdio: Vec::new(),
             arguments: Vec::new(),
@@ -732,8 +944,58 @@ mod tests {
     }
 
     #[test]
-    fn default_mcp_servers_build() {
-        assert!(args().build(Path::new("/missing")).unwrap().is_some());
+    fn managed_mcp_config_uses_exact_proxy_url_and_scoped_headers() {
+        let origin = reqwest::Url::parse("https://connect.example/").unwrap();
+        let grant_id = format!("0x{}", "33".repeat(32));
+        let connection = crate::login::ManagedMcpConnection {
+            id: "a".repeat(43),
+            name: "Linear Workspace".to_owned(),
+        };
+        let config =
+            managed_mcp_server_config(&origin, &grant_id, "grant-token", &connection).unwrap();
+        assert!(matches!(
+            config.transport,
+            Transport::Http(ref url)
+                if url == &format!(
+                    "https://connect.example/v1/grants/{grant_id}/mcp/{}",
+                    connection.id
+                )
+        ));
+        assert_eq!(config.bearer.as_deref(), Some("grant-token"));
+        assert_eq!(
+            config.headers,
+            BTreeMap::from([
+                ("origin".to_owned(), APP_ORIGIN.to_owned()),
+                ("x-nanocodex-app-id".to_owned(), APP_ID.to_owned()),
+            ])
+        );
+        assert!(config.bearer_env.is_none());
+    }
+
+    #[test]
+    fn managed_mcp_names_preserve_existing_servers_without_collisions() {
+        let connection_id = "a".repeat(43);
+        let mut servers = BTreeMap::new();
+        let first = unique_managed_server_name("Linear Workspace", &connection_id, &servers);
+        assert_eq!(first, "managed-linear-workspace-aaaaaaaa");
+        servers.insert(
+            first.clone(),
+            managed_mcp_server_config(
+                &reqwest::Url::parse("https://connect.example/").unwrap(),
+                &format!("0x{}", "33".repeat(32)),
+                "grant-token",
+                &crate::login::ManagedMcpConnection {
+                    id: connection_id.clone(),
+                    name: "Linear Workspace".to_owned(),
+                },
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            unique_managed_server_name("Linear Workspace", &connection_id, &servers),
+            "managed-linear-workspace-aaaaaaaa-2"
+        );
+        assert!(servers.contains_key(&first));
     }
 
     #[test]
@@ -743,7 +1005,7 @@ mod tests {
                 mcp_defaults: false,
                 ..args()
             }
-            .build(Path::new("/missing"))
+            .build(Path::new("/missing"), None, None)
             .unwrap()
             .is_none()
         );
@@ -757,7 +1019,11 @@ mod tests {
             value: "https://example.test/mcp".to_owned(),
         });
 
-        assert!(args.build(Path::new("/missing")).unwrap().is_some());
+        assert!(
+            args.build(Path::new("/missing"), None, None)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -770,7 +1036,7 @@ mod tests {
             });
         }
 
-        assert!(args.build(Path::new("/missing")).is_err());
+        assert!(args.build(Path::new("/missing"), None, None).is_err());
     }
 
     #[tokio::test]
@@ -802,7 +1068,7 @@ enabled = false
         .unwrap();
         let mut args = args();
         args.mcp_codex_config = true;
-        let mcp = args.build(codex_home.path()).unwrap().unwrap();
+        let mcp = args.build(codex_home.path(), None, None).unwrap().unwrap();
         let tools = Tools::builder()
             .exposure(ToolExposure::DirectAndCodeMode)
             .provider(mcp.provider)
@@ -816,7 +1082,10 @@ enabled = false
         assert!(encoded.contains("centaur-paradigm"));
         assert!(encoded.contains("local"));
         assert!(encoded.contains("openaiDeveloperDocs"));
+        assert!(encoded.contains("mercator"));
         assert!(encoded.contains("cloudflare"));
+        assert!(encoded.contains("viem"));
+        assert!(encoded.contains("vocs"));
         assert!(!encoded.contains("\n- tempo:"));
     }
 
@@ -878,6 +1147,7 @@ tool_timeout_sec = 9.5
                     "access_token": "new-access",
                     "expires_at": 200,
                     "refresh_token": "new-refresh",
+                    "issuer": "https://remote.example",
                     "scopes": ["mcp:tools"]
                 },
                 "other|entry": {
@@ -898,9 +1168,14 @@ tool_timeout_sec = 9.5
             .unwrap();
         assert_eq!(loaded.client_id(), "new-client");
         assert_eq!(loaded.access_token(), "new-access");
+        assert_eq!(
+            loaded.authorization_issuer(),
+            Some("https://remote.example")
+        );
 
         let replacement = McpOAuthCredentials::new("current-client", "current-access")
             .refresh_token("current-refresh")
+            .issuer("https://remote.example")
             .expires_at_millis(300)
             .scopes(["mcp:tools"]);
         store
@@ -912,6 +1187,10 @@ tool_timeout_sec = 9.5
         assert_eq!(entries.len(), 2);
         let key = codex_oauth_key("remote", "https://remote.example/mcp").unwrap();
         assert_eq!(entries[&key].access_token, "current-access");
+        assert_eq!(
+            entries[&key].issuer.as_deref(),
+            Some("https://remote.example")
+        );
         assert!(entries.contains_key("other|entry"));
     }
 
@@ -944,6 +1223,7 @@ tool_timeout_sec = 9.5
             Duration::from_secs(30),
             Duration::from_mins(5),
             Some(Arc::new(CodexOAuthStore::new(codex_home))),
+            None,
         )
         .unwrap();
 
@@ -990,6 +1270,7 @@ tool_timeout_sec = 9.5
             Duration::from_secs(30),
             Duration::from_mins(5),
             Some(Arc::new(CodexOAuthStore::new(codex_home))),
+            None,
         )
         .unwrap();
 
@@ -1122,7 +1403,10 @@ tool_timeout_sec = 9.5
         )
         .unwrap();
 
-        let mcp = args().build(Path::new("/missing")).unwrap().unwrap();
+        let mcp = args()
+            .build(Path::new("/missing"), None, None)
+            .unwrap()
+            .unwrap();
         let default_tools = Tools::builder().provider(mcp.provider).build().unwrap();
         let with_defaults = serde_json::to_vec(
             &ToolRuntime::new_with_tools(".", None, None, &default_tools)
@@ -1133,9 +1417,6 @@ tool_timeout_sec = 9.5
 
         assert!(encoded.contains("\"type\":\"tool_search\""));
         assert!(encoded.contains("Some deferred nested tools may be omitted"));
-        assert!(encoded.contains("list_mcp_resource_templates"));
-        assert!(encoded.contains("list_mcp_resources"));
-        assert!(encoded.contains("read_mcp_resource"));
         assert!(!encoded.contains("mcp__openaiDeveloperDocs__"));
         assert!(!encoded.contains("mcp__tempo__"));
         assert!(!encoded.contains("mcp__cloudflare__"));

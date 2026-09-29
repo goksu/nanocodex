@@ -5,6 +5,280 @@ All notable changes to Nanocodex are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.6](https://github.com/gakonst/nanocodex/releases/tag/v0.6.6) - 2026-09-29
+
+### Bug Fixes
+
+- [voice] Align ChatGPT voice with Codex app-server lifecycle ([#648](https://github.com/gakonst/nanocodex/issues/648))
+
+### Features
+
+- [models] Migrate Sol to GPT-6.1 ([#679](https://github.com/gakonst/nanocodex/issues/679))
+
+### Miscellaneous Tasks
+
+- Remove obsolete docs, artifacts, and low-signal tests ([#568](https://github.com/gakonst/nanocodex/issues/568))
+
+### Other
+
+- Use default Mercator MCP with the funded account wallet ([#659](https://github.com/gakonst/nanocodex/issues/659))
+- Enforce strict typed subagent spawn contracts and verify live child completion ([#666](https://github.com/gakonst/nanocodex/issues/666))
+
+### Styling
+
+- Add strict JSON Schema output and expose provider-reported model ([#656](https://github.com/gakonst/nanocodex/issues/656))
+
+## [0.6.5](https://github.com/gakonst/nanocodex/releases/tag/v0.6.5) - 2026-09-24
+
+### Bug Fixes
+
+- [router] Stream managed reasoning and reduce selection latency
+- [router] Accept Workers AI streams and terminate protocol failures ([#522](https://github.com/gakonst/nanocodex/issues/522))
+- [runtime] Prevent image replay crashes and reconcile steering delivery ([#435](https://github.com/gakonst/nanocodex/issues/435))
+- [subagents] Make result revisions runtime-owned ([#484](https://github.com/gakonst/nanocodex/issues/484))
+
+### Features
+
+- [router] Add Kimi and MiMo with mobile model controls ([#519](https://github.com/gakonst/nanocodex/issues/519))
+- [tui] Add authenticated rich terminal integration ([#344](https://github.com/gakonst/nanocodex/issues/344))
+
+### Miscellaneous Tasks
+
+- Prepare release 0.6.5 ([#584](https://github.com/gakonst/nanocodex/issues/584))
+
+### Other
+
+- Merge remote-tracking branch 'origin/master' into remove-legacy-memory
+- Route non-GPT children while preserving manual GPT spawning ([#536](https://github.com/gakonst/nanocodex/issues/536))
+- Merge pull request [#535](https://github.com/gakonst/nanocodex/issues/535) from gakonst/fix/provider-stream-diagnostics-compat-20260923
+- Preserve terminal retry classification for stream diagnostics
+- Merge remote-tracking branch 'origin/master' into fix/turn-controls-merge
+- Integrate GPT-6 Sol and Luna across Nanocodex ([#526](https://github.com/gakonst/nanocodex/issues/526))
+- Restore unchanged repository files omitted from frontier REST publication
+- Support configured Cloudflare REST transport for frontier inference ([#495](https://github.com/gakonst/nanocodex/issues/495))
+- Merge pull request [#436](https://github.com/gakonst/nanocodex/issues/436) from gakonst/poc/thread-model-routing
+- Merge latest master and retain voice lifecycle controls
+- Complete pinned provider and child routing with runtime validation
+- Add opt-in Jev thread routing with Workers AI GLM transport
+- Forward Codex turn metadata and surface Sky consent in foreground Hands ([#429](https://github.com/gakonst/nanocodex/issues/429))
+
+### Performance
+
+- [tls] Avoid macOS root-store enumeration on connect
+
+## [0.6.4](https://github.com/gakonst/nanocodex/releases/tag/v0.6.4) - 2026-09-19
+
+### Bug Fixes
+
+- [ci] Validate Codex parity imports and bounded declarations ([#415](https://github.com/gakonst/nanocodex/issues/415))
+- Repair malformed stored tool images before replay
+- Classify rejected images during connection warmup
+- Reject malformed image output and recover poisoned sessions
+- Fix compaction and image recovery across durable replay ([#375](https://github.com/gakonst/nanocodex/issues/375))
+- Align hosted compaction retries and HTTPS fallback with codex-rs ([#370](https://github.com/gakonst/nanocodex/issues/370))
+- [oai] Retry HTTPS request failures ([#341](https://github.com/gakonst/nanocodex/issues/341))
+
+### Dependencies
+
+- Align Codex compaction requests and summary recovery ([#410](https://github.com/gakonst/nanocodex/issues/410))
+
+### Features
+
+- [connect] Add ChatGPT account failover and per-session pins ([#343](https://github.com/gakonst/nanocodex/issues/343))
+- [hands] Unify computer publishers and reduce startup latency
+
+### Miscellaneous Tasks
+
+- Prepare release 0.6.4 with minified QuickJS fix ([#420](https://github.com/gakonst/nanocodex/issues/420))
+- Prepare corrected release 0.6.3 ([#418](https://github.com/gakonst/nanocodex/issues/418))
+- Prepare release 0.6.2 ([#416](https://github.com/gakonst/nanocodex/issues/416))
+
+### Other
+
+- Pin only consumed Codex runtime prompts and verify upstream fidelity ([#411](https://github.com/gakonst/nanocodex/issues/411))
+- Merge origin/master into feat/mobile-project-threads
+- Merge pull request [#371](https://github.com/gakonst/nanocodex/issues/371) from gakonst/fix/hosted-image-output
+- Merge master and align image preparation and replay with codex-rs
+- Merge remote-tracking branch 'origin/master' into fix/hosted-image-output
+- Merge master and retain its shared Vault link routing fix
+- Merge remote-tracking branch 'origin/master' into feat/background-cua-integration
+- Merge pull request [#374](https://github.com/gakonst/nanocodex/issues/374) from gakonst/phone-admin-merge
+- Add cloud phone agents with deployment-admin access
+- Merge remote-tracking branch 'origin/master' into feat/hand-rtmp
+- Merge remote-tracking branch 'origin/master' into perf/hand-video-60fps
+- Merge origin/master into Windows Hand installer
+
+## [0.6.1](https://github.com/gakonst/nanocodex/releases/tag/v0.6.1) - 2026-09-15
+
+### Bug Fixes
+
+- [voice] Ship verified native runtime in 0.6.1 ([#333](https://github.com/gakonst/nanocodex/issues/333))
+
+## [0.6.0](https://github.com/gakonst/nanocodex/releases/tag/v0.6.0) - 2026-09-15
+
+### Rust API migration
+
+Read the [0.5 → 0.6 Rust API changelog and migration guide](https://github.com/gakonst/nanocodex/blob/v0.6.0/docs/MIGRATING_0_6.md) before upgrading.
+
+- **Breaking:** turn usage and snapshots are optional; session IDs are strings; prompt wrappers now target `PromptRequest`.
+- **Breaking:** `hosted` tool APIs move to `embedded`; Code Mode execution/wait returns `Result`; protocol literals gain asynchronous fields.
+- **Behavior:** default model/reasoning changes to Astra/low; resumed sessions use current instructions and tools; billing-uncertainty metrics and generic MCP resource helpers are removed.
+- **Optional SDK layers:** durable execution with caller-owned storage, reusable subagent orchestration, and a managed backend. Browser, egress, VM, and voice leave experimental paths; computer and evals retain the label.
+
+### Bug Fixes
+
+- [transport] Let quiet reasoning wait without restarting
+- [durability] Checkpoint current execution and retire settled effects
+- [voice] Improve WebRTC startup and transcript handling
+- [apple] Preserve repository tree in native playtest update
+- [apple] Preserve reading position and playtest navigation edge cases
+- [durability] Preserve encrypted provider item identities
+- [durability] Recover with retained model requests
+- [astra] Use model-specific prompts across runtimes
+- [agent] Retain provider session routing across branches
+- [agent] Replay unstored forks on fresh transports
+- [durability] Remove billing uncertainty state
+- [durability] Settle uncertain effects safely
+- [oai] Distinguish claimed and committed terminals
+- [oai] Close terminal publication races lock-free
+- [oai] Enforce contiguous terminal event streams
+- [voice] Use Codex realtime model
+- [durability] Terminally commit failed turns
+- [oai] Acknowledge realtime constructor width
+- [auth] Repair access-only durable credentials
+- [ci] Unblock current toolchain checks
+- [js] Expose typed Code Mode tool results
+- [auth] Derive subscription store defaults
+- [eval] Align prompt cache identity with Codex ([#180](https://github.com/gakonst/nanocodex/issues/180))
+- Preserve SDK warmup behavior
+
+### Features
+
+- [voice] Align native, browser, and Swift sessions with Codex
+- Align Astra defaults and Code Mode with Codex ([#275](https://github.com/gakonst/nanocodex/issues/275))
+- [managed] Add scoped VM hand factories
+- Complete GPT-6 Astra integration
+- Prepare GPT-6 Astra support
+- [tools] Align MCP naming OAuth and typed output
+- [agent] Align Responses context and rollout replay
+- [voice] Match Codex realtime call controls
+- [subagents] Configure spawned model and thinking
+- [voice] Recover realtime sideband sessions
+- [agent] Journal durable prompts and steps
+- [auth] Add Rust-owned ChatGPT subscriptions
+- [auth] Support persistent ChatGPT access tokens
+
+### Miscellaneous Tasks
+
+- Release nanocodex 0.6.0 ([#330](https://github.com/gakonst/nanocodex/issues/330))
+- [ci] Satisfy workspace formatting and Rust 1.97 checks
+
+### Other
+
+- Merge pull request [#252](https://github.com/gakonst/nanocodex/issues/252) from gakonst/feat/host-vm-pools
+- Merge pull request [#251](https://github.com/gakonst/nanocodex/issues/251) from gakonst/feat/gpt-6-astra-readiness
+- Merge pull request [#226](https://github.com/gakonst/nanocodex/issues/226) from gakonst/fix/btw-unstored-fork
+- Merge pull request [#217](https://github.com/gakonst/nanocodex/issues/217) from gakonst/refactor/durability-total-state
+- Merge pull request [#181](https://github.com/gakonst/nanocodex/issues/181) from gakonst/feat/durable-runtime
+- Merge master into durable runtime
+- Merge pull request [#190](https://github.com/gakonst/nanocodex/issues/190) from gakonst/feat/rust-owned-chatgpt-subscription
+- Merge remote-tracking branch 'origin/master' into wrapup/pr-171
+- Merge pull request [#175](https://github.com/gakonst/nanocodex/issues/175) from gakonst/fix/persistent-chatgpt-access-tokens
+- Merge remote-tracking branch 'origin/master' into agent/eval-cluster-dashboard
+
+### Performance
+
+- Reduce agent startup overhead
+
+### Refactor
+
+- [oai] Keep event publication lock-free
+- [oai] Publish portable agent events
+
+## [0.5.0](https://github.com/gakonst/nanocodex/releases/tag/v0.5.0) - 2026-08-12
+
+### Bug Fixes
+
+- [tui] Handle terminal input as shell output
+- [events] Preserve structured results universally
+- [events] Retain structured nested tool results
+- [oai] Drop notifications orphaned by compaction
+
+### Miscellaneous Tasks
+
+- [release] Refresh 0.5.0 changelogs
+- [release] Prepare 0.5.0
+
+### Other
+
+- Merge pull request [#169](https://github.com/gakonst/nanocodex/issues/169) from gakonst/release/0.5.0
+- Merge pull request [#167](https://github.com/gakonst/nanocodex/issues/167) from clabby/cl/structured-events
+- :broom:
+- Merge pull request [#168](https://github.com/gakonst/nanocodex/issues/168) from clabby/cl/fix-orphaned-notifs
+
+## [0.4.0](https://github.com/gakonst/nanocodex/releases/tag/v0.4.0) - 2026-08-11
+
+### Bug Fixes
+
+- [http] Initialize rustls at client boundaries
+- [oai] Allow long silent response generations
+- [eval] Preserve same-role benchmark messages
+- [eval] Recover cleanly from worker infrastructure failures
+- [oai] Recover forbidden websocket handshakes
+- [oai] Preserve code mode notifications in replay
+- Close remaining Codex wire parity gaps
+- [oai] Account for usage-uncertain attempts
+- [tools] Align Code Mode tool contracts
+- [tls] Standardize rustls on ring
+- Preserve Codex rollout model compatibility
+- [ci] Stabilize observability tests
+
+### Features
+
+- [eval] Add benchmark adapter foundation
+- [tools] Align current Codex parity
+- [model] Support Terra and routed OpenAI model IDs
+- [voice] Add Codex realtime parity
+- Support Luna
+- Close Codex realtime parity gaps
+- Match Codex realtime steering
+- Add reusable realtime voice sessions
+- [vm] Add retained VM-backed workspace tools
+
+### Miscellaneous Tasks
+
+- [release] Refresh 0.4.0 changelogs
+- [release] Prepare 0.4.0
+
+### Other
+
+- Merge pull request [#160](https://github.com/gakonst/nanocodex/issues/160) from gakonst/release/v0.4.0
+- Merge pull request [#142](https://github.com/gakonst/nanocodex/issues/142) from gakonst/feat/eval-adapter-foundation
+- Merge pull request [#139](https://github.com/gakonst/nanocodex/issues/139) from gakonst/fix/websocket-403-fallback
+- Merge pull request [#124](https://github.com/gakonst/nanocodex/issues/124) from gakonst/fix/codex-parity-current
+- Merge pull request [#121](https://github.com/gakonst/nanocodex/issues/121) from Slokh/kartik/upstream-contributions
+- Merge pull request [#97](https://github.com/gakonst/nanocodex/issues/97) from gakonst/agent/pr61-tower-accounting
+- Merge pull request [#95](https://github.com/gakonst/nanocodex/issues/95) from gakonst/agent/pr61-code-mode
+- Merge pull request [#86](https://github.com/gakonst/nanocodex/issues/86) from gakonst/fix/ring-only-rustls
+- Merge pull request [#82](https://github.com/gakonst/nanocodex/issues/82) from gakonst/feat/realtime-codex-parity
+- Merge pull request [#80](https://github.com/gakonst/nanocodex/issues/80) from clabby/cl/luna
+- Merge pull request [#77](https://github.com/gakonst/nanocodex/issues/77) from gakonst/feat/realtime-voice
+- Merge pull request [#58](https://github.com/gakonst/nanocodex/issues/58) from gakonst/refactor/09-eval
+
+### Performance
+
+- Harden realtime voice audio paths
+
+### Refactor
+
+- [eval] Simplify durable benchmark ownership
+- Trim Codex parity implementation
+- Fix the model for each thread
+
+### Testing
+
+- Synchronize realtime response queue
+
 ## [0.3.0](https://github.com/gakonst/nanocodex/releases/tag/v0.3.0) - 2026-07-28
 
 ### Bug Fixes
@@ -27,6 +301,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Miscellaneous Tasks
 
+- [release] Refresh 0.3.0 changelogs
 - [release] Prepare 0.3.0
 
 ### Other

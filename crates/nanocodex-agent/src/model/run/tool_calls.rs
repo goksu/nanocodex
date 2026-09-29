@@ -16,15 +16,36 @@ pub(super) struct ActiveToolCall {
 #[derive(Default)]
 pub(super) struct ActiveToolProgress {
     pub(super) nested_tool_calls: u32,
+    pub(super) active_nested_tool_calls: Vec<ActiveNestedToolCall>,
 }
 
+pub(super) struct ActiveNestedToolCall {
+    pub(super) call_id: String,
+    pub(super) tool: String,
+    pub(super) started_at: Instant,
+}
+
+impl ActiveNestedToolCall {
+    pub(super) fn started_after_ns(&self, parent_started_at: Instant) -> u64 {
+        u64::try_from(
+            self.started_at
+                .saturating_duration_since(parent_started_at)
+                .as_nanos(),
+        )
+        .unwrap_or(u64::MAX)
+    }
+}
+
+#[derive(Deserialize, Serialize)]
 pub(super) struct CompletedToolCall {
+    pub(super) cell: Option<nanocodex_tools::code_mode::CodeModeCell>,
     pub(super) call_id: String,
     pub(super) tool: String,
     pub(super) success: bool,
     pub(super) duration_ns: u64,
     pub(super) work_duration_ns: u64,
     pub(super) output: ToolOutputBody,
+    pub(super) structured_result: Value,
     pub(super) metadata: Option<Box<RawValue>>,
     pub(super) response_items: Vec<ResponseItem>,
 }
@@ -49,6 +70,7 @@ impl CodeModeObserver for NestedToolEventObserver<'_> {
                 name,
                 input,
             } => {
+                let started_at = Instant::now();
                 let (call_id, call_index) = self.event_context(call_id);
                 let result = self.events.emit(
                     AgentEventKind::ToolCall,
@@ -60,15 +82,39 @@ impl CodeModeObserver for NestedToolEventObserver<'_> {
                     },
                 );
                 if result.is_ok() {
-                    self.progress
+                    let mut progress = self
+                        .progress
                         .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .nested_tool_calls += 1;
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    progress.nested_tool_calls += 1;
+                    progress
+                        .active_nested_tool_calls
+                        .push(ActiveNestedToolCall {
+                            call_id,
+                            tool: name.to_owned(),
+                            started_at,
+                        });
                 }
                 result
             }
             CodeModeUpdate::NestedCallCompleted(call) => {
                 let (call_id, _) = self.event_context(&call.call_id);
+                {
+                    let mut progress = self
+                        .progress
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Some(index) = progress
+                        .active_nested_tool_calls
+                        .iter()
+                        .position(|active| active.call_id == call_id)
+                    {
+                        progress.active_nested_tool_calls.remove(index);
+                    }
+                }
+                // A yielded cell can finish a tool in a later wait call, whose
+                // progress does not contain the original start. The completion
+                // update still belongs to that original call and must be emitted.
                 self.events.emit(
                     AgentEventKind::ToolResult,
                     ToolResultEvent {
@@ -78,6 +124,7 @@ impl CodeModeObserver for NestedToolEventObserver<'_> {
                         duration_ns: call.duration_ns,
                         started_after_ns: Some(call.started_after_ns),
                         result: &call.output,
+                        structured_result: &call.structured_result,
                         metadata: call.metadata.as_deref(),
                     },
                 )
@@ -112,29 +159,31 @@ async fn execute_code_call(
     tools: &ToolRuntime,
     call: &CodeCall,
     owned_context: Option<OwnedToolContext>,
-    session_id: &str,
-    model: Model,
+    context: ToolContext<'_>,
     observer: &mut dyn CodeModeObserver,
     tool_span: &tracing::Span,
-) -> CodeModeExecution {
+) -> Result<CodeModeExecution> {
     if let Some(context) = owned_context {
         tools
             .execute_code_owned_with_updates(&call.input, context, observer)
             .instrument(tool_span.clone())
             .await
+            .map_err(interrupted_tool_host)
     } else {
-        let context = ToolContext::new(
-            model.as_str(),
-            session_id,
-            &call.call_id,
-            &[],
-            DEFAULT_TOOL_OUTPUT_TOKENS,
-        );
         tools
             .wait_for_code_with_updates(&call.input, context, observer)
             .instrument(tool_span.clone())
             .await
+            .map_err(interrupted_tool_host)
     }
+}
+
+fn interrupted_tool_host(error: nanocodex_tools::embedded::CodeModeHostError) -> NanocodexError {
+    NanocodexError::execution_policy_with_disposition(
+        "tool host interrupted",
+        crate::ExecutionPolicyDisposition::Reopen,
+        error,
+    )
 }
 
 impl<S> ModelRun<S>
@@ -150,6 +199,7 @@ where
         call_index: u32,
         calls: Vec<CodeCall>,
         history: Option<Arc<Vec<ResponseItem>>>,
+        turn_id: String,
     ) -> Result<()> {
         self.active_tool_batch_started_at = Some(Instant::now());
         let mut prepared = Vec::with_capacity(calls.len());
@@ -164,6 +214,11 @@ where
         let tool_call_indices = self.tool_call_indices.clone();
         let session_id = events.request_id().to_owned();
         let model = self.model;
+        let host_context = self.host_context.clone();
+        // Every call in this response retains the revision consumed by its model request,
+        // including calls queued behind the execution gate.
+        let instruction_revision = self.instruction_revision;
+        let execution_steps = self.execution_steps.clone();
         let mut executions = prepared
             .into_iter()
             .map(|(call, supports_parallel, active)| {
@@ -172,61 +227,98 @@ where
                 let events = events.clone();
                 let tool_call_indices = tool_call_indices.clone();
                 let session_id = session_id.clone();
+                let turn_id = turn_id.clone();
+                let host_context = host_context.clone();
+                let execution_steps = execution_steps.clone();
                 async move {
                     let started_at = active.started_at;
-                    let dispatch = async {
-                        if supports_parallel {
-                            let _guard = gate.read().await;
-                            active
-                                .execution_started_at
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .replace(Instant::now());
-                            Self::execute_model_tool_call(
-                                tools,
-                                &events,
-                                &tool_call_indices,
-                                call_index,
-                                call,
-                                history,
-                                &session_id,
-                                model,
-                                started_at,
-                                &active.progress,
-                                &active.span,
-                            )
-                            .await
-                        } else {
-                            let _guard = gate.write().await;
-                            active
-                                .execution_started_at
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .replace(Instant::now());
-                            Self::execute_model_tool_call(
-                                tools,
-                                &events,
-                                &tool_call_indices,
-                                call_index,
-                                call,
-                                history,
-                                &session_id,
-                                model,
-                                started_at,
-                                &active.progress,
-                                &active.span,
-                            )
-                            .await
+                    let step_id = format!("tool-{call_index}-{}", call.call_id);
+                    let recovered = if let Some(steps) = &execution_steps {
+                        match steps
+                            .begin::<_, CompletedToolCall>(&step_id, "tool_call", &call)
+                            .await?
+                        {
+                            crate::agent::ExecutionStep::Execute => None,
+                            crate::agent::ExecutionStep::Replay(output) => Some(output),
                         }
+                    } else {
+                        None
                     };
-                    let result = match AssertUnwindSafe(dispatch).catch_unwind().await {
-                        Ok(result) => result,
-                        Err(payload) => Ok(Self::panicked_tool_call(&active, payload)),
+                    let (result, persist_result) = if let Some(mut completed) = recovered {
+                        // Legacy effect receipts bypass fresh tool execution. Prepare
+                        // their media before those response items enter history too.
+                        prepare_output_images(&mut completed.output).await;
+                        nanocodex_tools::image::prepare_history_images(
+                            &mut completed.response_items,
+                        );
+                        (Ok(completed), false)
+                    } else {
+                        let dispatch = async {
+                            if supports_parallel {
+                                let _guard = gate.read().await;
+                                active
+                                    .execution_started_at
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .replace(Instant::now());
+                                Self::execute_model_tool_call(
+                                    tools,
+                                    &events,
+                                    &tool_call_indices,
+                                    call_index,
+                                    call,
+                                    history,
+                                    &session_id,
+                                    &turn_id,
+                                    model,
+                                    host_context.as_deref(),
+                                    instruction_revision,
+                                    started_at,
+                                    &active.progress,
+                                    &active.span,
+                                )
+                                .await
+                            } else {
+                                let _guard = gate.write().await;
+                                active
+                                    .execution_started_at
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .replace(Instant::now());
+                                Self::execute_model_tool_call(
+                                    tools,
+                                    &events,
+                                    &tool_call_indices,
+                                    call_index,
+                                    call,
+                                    history,
+                                    &session_id,
+                                    &turn_id,
+                                    model,
+                                    host_context.as_deref(),
+                                    instruction_revision,
+                                    started_at,
+                                    &active.progress,
+                                    &active.span,
+                                )
+                                .await
+                            }
+                        };
+                        let result = match AssertUnwindSafe(dispatch).catch_unwind().await {
+                            Ok(result) => result,
+                            Err(payload) => Ok(Self::panicked_tool_call(&active, payload)),
+                        };
+                        (result, true)
                     };
                     match result {
                         Ok(mut completed) => {
-                            completed.work_duration_ns =
-                                Self::completed_tool_work_duration(&active);
+                            if persist_result {
+                                completed.work_duration_ns =
+                                    Self::completed_tool_work_duration(&active);
+                                if let Some(steps) = &execution_steps {
+                                    steps.complete(&step_id, &completed).await?;
+                                }
+                            }
                             Self::emit_completed_tool_result(&events, &completed)?;
                             active
                                 .completion
@@ -316,18 +408,34 @@ where
         completed: CompletedToolCall,
         progress: &Mutex<ActiveToolProgress>,
     ) -> Result<Vec<ResponseItem>> {
+        if !completed
+            .cell
+            .as_ref()
+            .is_some_and(|cell| cell.running && cell.origin_call_id == completed.call_id)
+        {
+            self.tool_call_indices.remove(completed.call_id.as_str());
+        }
+        if let Some(cell) = &completed.cell
+            && !cell.running
+        {
+            self.tool_call_indices.remove(cell.origin_call_id.as_str());
+        }
         self.stats.tool_work_duration_ns += completed.work_duration_ns;
-        self.finish_active_tool_progress(progress);
+        let _ = self.finish_active_tool_progress(progress);
         Ok(completed.response_items)
     }
 
-    pub(super) fn finish_active_tool_progress(&mut self, progress: &Mutex<ActiveToolProgress>) {
+    pub(super) fn finish_active_tool_progress(
+        &mut self,
+        progress: &Mutex<ActiveToolProgress>,
+    ) -> Vec<ActiveNestedToolCall> {
         let progress = std::mem::take(
             &mut *progress
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
         self.stats.tool_calls += progress.nested_tool_calls;
+        progress.active_nested_tool_calls
     }
 
     pub(super) fn completed_tool_work_duration(active: &ActiveToolCall) -> u64 {
@@ -369,10 +477,47 @@ where
                 duration_ns: completed.duration_ns,
                 started_after_ns: None,
                 result: &completed.output,
+                structured_result: &completed.structured_result,
                 metadata: completed.metadata.as_deref(),
             },
         )?;
         Ok(())
+    }
+
+    pub(super) fn emit_cancelled_tool_result(
+        &self,
+        call_id: &str,
+        tool: &str,
+        started_at: Instant,
+        started_after_ns: Option<u64>,
+        shell_abort_format: bool,
+        span: Option<&tracing::Span>,
+    ) -> Result<ToolOutputBody> {
+        let duration_ns = elapsed_ns(started_at);
+        let elapsed_seconds = started_at.elapsed().as_secs_f64();
+        let output = ToolOutputBody::Text(if shell_abort_format {
+            format!("Wall time: {elapsed_seconds:.1} seconds\naborted by user")
+        } else {
+            format!("aborted by user after {:.1}s", elapsed_seconds.max(0.1))
+        });
+        let structured_result = output.structured_result();
+        if let Some(span) = span {
+            record_tool_span_terminal(span, "cancelled", "ERROR", duration_ns, &output);
+        }
+        self.events.emit(
+            AgentEventKind::ToolResult,
+            ToolResultEvent {
+                call_id,
+                tool,
+                status: "cancelled",
+                duration_ns,
+                started_after_ns,
+                result: &output,
+                structured_result: &structured_result,
+                metadata: None,
+            },
+        )?;
+        Ok(output)
     }
 
     pub(super) fn panicked_tool_call(
@@ -382,6 +527,7 @@ where
         let message = panic_payload(payload);
         record_span_content(&active.span, "tool.panic", &message);
         let output = ToolOutputBody::Text("aborted".to_owned());
+        let structured_result = output.structured_result();
         let duration_ns = elapsed_ns(active.started_at);
         record_tool_span_terminal(&active.span, "failed", "ERROR", duration_ns, &output);
         let response_item = match active.kind {
@@ -390,12 +536,14 @@ where
             CodeCallKind::ToolSearch => tool_search_output(active.call_id.clone(), Vec::new()),
         };
         CompletedToolCall {
+            cell: None,
             call_id: active.call_id.clone(),
             tool: active.name.clone(),
             success: false,
             duration_ns,
             work_duration_ns: Self::completed_tool_work_duration(active),
             output,
+            structured_result,
             metadata: None,
             response_items: vec![response_item],
         }
@@ -410,7 +558,10 @@ where
         call: CodeCall,
         history: Option<Arc<Vec<ResponseItem>>>,
         session_id: &str,
+        turn_id: &str,
         model: Model,
+        host_context: Option<&str>,
+        instruction_revision: Option<u64>,
         started_at: Instant,
         progress: &Mutex<ActiveToolProgress>,
         tool_span: &tracing::Span,
@@ -418,6 +569,7 @@ where
         let qualified_name = qualified_tool_name(&call);
         if let Some(message) = unsupported_tool_message(tools, &call) {
             let output = ToolOutputBody::Text(message);
+            let structured_result = output.structured_result();
             record_tool_span_terminal(tool_span, "failed", "ERROR", 0, &output);
             let response_item = match call.kind {
                 CodeCallKind::Custom => custom_tool_output(call.call_id.clone(), output.clone()),
@@ -427,12 +579,14 @@ where
                 CodeCallKind::ToolSearch => tool_search_output(call.call_id.clone(), Vec::new()),
             };
             return Ok(CompletedToolCall {
+                cell: None,
                 call_id: call.call_id,
                 tool: qualified_name,
                 success: false,
                 duration_ns: 0,
                 work_duration_ns: 0,
                 output,
+                structured_result,
                 metadata: None,
                 response_items: vec![response_item],
             });
@@ -448,33 +602,37 @@ where
                 &call.call_id,
                 &[],
                 DEFAULT_TOOL_OUTPUT_TOKENS,
-            );
+            )
+            .with_instruction_revision(instruction_revision)
+            .with_host_context(host_context)
+            .with_turn_id(Some(turn_id));
             let mut execution = match call.kind {
                 CodeCallKind::Function => match RawValue::from_string(call.input.clone()) {
-                    Ok(input) => {
-                        tools
-                            .execute_tool(&qualified_name, ToolInput::Function(input), context)
-                            .instrument(tool_span.clone())
-                            .await
-                    }
+                    Ok(input) => tools
+                        .execute_tool(&qualified_name, ToolInput::Function(input), context)
+                        .instrument(tool_span.clone())
+                        .await
+                        .map_err(interrupted_tool_host)?,
                     Err(error) => ToolOutput::error(format!(
                         "failed to encode {qualified_name} arguments: {error}"
                     )),
                 },
-                CodeCallKind::Custom => {
-                    tools
-                        .execute_tool(
-                            &qualified_name,
-                            ToolInput::Freeform(call.input.clone()),
-                            context,
-                        )
-                        .instrument(tool_span.clone())
-                        .await
-                }
+                CodeCallKind::Custom => tools
+                    .execute_tool(
+                        &qualified_name,
+                        ToolInput::Freeform(call.input.clone()),
+                        context,
+                    )
+                    .instrument(tool_span.clone())
+                    .await
+                    .map_err(interrupted_tool_host)?,
                 CodeCallKind::ToolSearch => {
                     unreachable!("tool search is not an ordinary direct tool")
                 }
             };
+            // The explicit result is retained by CompletedToolCall. Move it before
+            // image preparation instead of keeping another large copy alive.
+            let structured_result = execution.take_structured_result();
             prepare_output_images(&mut execution.output).await;
             if let Some(content) = serialize_trace_content(&execution.output) {
                 record_span_content(tool_span, "tool.output", &content);
@@ -484,6 +642,7 @@ where
             tool_span.record("otel.status_code", otel_status(execution.success));
             tool_span.record("duration_ns", duration_ns);
             return Ok(CompletedToolCall {
+                cell: None,
                 call_id: call.call_id.clone(),
                 tool: qualified_name,
                 success: execution.success,
@@ -501,6 +660,7 @@ where
                     }
                 }],
                 output: execution.output,
+                structured_result,
                 metadata: execution.metadata,
             });
         }
@@ -512,14 +672,16 @@ where
                 &call.call_id,
                 search_history,
                 DEFAULT_TOOL_OUTPUT_TOKENS,
-            );
+            )
+            .with_instruction_revision(instruction_revision)
+            .with_host_context(host_context)
+            .with_turn_id(Some(turn_id));
             let execution = match RawValue::from_string(call.input.clone()) {
-                Ok(input) => {
-                    tools
-                        .execute_tool("tool_search", ToolInput::Function(input), context)
-                        .instrument(tool_span.clone())
-                        .await
-                }
+                Ok(input) => tools
+                    .execute_tool("tool_search", ToolInput::Function(input), context)
+                    .instrument(tool_span.clone())
+                    .await
+                    .map_err(interrupted_tool_host)?,
                 Err(error) => {
                     ToolOutput::error(format!("failed to encode tool_search arguments: {error}"))
                 }
@@ -531,15 +693,17 @@ where
             tool_span.record("status", status(execution.success));
             tool_span.record("otel.status_code", otel_status(execution.success));
             tool_span.record("duration_ns", duration_ns);
+            let structured_result = execution.structured_result();
             let tools = if execution.success {
-                match execution.code_mode_value() {
-                    Value::Array(tools) => tools,
+                match &structured_result {
+                    Value::Array(tools) => tools.clone(),
                     _ => Vec::new(),
                 }
             } else {
                 Vec::new()
             };
             return Ok(CompletedToolCall {
+                cell: None,
                 call_id: call.call_id.clone(),
                 tool: qualified_name,
                 success: execution.success,
@@ -547,10 +711,29 @@ where
                 work_duration_ns: 0,
                 response_items: vec![tool_search_output(call.call_id, tools)],
                 output: execution.output,
+                structured_result,
                 metadata: execution.metadata,
             });
         }
-        let owned_context = owned_code_context(&call, history, session_id, model)?;
+        let owned_context = owned_code_context(
+            &call,
+            history,
+            session_id,
+            turn_id,
+            model,
+            host_context,
+            instruction_revision,
+        )?;
+        let context = ToolContext::new(
+            model.as_str(),
+            session_id,
+            &call.call_id,
+            &[],
+            DEFAULT_TOOL_OUTPUT_TOKENS,
+        )
+        .with_instruction_revision(instruction_revision)
+        .with_host_context(host_context)
+        .with_turn_id(Some(turn_id));
         let mut observer = NestedToolEventObserver {
             events,
             tool_call_indices,
@@ -563,17 +746,17 @@ where
             tools,
             &call,
             owned_context,
-            session_id,
-            model,
+            context,
             &mut observer,
             tool_span,
         )
-        .await;
+        .await?;
         let update_error = observer.error.take();
         drop(observer);
         if let Some(error) = update_error {
             return Err(error);
         }
+        let structured_result = execution.output.structured_result();
         prepare_output_images(&mut execution.output).await;
         if let Some(content) = serialize_trace_content(&execution.output) {
             record_span_content(tool_span, "tool.output", &content);
@@ -601,12 +784,14 @@ where
             }),
         );
         Ok(CompletedToolCall {
+            cell: execution.cell,
             call_id: call.call_id,
             tool: qualified_name,
             success: execution.success,
             duration_ns,
             work_duration_ns: 0,
             output: execution.output,
+            structured_result,
             metadata: None,
             response_items: outputs,
         })
