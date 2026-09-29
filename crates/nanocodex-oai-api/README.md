@@ -36,9 +36,9 @@ if let Some(cost) = completed.estimated_cost() {
 # }
 ```
 
-This crate supports `gpt-5.6-sol` (the default), `gpt-5.6-terra`, and
-`gpt-5.6-luna`. Select a client default with
-`OpenAi::builder(auth).model(Model::Terra)`. A session keeps that model for its
+This crate supports `gpt-6-astra` (the default, with low reasoning),
+`gpt-6.1-sol`, and `gpt-6-luna`. Select a client default with
+`OpenAi::builder(auth).model(Model::Sol)`. A session keeps that model for its
 lifetime, and each replayable attempt retains it across retries. Changing
 models would invalidate the provider checkpoint and require an inefficient
 replay of the complete retained context.
@@ -50,10 +50,11 @@ and snapshots continue to use the typed [`Model`] value. It does not add an
 alternate provider or arbitrary-model surface.
 
 USD estimates require no pricing configuration. Each model applies its
-published standard rates, or its priority rates when
-[`OpenAiBuilder::fast_mode`] is enabled. Terra and Luna usage receive the same
-complete estimate and status treatment as Sol. Provider-omitted usage remains
-distinguishable as `usage_not_reported`.
+published standard or long-context rates and its model-specific fast rates when
+[`OpenAiBuilder::fast_mode`] is enabled. GPT-6 requests use `priority` on the
+wire for fast mode. Luna and Astra usage receive the same complete estimate and
+status treatment as Sol. Provider-omitted usage
+remains distinguishable as `usage_not_reported`.
 
 ## ChatGPT subscription login
 
@@ -102,12 +103,29 @@ println!("{}", completed.output_text());
 
 Keep the credential file outside source control and reuse the same path on
 later runs. It uses Codex's `auth.json` format, so Codex and multiple Nanocodex
-processes can safely share the same path. [`auth::load_chatgpt_auth`] adopts a
-same-account rotation from disk before refreshing, refreshes expiring
-credentials, and recovers an unauthorized request once with the refreshed
-authorization.
-[`auth::chatgpt_auth_status`] inspects the selected account without exposing
-tokens, and [`auth::logout_chatgpt`] removes the stored credentials.
+processes can safely share the same path. The loader accepts both Codex OAuth
+sessions and its `personal_access_token` format. OAuth sessions adopt a
+same-account rotation from disk before refreshing; persistent Business and
+Enterprise access tokens resolve their account metadata once and never enter
+the OAuth refresh path.
+
+Applications that receive a persistent `at-...` token directly can skip the
+credential file:
+
+```rust,no_run
+use nanocodex_oai_api::{OpenAi, auth::chatgpt_access_token};
+
+# fn run() -> Result<(), Box<dyn std::error::Error>> {
+let auth = chatgpt_access_token(std::env::var("CODEX_ACCESS_TOKEN")?)?;
+let openai = OpenAi::new(auth)?;
+# let _ = openai;
+# Ok(())
+# }
+```
+
+[`auth::resolve_chatgpt_auth_status`] inspects either stored credential type
+without exposing tokens, and [`auth::logout_chatgpt`] removes the stored
+credentials.
 
 A [`Response`] is also a typed stream. It retains the completed aggregate
 after the stream reaches [`ResponseEvent::Completed`]:
@@ -152,9 +170,25 @@ The library accepts and emits signed 16-bit little-endian, 24 kHz mono PCM throu
 [`realtime::RealtimeSession`] handle and an independent
 [`realtime::RealtimeEvents`] stream. It does not open audio devices, so callers
 can connect a microphone, files, or ordinary stdin and stdout pipes.
+Owned WebRTC sends its offer while local ICE gathering continues, then applies
+the answer concurrently with joining the control sideband. Cancelling setup
+closes the peer's native tasks. Transcript deltas retain each speaker separately
+when speech overlaps, and replayed delegation IDs are suppressed across reconnects.
 The experimental `nanocodex-voice` crate packages default desktop devices and
 background-agent delegation without moving those policies into this transport
 boundary.
+
+Embeddings that already own WebRTC use
+[`realtime::RealtimeSessionBuilder::connect_with_sdp`]. It creates the remote
+call and returns a [`realtime::RealtimeSdpConnection`] immediately after the
+answer SDP is available, while the authenticated sideband joins in the
+background. The caller applies the answer and owns its peer and media for the
+entire call. [`OpenAi::attach_realtime_call`] instead joins a call created and
+negotiated elsewhere. Attachment defaults to Realtime V1, supports V3 when
+selected explicitly, performs no call-create request, and sends no
+`session.update`. Closing either external mode detaches Nanocodex's sideband; it
+does not send `session.close` or terminate the caller-owned media call. See the
+`realtime-external` example for both modes.
 
 Both transports expose background-agent delegation as
 [`realtime::RealtimeEvent::AgentRequest`]. An embedding handles that event with
@@ -185,11 +219,9 @@ replacement without embedding agent policy.
 ## Attempt accounting
 
 Transport metrics distinguish physical Responses attempts from retries. A sent
-attempt that is cancelled or fails before a provider terminal event increments
-`billing_uncertain_response_attempts`; its `ModelAttemptFailed` event also sets
-`billing_uncertain`. This does not assume that the provider charged the request.
-It records that observed token usage is only a lower bound, while completed and
-provider-rejected responses remain exact.
+attempt that fails or is cancelled still emits `ModelAttemptFailed` with its
+failure phase and retryability. Completed responses retain the provider-reported
+usage used for normal cost accounting.
 
 ## Contract-only builds
 

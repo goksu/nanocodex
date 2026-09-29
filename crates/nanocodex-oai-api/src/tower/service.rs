@@ -107,7 +107,6 @@ struct AttemptGuard<'a> {
     started_at: Instant,
     span: tracing::Span,
     completed: bool,
-    request_sent: bool,
 }
 
 impl<'a> AttemptGuard<'a> {
@@ -124,17 +123,7 @@ impl<'a> AttemptGuard<'a> {
             started_at,
             span: tracing::Span::current(),
             completed: false,
-            request_sent: false,
         }
-    }
-
-    const fn mark_request_sent(&mut self) {
-        self.request_sent = true;
-    }
-
-    #[cfg(not(target_family = "wasm"))]
-    const fn mark_provider_terminal(&mut self) {
-        self.request_sent = false;
     }
 
     const fn complete(&mut self) {
@@ -169,13 +158,6 @@ impl Drop for AttemptGuard<'_> {
             self.span.record("otel.status_code", "ERROR");
             self.span.record("duration_ns", elapsed_ns(self.started_at));
             let message = "Responses attempt cancelled before a provider terminal event";
-            if self.request_sent {
-                self.request
-                    .observer
-                    .stats
-                    .billing_uncertain_response_attempts
-                    .fetch_add(1, Ordering::Relaxed);
-            }
             if let Err(error) = self.request.observer.emit(
                 AgentEventKind::ModelAttemptFailed,
                 AttemptFailed {
@@ -187,7 +169,6 @@ impl Drop for AttemptGuard<'_> {
                     failure_phase: FailurePhase::Completion,
                     error_class: "cancelled",
                     retryable: false,
-                    billing_uncertain: self.request_sent,
                     connection_generation: generation,
                     error: message,
                 },
@@ -317,7 +298,10 @@ impl ResponsesService {
             self.run_websocket(&mut guard, request, started_at).await
         } else {
             https::run(self, &mut guard, request, started_at).await
-        };
+        }
+        // Resolve provider indices before retry policy can change the input
+        // from an incremental delta to full replay (or back again).
+        .map_err(|error| error.with_request_input(request));
         guard.complete();
         drop(guard);
         tracing::Span::current().record(
@@ -335,13 +319,6 @@ impl ResponsesService {
         tracing::Span::current().record("duration_ns", elapsed_ns(started_at));
         connection.capture_turn_state();
         if let Err(failure) = &result {
-            if failure.billing_uncertain() {
-                request
-                    .observer
-                    .stats
-                    .billing_uncertain_response_attempts
-                    .fetch_add(1, Ordering::Relaxed);
-            }
             if matches!(request.kind, ResponsesAttemptKind::Warmup) {
                 connection.invalidate(ConnectionPurpose::WarmupFallback);
             } else if failure.retry_advice.is_some() {
@@ -359,7 +336,6 @@ impl ResponsesService {
                     failure_phase: failure.phase,
                     error_class: failure.error_class(),
                     retryable: failure.is_retryable() || failure.is_checkpoint_missing(),
-                    billing_uncertain: failure.billing_uncertain(),
                     connection_generation: failure.connection_generation,
                     error: &message,
                 },
@@ -411,7 +387,6 @@ impl ResponsesService {
                 generation,
             ));
         }
-        connection.mark_request_sent();
         let socket = connection.socket.as_mut().ok_or_else(|| {
             ResponsesServiceError::invalid_attempt_state(
                 "connection completed without installing a WebSocket",
@@ -422,18 +397,15 @@ impl ResponsesService {
         let send_started_at = Instant::now();
         socket.send(encoded).await.map_err(|error| {
             ResponsesServiceError::responses(error, FailurePhase::Send, generation)
-                .with_billing_uncertain()
         })?;
         let send_duration_ns = elapsed_ns(send_started_at);
         span.record("request.send.duration_ns", send_duration_ns);
         let output = match request.kind {
-            ResponsesAttemptKind::Warmup => {
-                ResponsesOutput::Warmup(receive_warmup(socket, request).await.map_err(|error| {
-                    error
-                        .with_connection_generation(generation)
-                        .with_billing_uncertain_unless_provider_terminal()
-                })?)
-            }
+            ResponsesAttemptKind::Warmup => ResponsesOutput::Warmup(
+                receive_warmup(socket, request)
+                    .await
+                    .map_err(|error| error.with_connection_generation(generation))?,
+            ),
             ResponsesAttemptKind::Generation => ResponsesOutput::Generation(
                 stream::receive(
                     socket,
@@ -443,11 +415,7 @@ impl ResponsesService {
                     started_at,
                 )
                 .await
-                .map_err(|error| {
-                    error
-                        .with_connection_generation(generation)
-                        .with_billing_uncertain_unless_provider_terminal()
-                })?,
+                .map_err(|error| error.with_connection_generation(generation))?,
             ),
             ResponsesAttemptKind::Compaction => ResponsesOutput::Compaction(
                 stream::receive_compaction(
@@ -458,11 +426,7 @@ impl ResponsesService {
                     started_at,
                 )
                 .await
-                .map_err(|error| {
-                    error
-                        .with_connection_generation(generation)
-                        .with_billing_uncertain_unless_provider_terminal()
-                })?,
+                .map_err(|error| error.with_connection_generation(generation))?,
             ),
         };
         let pipeline_stats = match &output {
@@ -610,7 +574,11 @@ impl ResponsesService {
             duration_ns = tracing::field::Empty,
         );
         let result = self
-            .connect_with_auth_recovery(request.profile.session_id(), turn_state)
+            .connect_with_auth_recovery(
+                request.profile.session_id(),
+                request.profile.thread_id(),
+                turn_state,
+            )
             .instrument(connect_span.clone())
             .await;
         let elapsed = started_at.elapsed();
@@ -665,11 +633,19 @@ impl ResponsesService {
     async fn connect_with_auth_recovery(
         &self,
         session_id: &str,
+        thread_id: &str,
         turn_state: Option<&str>,
     ) -> Result<(ResponsesSocket, ConnectionMetadata), ResponsesError> {
         let auth = self.auth_snapshot().await?;
-        match platform::connect_socket(&self.platform, &self.config, &auth, session_id, turn_state)
-            .await
+        match platform::connect_socket(
+            &self.platform,
+            &self.config,
+            &auth,
+            session_id,
+            thread_id,
+            turn_state,
+        )
+        .await
         {
             Err(ResponsesError::HandshakeRejected { status: 401, .. })
                 if auth.mode() == OpenAiAuthMode::ChatGpt =>
@@ -687,6 +663,7 @@ impl ResponsesService {
                     &self.config,
                     &refreshed,
                     session_id,
+                    thread_id,
                     turn_state,
                 )
                 .await
@@ -779,6 +756,10 @@ impl Service<ResponsesAttempt> for ResponsesService {
 
     fn call(&mut self, mut request: ResponsesAttempt) -> Self::Future {
         request.limit_attempts(self.max_attempts);
+        request.observer.events = request
+            .observer
+            .events
+            .with_raw_api_events(self.config.raw_api_events);
         let service = self.clone();
         let parent = tracing::Span::current();
         Box::pin(async move {
@@ -826,15 +807,15 @@ impl Service<ResponsesAttempt> for ResponsesService {
                     connection.capture_turn_state();
                     connection.socket = None;
                 }
+                let replaces_websocket = matches!(transport, ResponsesTransport::WebSocket)
+                    && connection.socket.is_none()
+                    && connection.generation > 0;
                 if matches!(
                     service.config.responses_history,
                     ResponsesHistory::FullReplay
                 ) || (matches!(transport, ResponsesTransport::Https)
                     && !service.config.store_responses)
-                    || (matches!(transport, ResponsesTransport::WebSocket)
-                        && !service.config.store_responses
-                        && connection.socket.is_none()
-                        && request.previous_response_id().is_some())
+                    || replaces_websocket
                 {
                     request.force_full_replay();
                 }
@@ -854,7 +835,7 @@ async fn receive_warmup(
     request: &ResponsesAttempt,
 ) -> Result<WarmupResponse, ResponsesServiceError> {
     loop {
-        let received = socket.next_text_or_idle_timeout().await?;
+        let received = socket.next_text().await?;
         let raw_event = parse_raw_json(received.text.as_str())?;
         tracing::trace!(
             target: "nanocodex_oai_api",
@@ -930,7 +911,6 @@ mod tests {
 
         let (events, mut receiver) = crate::EventSink::channel("cancelled-attempt".to_owned());
         let stats = Arc::new(crate::TransportStats::default());
-        let before = stats.snapshot();
         let factory = crate::ResponsesAttemptFactory::new(
             crate::responses::RequestProfile::new(
                 "cancelled-attempt",
@@ -964,15 +944,10 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(event.payload.get()).unwrap()["error_class"],
             "cancelled"
         );
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(event.payload.get()).unwrap()["billing_uncertain"],
-            false
-        );
-        assert_eq!(stats.since(before).billing_uncertain_response_attempts, 0);
     }
 
     #[test]
-    fn cancelling_a_sent_attempt_marks_billing_uncertain_for_each_transport() {
+    fn cancellation_is_observable_for_each_transport() {
         for transport in [
             crate::ResponsesTransport::WebSocket,
             crate::ResponsesTransport::Https,
@@ -981,7 +956,6 @@ mod tests {
             let (events, mut receiver) =
                 crate::EventSink::channel(format!("sent-{}-attempt", transport.as_str()));
             let stats = Arc::new(crate::TransportStats::default());
-            let before = stats.snapshot();
             let factory = crate::ResponsesAttemptFactory::new(
                 crate::responses::RequestProfile::new(
                     "sent-attempt",
@@ -993,9 +967,12 @@ mod tests {
             );
             let request = factory.warmup(crate::Model::Sol, crate::Thinking::High, false);
 
-            let mut guard = AttemptGuard::new(&mut connection, &request, transport, Instant::now());
-            guard.mark_request_sent();
-            drop(guard);
+            drop(AttemptGuard::new(
+                &mut connection,
+                &request,
+                transport,
+                Instant::now(),
+            ));
 
             let event = receiver
                 .try_recv_timed()
@@ -1003,10 +980,9 @@ mod tests {
                 .event;
             assert_eq!(event.kind, crate::AgentEventKind::ModelAttemptFailed);
             assert_eq!(
-                serde_json::from_str::<serde_json::Value>(event.payload.get()).unwrap()["billing_uncertain"],
-                true
+                serde_json::from_str::<serde_json::Value>(event.payload.get()).unwrap()["error_class"],
+                "cancelled"
             );
-            assert_eq!(stats.since(before).billing_uncertain_response_attempts, 1);
         }
     }
 }

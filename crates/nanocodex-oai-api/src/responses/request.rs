@@ -5,15 +5,26 @@ use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
 use serde::{Serialize, Serializer, ser::SerializeSeq};
 
 use super::ResponseItem;
-use crate::{ModelConfig, Thinking};
+use crate::{ModelConfig, Thinking, responses::StrictJsonSchema};
 
 /// Stable request metadata and prefix shared by every operation in a session.
 #[derive(Clone)]
 pub struct RequestProfile {
     session_id: String,
+    thread_id: String,
     prompt_cache_key: String,
     prefix: Arc<[ResponseItem]>,
     code_mode_tool_names: Arc<BTreeMap<String, CodeModeToolName>>,
+    tool_namespaces_info: Arc<BTreeMap<String, serde_json::Value>>,
+    logical_turn: u64,
+    retained_config: Option<RetainedRequestConfig>,
+}
+
+#[derive(Clone)]
+struct RetainedRequestConfig {
+    model_id_prefix: Option<String>,
+    reasoning_mode: crate::ReasoningMode,
+    store_responses: bool,
 }
 
 impl RequestProfile {
@@ -24,18 +35,49 @@ impl RequestProfile {
         prompt_cache_key: impl Into<String>,
         prefix: Arc<[ResponseItem]>,
     ) -> Self {
-        Self {
-            session_id: session_id.into(),
+        let session_id = session_id.into();
+        let mut profile = Self {
+            thread_id: session_id.clone(),
+            session_id,
             prompt_cache_key: prompt_cache_key.into(),
             prefix,
             code_mode_tool_names: Arc::default(),
-        }
+            tool_namespaces_info: Arc::default(),
+            logical_turn: 0,
+            retained_config: None,
+        };
+        profile.tool_namespaces_info = Arc::new(tool_namespaces_info(&profile));
+        profile
     }
 
     /// Returns the client-owned session identity used in request metadata.
     #[must_use]
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    /// Returns the current agent thread identity.
+    #[must_use]
+    pub fn thread_id(&self) -> &str {
+        &self.thread_id
+    }
+
+    /// Returns the stable turn identity sent in provider request metadata.
+    #[must_use]
+    pub fn turn_id(&self) -> String {
+        format!("{}:{}", self.thread_id(), self.logical_turn)
+    }
+
+    /// Uses a fresh thread identity while retaining the provider session.
+    #[must_use]
+    pub fn with_thread_id(mut self, thread_id: impl Into<String>) -> Self {
+        self.thread_id = thread_id.into();
+        self
+    }
+
+    pub(crate) const fn with_logical_turn(mut self, logical_turn: u64) -> Self {
+        self.logical_turn = logical_turn;
+        self
     }
 
     /// Returns the stable prompt-cache identity.
@@ -57,6 +99,25 @@ impl RequestProfile {
         Arc::clone(&self.prefix)
     }
 
+    pub(crate) fn with_request_content(
+        mut self,
+        prompt_cache_key: String,
+        prefix: Arc<[ResponseItem]>,
+        model_id_prefix: Option<String>,
+        reasoning_mode: crate::ReasoningMode,
+        store_responses: bool,
+    ) -> Self {
+        self.prompt_cache_key = prompt_cache_key;
+        self.prefix = prefix;
+        self.tool_namespaces_info = Arc::new(tool_namespaces_info(&self));
+        self.retained_config = Some(RetainedRequestConfig {
+            model_id_prefix,
+            reasoning_mode,
+            store_responses,
+        });
+        self
+    }
+
     pub(crate) fn with_code_mode_tool_names(
         mut self,
         names: impl IntoIterator<Item = (String, String)>,
@@ -67,6 +128,7 @@ impl RequestProfile {
                 .map(|(identifier, name)| (identifier, CodeModeToolName::from_flat_name(name)))
                 .collect(),
         );
+        self.tool_namespaces_info = Arc::new(tool_namespaces_info(&self));
         self
     }
 }
@@ -85,6 +147,12 @@ impl CodeModeToolName {
             return Self {
                 name: tool.into(),
                 namespace: Some(format!("mcp__{server}").into()),
+            };
+        }
+        if let Some((namespace, tool)) = name.split_once("__") {
+            return Self {
+                name: tool.into(),
+                namespace: Some(namespace.into()),
             };
         }
         Self {
@@ -468,7 +536,10 @@ impl Serialize for ResponsesInput<'_> {
     {
         let mut sequence = serializer.serialize_seq(Some(self.len()))?;
         for item in self.iter() {
-            sequence.serialize_element(&RequestResponseItem { item })?;
+            sequence.serialize_element(&RequestResponseItem {
+                item,
+                strip_image_detail: false,
+            })?;
         }
         sequence.end()
     }
@@ -477,6 +548,7 @@ impl Serialize for ResponsesInput<'_> {
 #[derive(Clone, Copy)]
 struct RequestInput<'a> {
     input: ResponsesInput<'a>,
+    strip_image_detail: bool,
 }
 
 impl Serialize for RequestInput<'_> {
@@ -486,7 +558,10 @@ impl Serialize for RequestInput<'_> {
     {
         let mut sequence = serializer.serialize_seq(Some(self.input.len()))?;
         for item in self.input.iter() {
-            sequence.serialize_element(&RequestResponseItem { item })?;
+            sequence.serialize_element(&RequestResponseItem {
+                item,
+                strip_image_detail: self.strip_image_detail,
+            })?;
         }
         sequence.end()
     }
@@ -494,6 +569,7 @@ impl Serialize for RequestInput<'_> {
 
 struct RequestResponseItem<'a> {
     item: &'a ResponseItem,
+    strip_image_detail: bool,
 }
 
 impl Serialize for RequestResponseItem<'_> {
@@ -501,9 +577,14 @@ impl Serialize for RequestResponseItem<'_> {
     where
         S: serde::Serializer,
     {
-        if self.item.id().is_some_and(|id| !id.is_prefixed()) {
+        if self.strip_image_detail || self.item.id().is_some_and(|id| !id.is_prefixed()) {
             let mut item = self.item.clone();
-            item.set_id(None);
+            if item.id().is_some_and(|id| !id.is_prefixed()) {
+                item.set_id(None);
+            }
+            if self.strip_image_detail {
+                item.strip_image_details();
+            }
             item.serialize(serializer)
         } else {
             self.item.serialize(serializer)
@@ -527,7 +608,7 @@ pub(crate) struct ResponseCreate<'a> {
     stream: bool,
     include: [&'static str; 1],
     prompt_cache_key: &'a str,
-    text: TextControls,
+    text: TextControls<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     service_tier: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -591,37 +672,86 @@ impl<'a> ResponseCreate<'a> {
         turn_state: Option<&'a str>,
     ) -> Self {
         let websocket = matches!(policy.transport, crate::ResponsesTransport::WebSocket);
+        let retained = profile.retained_config.as_ref();
+        let model = retained.map_or_else(
+            || config.wire_model_id(policy.model),
+            |retained| {
+                retained.model_id_prefix.as_ref().map_or_else(
+                    || Cow::Borrowed(policy.model.as_str()),
+                    |prefix| Cow::Owned(format!("{prefix}/{}", policy.model.as_str())),
+                )
+            },
+        );
+        let reasoning_mode =
+            retained.map_or(config.reasoning_mode, |retained| retained.reasoning_mode);
+        let store_responses =
+            retained.map_or(config.store_responses, |retained| retained.store_responses);
         Self {
             kind: websocket.then_some("response.create"),
-            model: config.wire_model_id(policy.model),
+            model,
             previous_response_id,
-            input: RequestInput { input },
+            input: RequestInput {
+                input,
+                strip_image_detail: matches!(
+                    policy.model,
+                    crate::Model::Sol | crate::Model::Luna | crate::Model::Astra
+                ),
+            },
             tool_choice: "auto",
-            // gpt-5.6-sol uses Responses Lite. Codex disables the provider
+            // GPT-6 uses Responses Lite. Codex disables the provider
             // parallel-call request bit for Lite even though the client-side
             // scheduler still accepts multi-call responses and replays.
             parallel_tool_calls: false,
             reasoning: ReasoningControls {
-                mode: config.reasoning_mode.request_value(),
+                // Astra rejects the legacy `reasoning.mode` field. Standard
+                // already serializes as absent; keep this model guard as a
+                // final wire-level invariant for custom service factories.
+                mode: (!matches!(
+                    policy.model,
+                    crate::Model::Astra
+                        | crate::Model::Glm53
+                        | crate::Model::Kimi
+                        | crate::Model::Mimo
+                ))
+                .then(|| reasoning_mode.request_value())
+                .flatten(),
                 effort: policy.thinking.as_str(),
-                summary: Some("auto"),
+                summary: None,
                 context: "all_turns",
             },
-            store: config.store_responses,
+            store: store_responses,
             stream: true,
             include: ["reasoning.encrypted_content"],
             prompt_cache_key: profile.prompt_cache_key(),
-            text: TextControls { verbosity: "low" },
-            service_tier: policy.fast_mode.then_some("priority"),
+            text: TextControls {
+                verbosity: "low",
+                format: config.strict_json_schema.as_ref(),
+            },
+            // The API accepts both `fast` and `priority`. Codex currently uses
+            // `priority` as the compatibility request value for Fast mode.
+            // GPT-6 standard mode is explicit so a project-level Fast default
+            // cannot silently change processing or the local cost estimate.
+            service_tier: match (policy.model, policy.fast_mode) {
+                (crate::Model::Glm53 | crate::Model::Kimi | crate::Model::Mimo, _) => None,
+                (_, true) => Some("priority"),
+                (crate::Model::Sol | crate::Model::Luna | crate::Model::Astra, false) => {
+                    Some("default")
+                }
+            },
             generate,
             client_metadata: ClientMetadata {
                 session_id: profile.session_id(),
-                thread_id: profile.session_id(),
+                thread_id: profile.thread_id(),
                 responses_lite: websocket.then_some("true"),
                 turn_state: websocket.then_some(turn_state).flatten(),
-                turn_metadata: (!profile.code_mode_tool_names.is_empty()).then_some(
-                    SerializedCodeModeTurnMetadata(&profile.code_mode_tool_names),
-                ),
+                turn_metadata: Some(SerializedTurnMetadata {
+                    profile,
+                    request_kind: if generate == Some(false) {
+                        "prewarm"
+                    } else {
+                        "turn"
+                    },
+                }),
             },
         }
     }
@@ -662,8 +792,10 @@ struct ReasoningControls {
 }
 
 #[derive(Clone, Copy, Serialize)]
-struct TextControls {
+struct TextControls<'a> {
     verbosity: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    format: Option<&'a StrictJsonSchema>,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -678,35 +810,165 @@ struct ClientMetadata<'a> {
     turn_state: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "x-codex-turn-metadata")]
-    turn_metadata: Option<SerializedCodeModeTurnMetadata<'a>>,
+    turn_metadata: Option<SerializedTurnMetadata<'a>>,
 }
 
 #[derive(Clone, Copy)]
-struct SerializedCodeModeTurnMetadata<'a>(&'a BTreeMap<String, CodeModeToolName>);
+struct SerializedTurnMetadata<'a> {
+    profile: &'a RequestProfile,
+    request_kind: &'static str,
+}
 
-impl Serialize for SerializedCodeModeTurnMetadata<'_> {
+impl Serialize for SerializedTurnMetadata<'_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
         #[derive(Serialize)]
         struct TurnMetadata<'a> {
-            code_mode_tool_names: &'a BTreeMap<String, CodeModeToolName>,
+            session_id: &'a str,
+            thread_id: &'a str,
+            turn_id: String,
+            request_kind: &'static str,
+            tool_namespaces_info: &'a BTreeMap<String, serde_json::Value>,
         }
 
+        let profile = self.profile;
         let value = serde_json::to_string(&TurnMetadata {
-            code_mode_tool_names: self.0,
+            session_id: profile.session_id(),
+            thread_id: profile.thread_id(),
+            turn_id: profile.turn_id(),
+            request_kind: self.request_kind,
+            tool_namespaces_info: &profile.tool_namespaces_info,
         })
         .map_err(serde::ser::Error::custom)?;
         serializer.serialize_str(&value)
     }
 }
 
+// Codex replaced the legacy flat inventory with effective namespace exposure.
+// Construct it from the same immutable catalog and normalized Code Mode map
+// used by dispatch, so metadata cannot advertise a different tool surface.
+fn tool_namespaces_info(profile: &RequestProfile) -> BTreeMap<String, serde_json::Value> {
+    use super::ToolDefinition;
+    use serde_json::json;
+    fn insert(
+        result: &mut BTreeMap<String, serde_json::Value>,
+        namespace: &str,
+        name: &str,
+        direct: bool,
+        code_name: Option<&str>,
+        deferred: bool,
+    ) {
+        let source = namespace.strip_prefix("mcp__").map_or_else(
+            || json!({"kind":"harness"}),
+            |server| json!({"kind":"mcp", "server_name":server}),
+        );
+        let entry = result
+            .entry(namespace.to_owned())
+            .or_insert_with(|| json!({"name":namespace,"functions":{}}));
+        let function = &mut entry["functions"][name];
+        if function.is_null() {
+            *function = json!({"name":name,"direct":direct,"code_mode_name":code_name,"deferred":deferred,"source":source});
+        } else {
+            if direct {
+                function["direct"] = json!(true);
+            }
+            if let Some(code_name) = code_name {
+                function["code_mode_name"] = json!(code_name);
+            }
+        }
+    }
+    fn direct(
+        result: &mut BTreeMap<String, serde_json::Value>,
+        namespace: &str,
+        definition: &ToolDefinition,
+    ) {
+        match definition {
+            ToolDefinition::Namespace { name, tools, .. } => {
+                for tool in tools {
+                    direct(result, name, tool);
+                }
+            }
+            ToolDefinition::Function {
+                name,
+                defer_loading,
+                ..
+            }
+            | ToolDefinition::Custom {
+                name,
+                defer_loading,
+                ..
+            } => insert(
+                result,
+                namespace,
+                name,
+                true,
+                None,
+                defer_loading.unwrap_or(false),
+            ),
+            ToolDefinition::ToolSearch { .. } => {
+                insert(result, "tool_search", "tool_search_tool", true, None, false)
+            }
+        }
+    }
+    let mut result = BTreeMap::new();
+    for item in profile.prefix() {
+        if let ResponseItem::AdditionalTools { tools, .. } = item {
+            for tool in tools {
+                direct(&mut result, "functions", tool);
+            }
+        }
+    }
+    for (identifier, tool) in profile.code_mode_tool_names.iter() {
+        insert(
+            &mut result,
+            tool.namespace.as_deref().unwrap_or("functions"),
+            &tool.name,
+            false,
+            Some(identifier),
+            false,
+        );
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ContentItem, MessageRole, Model, ReasoningMode, Thinking};
+    use crate::{ContentItem, ImageDetail, MessageRole, Model, ReasoningMode, Thinking};
     use serde_json::json;
+
+    #[test]
+    fn tool_turn_identity_matches_provider_metadata() {
+        let config = ModelConfig {
+            auth: crate::OpenAiAuth::api_key("test-key"),
+            responses_transport: crate::ResponsesTransport::Https,
+            ..ModelConfig::default()
+        };
+        let profile = RequestProfile::new("session", "cache", Arc::from([]))
+            .with_thread_id("branch")
+            .with_logical_turn(7);
+        assert_eq!(profile.turn_id(), "branch:7");
+        let request = serde_json::to_value(ResponseCreate::warmup(
+            &config,
+            Model::Sol,
+            Thinking::Low,
+            false,
+            &profile,
+            None,
+        ))
+        .unwrap();
+        let metadata: serde_json::Value = serde_json::from_str(
+            request["client_metadata"]["x-codex-turn-metadata"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata["turn_id"], profile.turn_id());
+        assert_eq!(profile.clone().with_logical_turn(8).turn_id(), "branch:8");
+        assert_eq!(profile.turn_id(), "branch:7");
+    }
 
     #[test]
     fn prompt_cache_key_is_stable_across_the_session() {
@@ -721,20 +983,22 @@ mod tests {
                 text: "system prompt".into(),
             }],
         )]);
-        let profile = RequestProfile::new("branch-a", "lineage-a", prefix);
+        let profile =
+            RequestProfile::new("session-a", "lineage-a", prefix).with_thread_id("branch-a");
         let request =
             ResponseCreate::warmup(&config, Model::Sol, Thinking::Low, false, &profile, None);
         let request = serde_json::to_value(request).expect("request should serialize");
 
         assert_eq!(request["prompt_cache_key"], json!("lineage-a"));
-        assert_eq!(request["client_metadata"]["session_id"], json!("branch-a"));
+        assert_eq!(request["client_metadata"]["session_id"], json!("session-a"));
         assert_eq!(request["client_metadata"]["thread_id"], json!("branch-a"));
         assert_eq!(request["store"], false);
         assert_eq!(request["generate"], false);
+        assert!(request["text"].get("format").is_none());
         assert_eq!(request["parallel_tool_calls"], false);
         assert!(request.get("tools").is_none());
         assert!(request.get("instructions").is_none());
-        assert_eq!(request["reasoning"]["summary"], json!("auto"));
+        assert!(request["reasoning"].get("summary").is_none());
         assert!(request["reasoning"].get("mode").is_none());
         assert!(request.get("context_management").is_none());
     }
@@ -769,13 +1033,15 @@ mod tests {
             .expect("turn metadata should be encoded as JSON");
 
         assert_eq!(
-            metadata["code_mode_tool_names"]["exec_command"],
-            json!({"name": "exec_command", "namespace": null})
+            metadata["tool_namespaces_info"]["functions"]["functions"]["exec_command"],
+            json!({"name": "exec_command", "direct": false, "code_mode_name": "exec_command", "deferred": false, "source": {"kind":"harness"}})
         );
         assert_eq!(
-            metadata["code_mode_tool_names"]["mcp__calendar__lookup"],
-            json!({"name": "lookup", "namespace": "mcp__calendar"})
+            metadata["tool_namespaces_info"]["mcp__calendar"]["functions"]["lookup"],
+            json!({"name": "lookup", "direct": false, "code_mode_name": "mcp__calendar__lookup", "deferred": false, "source": {"kind":"mcp", "server_name":"calendar"}})
         );
+        assert!(metadata.get("code_mode_tool_names").is_none());
+        assert_eq!(metadata["request_kind"], "prewarm");
         assert!(
             request["client_metadata"]
                 .get("ws_request_header_x_openai_internal_codex_responses_lite")
@@ -863,16 +1129,63 @@ mod tests {
     }
 
     #[test]
-    fn thinking_defaults_to_high() {
-        assert_eq!(ModelConfig::default().thinking, Thinking::High);
+    fn responses_lite_strips_image_detail_without_mutating_history() {
+        let image = ContentItem::input_image_with_detail(
+            "data:image/png;base64,YQ==",
+            ImageDetail::Original,
+        );
+        let history = ResponseHistory::new(vec![ResponseItem::message(MessageRole::User, [image])]);
+        let config = ModelConfig::default();
+        let profile = RequestProfile::new("image-agent", "image-lineage", Arc::from([]));
+
+        for model in [Model::Sol, Model::Luna, Model::Astra] {
+            let request = serde_json::to_value(ResponseCreate::generation_with_policy(
+                &config,
+                CreatePolicy::new(
+                    config.responses_transport,
+                    model,
+                    model.default_thinking(),
+                    false,
+                ),
+                ResponsesInput::history(&[], &history, None),
+                None,
+                &profile,
+                None,
+            ))
+            .expect("request should serialize");
+            assert!(request["input"][0]["content"][0].get("detail").is_none());
+        }
+
+        let provider_request = serde_json::to_value(ResponseCreate::generation_with_policy(
+            &config,
+            CreatePolicy::new(
+                config.responses_transport,
+                Model::Glm53,
+                Thinking::Medium,
+                false,
+            ),
+            ResponsesInput::history(&[], &history, None),
+            None,
+            &profile,
+            None,
+        ))
+        .expect("request should serialize");
+        assert_eq!(
+            provider_request["input"][0]["content"][0]["detail"],
+            "original"
+        );
+
+        let retained = serde_json::to_value(history.iter().next().unwrap()).unwrap();
+        assert_eq!(retained["content"][0]["detail"], "original");
     }
 
     #[test]
     fn supported_models_serialize_as_selected() {
         for (model, expected) in [
-            (Model::Sol, "gpt-5.6-sol"),
-            (Model::Terra, "gpt-5.6-terra"),
-            (Model::Luna, "gpt-5.6-luna"),
+            (Model::Sol, "gpt-6.1-sol"),
+            (Model::Luna, "gpt-6-luna"),
+            (Model::Astra, "gpt-6-astra"),
+            (Model::Glm53, "@cf/zai-org/glm-5.3"),
         ] {
             let config = ModelConfig::default();
             let profile = RequestProfile::new("model-agent", "model-lineage", Arc::from([]));
@@ -899,7 +1212,7 @@ mod tests {
         let profile = RequestProfile::new("gateway-agent", "gateway-lineage", Arc::from([]));
         let request = serde_json::to_value(ResponseCreate::warmup(
             &config,
-            Model::Terra,
+            Model::Sol,
             Thinking::Medium,
             false,
             &profile,
@@ -907,7 +1220,44 @@ mod tests {
         ))
         .expect("request should serialize");
 
-        assert_eq!(request["model"], json!("openai/gpt-5.6-terra"));
+        assert_eq!(request["model"], json!("openai/gpt-6.1-sol"));
+    }
+
+    #[test]
+    fn retained_requests_keep_provider_settings_on_a_new_transport() {
+        let config = ModelConfig {
+            model_id_prefix: Some(Arc::from("updated")),
+            responses_transport: crate::ResponsesTransport::Https,
+            ..ModelConfig::default()
+        };
+        let profile = RequestProfile::new("current-session", "current-cache", Arc::from([]))
+            .with_request_content(
+                "original-cache".to_owned(),
+                Arc::from([]),
+                Some("original".to_owned()),
+                ReasoningMode::Pro,
+                true,
+            );
+        let request = serde_json::to_value(ResponseCreate::warmup(
+            &config,
+            Model::Sol,
+            Thinking::Max,
+            true,
+            &profile,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(request["model"], "original/gpt-6.1-sol");
+        assert_eq!(request["reasoning"]["mode"], "pro");
+        assert_eq!(request["reasoning"]["effort"], "max");
+        assert_eq!(request["service_tier"], "priority");
+        assert_eq!(request["store"], true);
+        assert_eq!(request["prompt_cache_key"], "original-cache");
+        assert_eq!(request["client_metadata"]["session_id"], "current-session");
+        assert!(
+            request.get("type").is_none(),
+            "transport belongs to the current owner"
+        );
     }
 
     #[test]
@@ -921,7 +1271,6 @@ mod tests {
         let profile = RequestProfile::new("pro-agent", "pro-lineage", prefix);
 
         for (thinking, expected) in [
-            (Thinking::None, "none"),
             (Thinking::Low, "low"),
             (Thinking::Medium, "medium"),
             (Thinking::High, "high"),
@@ -951,13 +1300,29 @@ mod tests {
     }
 
     #[test]
-    fn response_storage_support_tracks_auth_mode() {
-        assert!(crate::OpenAiAuthMode::ApiKey.supports_stored_responses());
-        assert!(!crate::OpenAiAuthMode::ChatGpt.supports_stored_responses());
+    fn astra_omits_reasoning_mode_and_default_summary() {
+        let config = ModelConfig {
+            reasoning_mode: ReasoningMode::Pro,
+            ..ModelConfig::default()
+        };
+        let profile = RequestProfile::new("astra-agent", "astra-lineage", Arc::from([]));
+        let request = serde_json::to_value(ResponseCreate::warmup(
+            &config,
+            Model::Astra,
+            Thinking::Max,
+            false,
+            &profile,
+            None,
+        ))
+        .expect("request should serialize");
+
+        assert!(request["reasoning"].get("mode").is_none());
+        assert!(request["reasoning"].get("summary").is_none());
+        assert_eq!(request["reasoning"]["effort"], json!("max"));
     }
 
     #[test]
-    fn fast_mode_selects_priority_service_tier() {
+    fn fast_mode_selects_the_codex_compatible_service_tier() {
         let config = ModelConfig::default();
         let profile = RequestProfile::new("fast-agent", "fast-lineage", Arc::from([]));
         let standard = serde_json::to_value(ResponseCreate::warmup(
@@ -978,40 +1343,19 @@ mod tests {
             None,
         ))
         .expect("fast request should serialize");
-
-        assert!(standard.get("service_tier").is_none());
+        assert_eq!(standard["service_tier"], json!("default"));
         assert_eq!(fast["service_tier"], json!("priority"));
-    }
 
-    #[test]
-    fn committed_history_is_shared_and_iterates_oldest_first() {
-        let mut history = ResponseHistory::new(vec![ResponseItem::message(
-            MessageRole::User,
-            [ContentItem::InputText { text: "one".into() }],
-        )]);
-        history.commit_tail();
-        let first_head = Arc::clone(history.committed_head().unwrap());
-        history.push(ResponseItem::message(
-            MessageRole::Assistant,
-            [ContentItem::OutputText {
-                text: "two".into(),
-                annotations: None,
-                logprobs: None,
-            }],
-        ));
-        history.commit_tail();
-        let fork = history.clone();
-
-        assert_eq!(history.len(), 2);
-        assert!(Arc::ptr_eq(
-            history.committed_head().unwrap().previous.as_ref().unwrap(),
-            &first_head
-        ));
-        assert!(Arc::ptr_eq(
-            history.committed_head().unwrap(),
-            fork.committed_head().unwrap()
-        ));
-        assert_eq!(history.iter().count(), 2);
+        let astra_standard = serde_json::to_value(ResponseCreate::warmup(
+            &config,
+            Model::Astra,
+            Thinking::Medium,
+            false,
+            &profile,
+            None,
+        ))
+        .expect("Astra standard request should serialize");
+        assert_eq!(astra_standard["service_tier"], json!("default"));
     }
 
     #[test]

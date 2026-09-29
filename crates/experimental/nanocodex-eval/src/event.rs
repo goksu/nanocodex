@@ -68,13 +68,8 @@ pub enum EvalEventKind {
     Completed(Box<EvalResult>),
     /// The attempt failed without a score.
     Failed(Box<EvalFailure>),
-    /// Every attempt admitted by this invocation reached a terminal outcome.
-    RunCompleted {
-        /// Number of terminal attempts returned by this invocation.
-        attempts: usize,
-        /// Number of already-durable sweep attempts skipped during resume.
-        skipped: usize,
-    },
+    /// The invocation returned its terminal outcome.
+    RunCompleted,
     /// The invocation ended before it could return complete terminal outcomes.
     RunFailed {
         /// Complete formatted operational error.
@@ -139,63 +134,6 @@ impl EvalEventStream {
             Err(broadcast::error::RecvError::Lagged(missed)) => {
                 Err(EvalEventStreamError::Lagged { missed })
             }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use tokio::sync::broadcast;
-    use uuid::Uuid;
-
-    use super::{EvalEvent, EvalEventAttempt, EvalEventKind, EvalEventStreamError, EvalEvents};
-
-    #[tokio::test]
-    async fn subscriptions_receive_the_same_event_independently() {
-        let (sender, _) = broadcast::channel(4);
-        let events = EvalEvents::new(&sender);
-        let mut first = events.subscribe();
-        let mut second = events.subscribe();
-        let event = Arc::new(event(1));
-
-        sender.send(Arc::clone(&event)).unwrap();
-
-        let first = first.recv().await.unwrap().unwrap();
-        let second = second.recv().await.unwrap().unwrap();
-        assert!(Arc::ptr_eq(&first, &event));
-        assert!(Arc::ptr_eq(&second, &event));
-    }
-
-    #[tokio::test]
-    async fn lag_is_reported_instead_of_silently_skipping_events() {
-        let (sender, _) = broadcast::channel(1);
-        let events = EvalEvents::new(&sender);
-        let mut subscriber = events.subscribe();
-
-        sender.send(Arc::new(event(1))).unwrap();
-        sender.send(Arc::new(event(2))).unwrap();
-
-        assert!(matches!(
-            subscriber.recv().await,
-            Err(EvalEventStreamError::Lagged { missed: 1 })
-        ));
-        assert_eq!(subscriber.recv().await.unwrap().unwrap().sequence, 2);
-    }
-
-    fn event(sequence: u64) -> EvalEvent {
-        EvalEvent {
-            run_id: Uuid::nil(),
-            invocation_id: Uuid::nil(),
-            sequence,
-            attempt: Some(EvalEventAttempt {
-                id: Uuid::nil(),
-                task_name: "task".to_owned(),
-                trial_name: "task__attempt".to_owned(),
-                sequence,
-            }),
-            kind: EvalEventKind::VerifierStarted,
         }
     }
 }

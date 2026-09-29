@@ -5,7 +5,7 @@ use crate::{
     ResponseItemId, monotonic_now_ns,
     responses::{ServerEvent, Usage},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use web_time::Instant;
 
 use crate::{
@@ -16,12 +16,14 @@ use crate::{
     telemetry::{ApiEvent, elapsed_ns},
 };
 
-const INVALID_IMAGE_ERROR: &str = "The image data you provided does not represent a valid image";
-
 /// Complete provider output from one `response.create` operation.
+#[derive(Deserialize, Serialize)]
 pub struct GenerationOutput {
     /// Provider response ID retained privately by a managed session.
     pub id: String,
+    /// Provider-reported model identifier when present in the completion event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_model: Option<String>,
     /// Provider terminal status.
     pub status: String,
     /// Whether the model affirmatively ended the logical turn.
@@ -61,7 +63,7 @@ pub struct CompactionOutput {
 }
 
 /// Work and latency counters for one complete streamed response.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Deserialize, Serialize)]
 pub struct ResponsePipelineStats {
     /// Provider events received.
     pub event_count: u64,
@@ -94,6 +96,7 @@ pub struct ResponsePipelineStats {
 }
 
 /// Completed callable output derived from a response item.
+#[derive(Clone, Deserialize, Serialize)]
 pub struct CodeCall {
     /// Provider call identity.
     pub call_id: String,
@@ -108,7 +111,8 @@ pub struct CodeCall {
 }
 
 /// Wire-level representation used by a completed callable output.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CodeCallKind {
     /// Custom tool call with free-form input.
     Custom,
@@ -220,16 +224,12 @@ struct ReceivedServerEvent {
 }
 
 pub(crate) trait ResponseEventSource {
-    async fn next_text_or_idle_timeout(
-        &mut self,
-    ) -> Result<crate::socket::ReceivedText, ResponsesError>;
+    async fn next_text(&mut self) -> Result<crate::socket::ReceivedText, ResponsesError>;
 }
 
 impl ResponseEventSource for ResponsesSocket {
-    async fn next_text_or_idle_timeout(
-        &mut self,
-    ) -> Result<crate::socket::ReceivedText, ResponsesError> {
-        Self::next_text_or_idle_timeout(self).await
+    async fn next_text(&mut self) -> Result<crate::socket::ReceivedText, ResponsesError> {
+        Self::next_text(self).await
     }
 }
 
@@ -245,6 +245,7 @@ where
 {
     let mut done_items = Vec::with_capacity(2);
     let mut assistant_items = HashMap::new();
+    let item_namespace = uuid::Uuid::new_v4();
     let mut timing = StreamTiming::new(started_at);
 
     loop {
@@ -258,10 +259,19 @@ where
         )
         .await?;
         match received.event {
-            ServerEvent::OutputItemAdded { output_index, item } => {
+            ServerEvent::OutputItemAdded {
+                output_index,
+                mut item,
+            } => {
                 let Some(output_index) = output_index else {
                     continue;
                 };
+                normalize_stream_item(
+                    &mut item,
+                    output_index,
+                    &item_namespace,
+                    &mut assistant_items,
+                );
                 let ResponseItem::Message {
                     id,
                     role: MessageRole::Assistant,
@@ -277,15 +287,24 @@ where
                 output_index,
                 delta,
             } => {
-                let item = output_index.and_then(|index| assistant_items.get(&index));
+                let index = output_index.unwrap_or(0);
+                let item = &*assistant_items
+                    .entry(index)
+                    .or_insert_with(|| AssistantStreamItem {
+                        item_id: Some(ResponseItemId::with_suffix(
+                            "msg",
+                            uuid::Uuid::new_v5(&item_namespace, &index.to_be_bytes()),
+                        )),
+                        phase: None,
+                    });
                 emit_display_delta(
                     &observer.events,
                     &mut timing,
                     AgentEventKind::AssistantDelta,
                     AssistantTextDelta {
                         model_call_index: call_index,
-                        item_id: item.and_then(|item| item.item_id.as_deref()),
-                        phase: item.and_then(|item| item.phase),
+                        item_id: item.item_id.as_deref(),
+                        phase: item.phase,
                         text: &delta,
                     },
                     received.received_ns,
@@ -293,8 +312,11 @@ where
                     delta.len(),
                 )?;
             }
+            // Chat-compatible providers expose visible reasoning as content
+            // deltas. Feed the same live display channel as Responses summaries.
             ServerEvent::ReasoningSummaryTextDelta { delta, .. }
-            | ServerEvent::ReasoningSummaryDelta { delta, .. } => {
+            | ServerEvent::ReasoningSummaryDelta { delta, .. }
+            | ServerEvent::ReasoningContentDelta { delta, .. } => {
                 emit_display_delta(
                     &observer.events,
                     &mut timing,
@@ -308,20 +330,45 @@ where
                     delta.len(),
                 )?;
             }
-            ServerEvent::OutputItemDone { item } => {
+            ServerEvent::OutputItemDone {
+                output_index,
+                mut item,
+            } => {
+                normalize_stream_item(
+                    &mut item,
+                    output_index.unwrap_or(done_items.len() as u32),
+                    &item_namespace,
+                    &mut assistant_items,
+                );
                 emit_assistant_message(&observer.events, call_index, &item)?;
                 done_items.push(item);
             }
             ServerEvent::Completed { mut response } => {
-                let output_items = if response.output.is_empty() {
+                let emitted_ids = done_items
+                    .iter()
+                    .filter_map(|item| item.id().cloned())
+                    .collect::<std::collections::HashSet<_>>();
+                let mut output_items = if response.output.is_empty() {
                     done_items
                 } else {
                     std::mem::take(&mut response.output)
                 };
+                for (index, item) in output_items.iter_mut().enumerate() {
+                    normalize_stream_item(
+                        item,
+                        index as u32,
+                        &item_namespace,
+                        &mut assistant_items,
+                    );
+                    if item.id().is_some_and(|id| !emitted_ids.contains(id)) {
+                        emit_assistant_message(&observer.events, call_index, item)?;
+                    }
+                }
                 let code_calls = code_calls(&output_items);
                 let final_message = final_message(&output_items);
                 return Ok(GenerationOutput {
                     id: response.id,
+                    reported_model: response.model,
                     status: response.status,
                     end_turn: response.end_turn,
                     final_message,
@@ -361,6 +408,37 @@ fn emit_display_delta<P: Serialize>(
         "Responses display delta entered the agent event stream"
     );
     Ok(())
+}
+
+fn normalize_stream_item(
+    item: &mut ResponseItem,
+    index: u32,
+    namespace: &uuid::Uuid,
+    known: &mut HashMap<u32, AssistantStreamItem>,
+) {
+    if let ResponseItem::Message {
+        id,
+        role: MessageRole::Assistant,
+        phase,
+        ..
+    } = item
+    {
+        let stream = known.entry(index).or_insert_with(|| AssistantStreamItem {
+            item_id: id.clone().or_else(|| {
+                Some(ResponseItemId::with_suffix(
+                    "msg",
+                    uuid::Uuid::new_v5(namespace, &index.to_be_bytes()),
+                ))
+            }),
+            phase: *phase,
+        });
+        *id = stream.item_id.clone();
+        if phase.is_some() {
+            stream.phase = *phase;
+        } else {
+            *phase = stream.phase;
+        }
+    }
 }
 
 fn emit_assistant_message(
@@ -414,14 +492,11 @@ where
         )
         .await?;
         match received.event {
-            ServerEvent::OutputItemDone { item } => done_items.push(item),
-            ServerEvent::Completed { mut response } => {
-                let output_items = if response.output.is_empty() {
-                    done_items
-                } else {
-                    std::mem::take(&mut response.output)
-                };
-                let mut compactions = output_items
+            ServerEvent::OutputItemDone { item, .. } => done_items.push(item),
+            ServerEvent::Completed { response } => {
+                // Pinned Codex counts streamed output_item.done compactions only.
+                // The completion envelope must not replace or manufacture them.
+                let mut compactions = done_items
                     .into_iter()
                     .filter(|item| matches!(item, ResponseItem::Compaction { .. }));
                 let item = compactions.next();
@@ -459,7 +534,7 @@ where
     S: ResponseEventSource,
 {
     let receive_started_at = Instant::now();
-    let received = source.next_text_or_idle_timeout().await?;
+    let received = source.next_text().await?;
     timing.pipeline.receive_wait_duration_ns = timing
         .pipeline
         .receive_wait_duration_ns
@@ -523,6 +598,7 @@ where
         ServerEvent::OutputTextDelta { .. }
             | ServerEvent::ReasoningSummaryTextDelta { .. }
             | ServerEvent::ReasoningSummaryDelta { .. }
+            | ServerEvent::ReasoningContentDelta { .. }
             | ServerEvent::OutputItemAdded { .. }
             | ServerEvent::OutputItemDone { .. }
     ) {
@@ -532,12 +608,6 @@ where
         event,
         ServerEvent::Error | ServerEvent::Failed | ServerEvent::Incomplete
     ) {
-        if raw_event.get().contains(INVALID_IMAGE_ERROR) {
-            return Err(ResponsesError::InvalidImageRequest {
-                event: raw_event.get().to_owned(),
-            }
-            .into());
-        }
         return Err(ResponsesError::api_event(raw_event.get().to_owned()).into());
     }
     Ok(ReceivedServerEvent {
@@ -636,6 +706,38 @@ mod tests {
         CodeCallKind, ContentItem, MessageRole, ResponseItem, StreamTiming, code_calls,
         final_message,
     };
+
+    #[test]
+    fn missing_provider_ids_are_stable_through_final_history_and_unique_per_attempt() {
+        let namespace = uuid::Uuid::new_v4();
+        let mut known = std::collections::HashMap::new();
+        let mut added = ResponseItem::message(MessageRole::Assistant, []);
+        super::normalize_stream_item(&mut added, 0, &namespace, &mut known);
+        let id = known[&0].item_id.clone();
+        assert!(id.is_some());
+        let mut done =
+            ResponseItem::message(MessageRole::Assistant, [ContentItem::output_text("answer")]);
+        super::normalize_stream_item(&mut done, 0, &namespace, &mut known);
+        assert_eq!(
+            serde_json::to_value(&done).unwrap()["id"],
+            serde_json::to_value(&added).unwrap()["id"]
+        );
+        let mut history =
+            ResponseItem::message(MessageRole::Assistant, [ContentItem::output_text("answer")]);
+        super::normalize_stream_item(&mut history, 0, &namespace, &mut known);
+        assert_eq!(
+            serde_json::to_value(&history).unwrap()["id"],
+            serde_json::to_value(&done).unwrap()["id"]
+        );
+        let mut retry = std::collections::HashMap::new();
+        super::normalize_stream_item(
+            &mut ResponseItem::message(MessageRole::Assistant, []),
+            0,
+            &uuid::Uuid::new_v4(),
+            &mut retry,
+        );
+        assert_ne!(id, retry[&0].item_id);
+    }
 
     #[test]
     fn display_delta_cadence_records_gaps_and_stalls() {

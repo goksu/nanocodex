@@ -12,12 +12,11 @@ compile_error!(
 #[cfg(feature = "client")]
 pub mod auth;
 /// Complete typed lifecycle events emitted around Responses operations.
-#[cfg(feature = "client")]
+#[cfg(feature = "events")]
 pub mod events;
 #[cfg(feature = "client")]
 mod openai;
 /// Automatic model-specific USD estimates from provider token usage.
-#[cfg(feature = "client")]
 pub mod pricing;
 /// Bidirectional GPT Realtime audio sessions and typed conversation events.
 #[cfg(all(feature = "realtime", not(target_family = "wasm")))]
@@ -28,6 +27,10 @@ pub mod pricing;
 pub mod realtime;
 /// Complete typed request, event, and item model for the Responses protocol.
 pub mod responses;
+/// Shared, bounded caching of the native system trust store for TLS clients.
+#[cfg(all(feature = "native-tls", not(target_family = "wasm")))]
+pub mod tls;
+
 /// Managed session identities, inputs, and compaction results.
 #[cfg(feature = "client")]
 pub mod session;
@@ -49,10 +52,7 @@ pub(crate) use auth::{OpenAiAuth, OpenAiAuthError, OpenAiAuthMode, OpenAiAuthSna
 #[cfg(feature = "client")]
 pub(crate) use events::stream::EventSink;
 #[cfg(feature = "client")]
-pub(crate) use events::{
-    AgentEventData, AgentEventKind, AssistantEvent, ContextEvent, EventError, ModelEvent,
-    ReasoningEvent, RunEvent, ToolEvent, TransportEvent, monotonic_now_ns,
-};
+pub(crate) use events::{AgentEventKind, EventError, monotonic_now_ns};
 #[cfg(feature = "client")]
 pub(crate) use openai::ModelConfig;
 #[cfg(feature = "client")]
@@ -72,8 +72,6 @@ pub use session::{
     SessionBuildError, SessionBuilder,
 };
 #[cfg(feature = "client")]
-pub(crate) use tools::ToolOutputBody;
-#[cfg(feature = "client")]
 pub(crate) use tower::attempt::{
     ResponsesAttempt, ResponsesAttemptFactory, ResponsesOutput, ResponsesServiceResponse,
     TransportStats,
@@ -92,7 +90,9 @@ pub(crate) use transport::{ResponsesError, ResponsesHistory, ResponsesTransport,
 #[cfg(feature = "client")]
 pub(crate) use tower::{attempt, middleware, service, service_error, stream};
 #[cfg(all(feature = "client", not(target_family = "wasm")))]
-pub(crate) use transport::{connector, http};
+pub(crate) use transport::connector;
+#[cfg(feature = "client")]
+pub(crate) use transport::http;
 #[cfg(feature = "client")]
 pub(crate) use transport::{socket, telemetry};
 
@@ -111,7 +111,9 @@ pub mod __private {
             CallerServiceFactory, LayeredServiceFactory, ModelConfig, ResponsesServiceFactory,
         },
         session::{
-            context::{ContextManager, assign_missing_response_item_id},
+            context::{
+                ContextManager, assign_missing_response_item_id, responses_lite_request_prefix,
+            },
             state::{ManagedSessionState, ManagedSessionStateError},
         },
         tower::attempt::ResponsesAttemptFactory,
@@ -143,30 +145,89 @@ pub mod __private {
 }
 
 /// The default Responses model used by this SDK.
-pub const MODEL: &str = Model::Sol.as_str();
+pub const MODEL: &str = Model::Astra.as_str();
 
-/// Supported models in the GPT-5.6 coding-model family.
+/// Supported coding models.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum Model {
-    /// GPT-5.6 Sol.
-    #[default]
+    /// GPT-6.1 Sol.
     Sol,
-    /// GPT-5.6 Terra.
-    Terra,
-    /// GPT-5.6 Luna.
+    /// GPT-6 Luna.
     Luna,
+    /// GPT-6 Astra.
+    #[default]
+    Astra,
+    /// Z.ai GLM-5.3 served by Cloudflare Workers AI.
+    #[serde(rename = "glm-5.3")]
+    Glm53,
+    /// Moonshot Kimi K3 through a host-managed gateway.
+    #[serde(rename = "kimi-k3", alias = "kimi")]
+    Kimi,
+    /// Xiaomi MiMo V2.6 Pro through a host-managed gateway.
+    #[serde(rename = "mimo-v2.6-pro", alias = "mimo")]
+    Mimo,
 }
 
 impl Model {
+    /// Supported model catalog in picker order.
+    pub const ALL: [Self; 3] = [Self::Astra, Self::Sol, Self::Luna];
+
+    /// Default reasoning effort from the pinned Codex model catalog.
+    #[must_use]
+    pub const fn default_thinking(self) -> Thinking {
+        match self {
+            Self::Astra | Self::Sol | Self::Glm53 | Self::Kimi | Self::Mimo => Thinking::Low,
+            Self::Luna => Thinking::Medium,
+        }
+    }
     /// Returns the Responses API model identifier.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Sol => "gpt-5.6-sol",
-            Self::Terra => "gpt-5.6-terra",
-            Self::Luna => "gpt-5.6-luna",
+            Self::Sol => "gpt-6.1-sol",
+            Self::Luna => "gpt-6-luna",
+            Self::Astra => "gpt-6-astra",
+            Self::Glm53 => "@cf/zai-org/glm-5.3",
+            Self::Kimi => "kimi-k3",
+            Self::Mimo => "mimo-v2.6-pro",
+        }
+    }
+
+    /// Returns whether the model accepts the requested reasoning effort.
+    #[must_use]
+    pub const fn supports_thinking(self, thinking: Thinking) -> bool {
+        match self {
+            Self::Kimi => matches!(thinking, Thinking::Low | Thinking::High),
+            Self::Glm53 | Self::Mimo => {
+                matches!(thinking, Thinking::Low | Thinking::Medium | Thinking::High)
+            }
+            Self::Luna => true,
+            Self::Astra | Self::Sol => !matches!(thinking, Thinking::None),
+        }
+    }
+
+    /// Returns whether the model accepts the requested reasoning execution mode.
+    #[must_use]
+    pub const fn supports_reasoning_mode(self, mode: ReasoningMode) -> bool {
+        !matches!(
+            (self, mode),
+            (
+                Self::Astra | Self::Glm53 | Self::Kimi | Self::Mimo,
+                ReasoningMode::Pro
+            )
+        )
+    }
+
+    /// Largest Codex-compatible prompt context for this model.
+    #[must_use]
+    pub const fn max_context_window_tokens(self) -> u64 {
+        match self {
+            Self::Glm53 => 1_310_720,
+            Self::Kimi => 1_000_000,
+            Self::Mimo => 1_048_576,
+            _ => MAX_CONTEXT_WINDOW_TOKENS,
         }
     }
 }
@@ -182,18 +243,26 @@ impl FromStr for Model {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
-            "gpt-5.6-sol" | "sol" => Ok(Self::Sol),
-            "gpt-5.6-terra" | "terra" => Ok(Self::Terra),
-            "gpt-5.6-luna" | "luna" => Ok(Self::Luna),
+            "gpt-6.1-sol" | "sol" => Ok(Self::Sol),
+            "gpt-6-luna" | "luna" => Ok(Self::Luna),
+            "gpt-6-astra" | "astra" => Ok(Self::Astra),
+            "@cf/zai-org/glm-5.3" | "glm-5.3" | "glm53" => Ok(Self::Glm53),
+            "kimi-k3" | "kimi" => Ok(Self::Kimi),
+            "mimo-v2.6-pro" | "mimo" => Ok(Self::Mimo),
             _ => Err(format!(
-                "invalid model {value:?}; expected gpt-5.6-sol, gpt-5.6-terra, or gpt-5.6-luna"
+                "invalid model {value:?}; expected gpt-6-astra, gpt-6.1-sol, gpt-6-luna, @cf/zai-org/glm-5.3, kimi-k3, or mimo-v2.6-pro"
             )),
         }
     }
 }
 
-/// Prompt-token budget used by automatic compaction to avoid long-context pricing.
+/// Default GPT-6 context window used for accounting and automatic compaction.
 pub const CONTEXT_WINDOW_TOKENS: u64 = 272_000;
+/// Largest Codex-compatible prompt context currently accepted by supported models.
+///
+/// This intentionally follows the current Codex model catalog rather than the
+/// Responses API's larger advertised total context window.
+pub const MAX_CONTEXT_WINDOW_TOKENS: u64 = 872_000;
 
 /// User input for one agent turn.
 ///
@@ -222,6 +291,12 @@ pub const CONTEXT_WINDOW_TOKENS: u64 = 272_000;
 pub struct Prompt {
     /// Ordered text and multimodal content for this turn.
     pub instruction: PromptInput,
+    /// Synthetic text-only conversation supplied before this turn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    transcript: Vec<PromptMessage>,
+    /// Runtime-owned revision; never part of model-visible prompt content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    instruction_revision: Option<u64>,
 }
 
 impl Prompt {
@@ -230,6 +305,8 @@ impl Prompt {
     pub fn new(instruction: impl Into<String>) -> Self {
         Self {
             instruction: PromptInput::Text(instruction.into()),
+            transcript: Vec::new(),
+            instruction_revision: None,
         }
     }
 
@@ -238,8 +315,157 @@ impl Prompt {
     pub fn content(input: impl IntoIterator<Item = UserInput>) -> Self {
         Self {
             instruction: PromptInput::Content(input.into_iter().collect()),
+            transcript: Vec::new(),
+            instruction_revision: None,
         }
     }
+
+    /// Attaches the trusted runtime instruction revision to this input.
+    #[must_use]
+    pub const fn with_instruction_revision(mut self, revision: u64) -> Self {
+        self.instruction_revision = Some(revision);
+        self
+    }
+
+    /// Returns the runtime-owned instruction revision, outside model-visible text.
+    #[must_use]
+    pub const fn instruction_revision(&self) -> Option<u64> {
+        self.instruction_revision
+    }
+
+    /// Prepends an explicit text-only conversation to this turn.
+    ///
+    /// This is intended for synthetic conversation benchmarks. Normal
+    /// follow-on turns should continue to rely on the agent's retained
+    /// session history.
+    #[must_use]
+    pub fn with_transcript(mut self, messages: impl IntoIterator<Item = PromptMessage>) -> Self {
+        self.transcript = messages.into_iter().collect();
+        self
+    }
+
+    /// Returns the synthetic conversation preceding this turn.
+    #[must_use]
+    pub fn transcript(&self) -> &[PromptMessage] {
+        &self.transcript
+    }
+
+    /// Returns the total UTF-8 byte length of model-visible text.
+    #[must_use]
+    pub fn text_bytes(&self) -> usize {
+        self.transcript
+            .iter()
+            .map(PromptMessage::text_bytes)
+            .sum::<usize>()
+            .saturating_add(self.instruction.text_bytes())
+    }
+
+    /// Returns whether the turn instruction contains no usable content.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.instruction.is_empty()
+    }
+
+    /// Validates the instruction and synthetic transcript invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed failure for empty text or a transcript that does not
+    /// start with user input and end with assistant output before the final
+    /// user instruction. Consecutive messages with the same role are retained
+    /// because benchmark transcripts may contain them intentionally.
+    pub fn validate(&self) -> Result<(), PromptValidationError> {
+        if self.instruction.is_empty() {
+            return Err(PromptValidationError::EmptyInstruction);
+        }
+        if self.transcript.iter().any(PromptMessage::is_empty) {
+            return Err(PromptValidationError::EmptyTranscriptMessage);
+        }
+        if self
+            .transcript
+            .first()
+            .is_some_and(|message| message.role() != PromptMessageRole::User)
+            || self
+                .transcript
+                .last()
+                .is_some_and(|message| message.role() != PromptMessageRole::Assistant)
+        {
+            return Err(PromptValidationError::InvalidTranscriptEndpoints);
+        }
+        Ok(())
+    }
+}
+
+/// Invalid model-visible prompt content.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum PromptValidationError {
+    /// The final user instruction has no usable content.
+    #[error("prompt instruction must not be empty")]
+    EmptyInstruction,
+    /// One synthetic message has no usable content.
+    #[error("prompt transcript messages must not be empty")]
+    EmptyTranscriptMessage,
+    /// Synthetic messages do not begin with user input and end with assistant output.
+    #[error("prompt transcript must start with a user message and end with an assistant message")]
+    InvalidTranscriptEndpoints,
+}
+
+/// One text-only message in a synthetic prompt transcript.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PromptMessage {
+    role: PromptMessageRole,
+    content: String,
+}
+
+impl PromptMessage {
+    /// Creates a synthetic user message.
+    #[must_use]
+    pub fn user(content: impl Into<String>) -> Self {
+        Self {
+            role: PromptMessageRole::User,
+            content: content.into(),
+        }
+    }
+
+    /// Creates a synthetic assistant message.
+    #[must_use]
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self {
+            role: PromptMessageRole::Assistant,
+            content: content.into(),
+        }
+    }
+
+    /// Returns the message role.
+    #[must_use]
+    pub const fn role(&self) -> PromptMessageRole {
+        self.role
+    }
+
+    /// Returns the complete message text.
+    #[must_use]
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+
+    const fn text_bytes(&self) -> usize {
+        self.content.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.content.trim().is_empty()
+    }
+}
+
+/// Role of one message in a synthetic prompt transcript.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptMessageRole {
+    /// User-supplied text.
+    User,
+    /// Assistant text supplied by the benchmark.
+    Assistant,
 }
 
 impl From<String> for Prompt {
@@ -394,7 +620,7 @@ impl UserInput {
     }
 }
 
-/// Responses reasoning execution mode for the supported GPT-5.6 model family.
+/// Responses reasoning execution mode for the supported model family.
 ///
 /// Standard mode preserves the default request behavior. Pro mode performs
 /// additional model work before returning one final answer and can increase
@@ -448,16 +674,17 @@ impl FromStr for ReasoningMode {
 }
 
 /// Requested model reasoning effort.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Thinking {
     /// Disable reasoning when supported.
     None,
     /// Low reasoning effort.
+    #[default]
     Low,
     /// Medium reasoning effort.
     Medium,
     /// High reasoning effort.
-    #[default]
     High,
     /// Extra-high reasoning effort.
     Xhigh,
@@ -466,6 +693,16 @@ pub enum Thinking {
 }
 
 impl Thinking {
+    /// Supported effort values; filter through Model::supports_thinking.
+    pub const ALL: [Self; 6] = [
+        Self::None,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::Xhigh,
+        Self::Max,
+    ];
+
     /// Returns the request value used by the Responses API.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -508,43 +745,54 @@ impl FromStr for Thinking {
 mod tests {
     use serde_json::json;
 
-    use super::{Model, Prompt, ReasoningMode, Thinking};
+    use super::{Prompt, PromptMessage, PromptValidationError};
 
     #[test]
-    fn model_parses_short_and_api_names() {
-        assert_eq!("sol".parse(), Ok(Model::Sol));
-        assert_eq!("gpt-5.6-sol".parse(), Ok(Model::Sol));
-        assert_eq!("terra".parse(), Ok(Model::Terra));
-        assert_eq!("gpt-5.6-terra".parse(), Ok(Model::Terra));
-        assert_eq!("luna".parse(), Ok(Model::Luna));
-        assert_eq!("gpt-5.6-luna".parse(), Ok(Model::Luna));
-        assert_eq!(Model::default().as_str(), "gpt-5.6-sol");
-    }
+    fn synthetic_transcript_is_typed_serialized_and_counted() {
+        let prompt = Prompt::new("repeat the second answer").with_transcript([
+            PromptMessage::user("first request"),
+            PromptMessage::assistant("first answer"),
+            PromptMessage::user("second request"),
+            PromptMessage::assistant("second answer"),
+        ]);
 
-    #[test]
-    fn reasoning_configuration_parses_every_public_value() {
-        assert_eq!("standard".parse(), Ok(ReasoningMode::Standard));
-        assert_eq!("pro".parse(), Ok(ReasoningMode::Pro));
-
-        for (value, expected) in [
-            ("none", Thinking::None),
-            ("low", Thinking::Low),
-            ("medium", Thinking::Medium),
-            ("high", Thinking::High),
-            ("xhigh", Thinking::Xhigh),
-            ("max", Thinking::Max),
-        ] {
-            assert_eq!(value.parse(), Ok(expected));
-        }
-    }
-
-    #[test]
-    fn prompt_serialization_contains_only_user_input() {
-        let prompt = Prompt::new("inspect the repository");
+        assert_eq!(prompt.validate(), Ok(()));
+        assert_eq!(prompt.text_bytes(), 76);
         assert_eq!(
             serde_json::to_value(prompt).unwrap(),
-            json!({ "instruction": "inspect the repository" })
+            json!({
+                "instruction": "repeat the second answer",
+                "transcript": [
+                    {"role": "user", "content": "first request"},
+                    {"role": "assistant", "content": "first answer"},
+                    {"role": "user", "content": "second request"},
+                    {"role": "assistant", "content": "second answer"},
+                ]
+            })
         );
+    }
+
+    #[test]
+    fn synthetic_transcript_requires_user_and_assistant_endpoints() {
+        let prompt =
+            Prompt::new("continue").with_transcript([PromptMessage::user("unanswered request")]);
+
+        assert_eq!(
+            prompt.validate(),
+            Err(PromptValidationError::InvalidTranscriptEndpoints)
+        );
+    }
+
+    #[test]
+    fn synthetic_transcript_preserves_consecutive_same_role_messages() {
+        let prompt = Prompt::new("continue").with_transcript([
+            PromptMessage::user("benchmark preamble"),
+            PromptMessage::user("first request"),
+            PromptMessage::assistant("first answer"),
+        ]);
+
+        assert_eq!(prompt.validate(), Ok(()));
+        assert_eq!(prompt.transcript().len(), 3);
     }
 
     #[test]
@@ -555,5 +803,22 @@ mod tests {
         }))
         .unwrap_err();
         assert!(error.to_string().contains("unknown field `workspace`"));
+    }
+}
+
+#[cfg(test)]
+mod instruction_revision_tests {
+    use super::Prompt;
+
+    #[test]
+    fn instruction_revision_round_trips_as_private_metadata() {
+        let prompt = Prompt::new("hello").with_instruction_revision(17);
+        assert_eq!(prompt.text_bytes(), 5);
+        let encoded = serde_json::to_value(&prompt).unwrap();
+        assert_eq!(encoded["instruction"], "hello");
+        let restored: Prompt = serde_json::from_value(encoded).unwrap();
+        assert_eq!(restored.instruction_revision(), Some(17));
+        let legacy: Prompt = serde_json::from_str(r#"{"instruction":"hello"}"#).unwrap();
+        assert_eq!(legacy.instruction_revision(), None);
     }
 }

@@ -5,9 +5,9 @@ mod wire;
 #[cfg(test)]
 mod tests;
 
-pub use load::{DurableSession, RolloutTranscriptItem};
+pub use load::{DurableSession, RolloutSessionInfo, RolloutTranscriptItem};
 pub use store::RolloutInfo;
-pub(crate) use store::{RolloutOrigin, RolloutRecorder, RolloutTurn};
+pub(crate) use store::{RolloutCreate, RolloutOrigin, RolloutRecorder, RolloutTurn};
 
 use std::{
     fs::File,
@@ -37,10 +37,21 @@ use crate::{
 const COMMAND_CAPACITY: usize = 8;
 
 /// Configuration for writing a thread in Codex's resumable rollout layout.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct RolloutConfig {
     codex_home: PathBuf,
     resume_path: Option<PathBuf>,
+    root_session_id: std::sync::Arc<std::sync::OnceLock<String>>,
+}
+
+impl Clone for RolloutConfig {
+    fn clone(&self) -> Self {
+        Self {
+            codex_home: self.codex_home.clone(),
+            resume_path: self.resume_path.clone(),
+            root_session_id: std::sync::Arc::new((*self.root_session_id).clone()),
+        }
+    }
 }
 
 impl RolloutConfig {
@@ -50,6 +61,7 @@ impl RolloutConfig {
         Self {
             codex_home: codex_home.into(),
             resume_path: None,
+            root_session_id: Default::default(),
         }
     }
 
@@ -69,12 +81,21 @@ impl RolloutConfig {
         DurableSession::load(&self.codex_home, thread_id)
     }
 
+    /// Lists resumable Codex and Nanocodex sessions beneath this Codex home.
+    ///
+    /// Active and archived uncompressed JSONL rollouts are returned newest
+    /// first. Files without recognizable session metadata are ignored so a
+    /// stale or partially written unrelated file cannot prevent discovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a session directory exists but cannot be read.
+    pub fn list_sessions(&self) -> io::Result<Vec<RolloutSessionInfo>> {
+        load::list_sessions(&self.codex_home)
+    }
+
     pub(crate) fn resumed(mut self, rollout_path: PathBuf) -> Self {
         self.resume_path = Some(rollout_path);
         self
-    }
-
-    pub(crate) fn for_new_thread(&self) -> Self {
-        Self::new(self.codex_home.clone())
     }
 }

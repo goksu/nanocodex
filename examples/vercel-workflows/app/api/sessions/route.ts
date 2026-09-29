@@ -1,7 +1,8 @@
 import { start } from "workflow/api";
-import { v7 as uuidv7 } from "uuid";
 
+import { hasBearerToken } from "@/lib/bearer-auth";
 import { nanocodexActor } from "@/workflows/nanocodex-actor";
+import type { DurabilityPortableStateArchive } from "nanocodex/durability";
 
 export const runtime = "nodejs";
 
@@ -13,9 +14,15 @@ export async function POST(request: Request): Promise<Response> {
     );
   }
   try {
-    const run = await start(nanocodexActor, [uuidv7()]);
+    const archive = await optionalDurabilityArchive(request);
+    const run = archive === undefined
+      ? await start(nanocodexActor)
+      : await start(nanocodexActor, [archive]);
     return Response.json(
-      { session_id: run.runId },
+      {
+        session_id: run.runId,
+        durability_id: archive?.stateId ?? run.runId,
+      },
       { status: 201, headers: { "cache-control": "no-store" } },
     );
   } catch (error) {
@@ -27,8 +34,22 @@ export async function POST(request: Request): Promise<Response> {
   }
 }
 
+async function optionalDurabilityArchive(
+  request: Request,
+): Promise<DurabilityPortableStateArchive | undefined> {
+  const encoded = await request.text();
+  if (!encoded.trim()) return undefined;
+  const body = JSON.parse(encoded) as { durability?: unknown };
+  if (!body || typeof body !== "object" || Array.isArray(body)
+    || Object.keys(body).some((key) => key !== "durability")
+    || body.durability === undefined) {
+    throw new TypeError("session creation body must contain only durability");
+  }
+  return body.durability as DurabilityPortableStateArchive;
+}
+
 function authorizedToCreate(request: Request): boolean {
   const expected = process.env.NANOCODEX_ADMIN_TOKEN?.trim();
   if (!expected) return true;
-  return request.headers.get("authorization") === `Bearer ${expected}`;
+  return hasBearerToken(request, expected);
 }

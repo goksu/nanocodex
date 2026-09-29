@@ -1,5 +1,19 @@
 use super::*;
 
+#[derive(Deserialize, Serialize)]
+struct RecordedModelResult {
+    response: TurnResult,
+    attempt: u32,
+    connection_generation: u32,
+    server_reasoning_included: bool,
+    duration_ns: u64,
+}
+
+pub(super) struct ModelCallOutcome {
+    pub(super) response: TurnResult,
+    pub(super) transport_continuation_valid: bool,
+}
+
 impl<S> ModelRun<S>
 where
     S: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + AgentSend + 'static,
@@ -11,7 +25,12 @@ where
         call_index: u32,
         conversation: &mut ConversationState,
         factory: &ResponsesAttemptFactory,
-    ) -> Result<TurnResult> {
+    ) -> Result<ModelCallOutcome> {
+        let step_id = format!("model-{call_index}");
+        let model = self.model;
+        let thinking = self.thinking;
+        let reasoning_mode = self.config.reasoning_mode;
+        let fast_mode = self.fast_mode;
         let (prompt_history, prompt_repaired) = conversation.prompt_history_with_repair();
         let previous_response_id = if prompt_repaired {
             None
@@ -24,9 +43,9 @@ where
             AgentEventKind::ModelCallStarted,
             ModelCallStarted {
                 call_index,
-                model: self.model.as_str(),
-                reasoning_mode: self.config.reasoning_mode.as_str(),
-                effort: self.thinking.as_str(),
+                model: model.as_str(),
+                reasoning_mode: reasoning_mode.as_str(),
+                effort: thinking.as_str(),
                 previous_response_id: previous_response_id.as_deref(),
             },
         )?;
@@ -36,16 +55,16 @@ where
             conversation.shared_history(),
             conversation.delta_start(),
             previous_response_id.as_deref(),
-            self.model,
-            self.thinking,
-            self.fast_mode,
+            model,
+            thinking,
+            fast_mode,
         );
         let (input_item_count, input_bytes, input_content) = trace_model_input(&request);
         let span = model_call_span(
             call_index,
-            self.model.as_str(),
-            self.config.reasoning_mode.as_str(),
-            self.thinking.as_str(),
+            model.as_str(),
+            reasoning_mode.as_str(),
+            thinking.as_str(),
             previous_response_id.is_some(),
             input_item_count,
             input_bytes,
@@ -53,50 +72,86 @@ where
         if let Some(input_content) = &input_content {
             record_span_content(&span, "model.input", input_content);
         }
-        let success = match self.client.execute(request).instrument(span.clone()).await {
-            Ok(success) => success,
-            Err(error) => {
+        let execution_steps = self.execution_steps.clone();
+        let recovered = if let Some(steps) = &execution_steps {
+            match steps
+                .begin::<_, RecordedModelResult>(&step_id, "model_call", &())
+                .await?
+            {
+                crate::agent::ExecutionStep::Execute => None,
+                crate::agent::ExecutionStep::Replay(output) => Some(output),
+            }
+        } else {
+            None
+        };
+        let (recorded_result, transport_continuation_valid) = if let Some(output) = recovered {
+            (output, false)
+        } else {
+            let success = match self.client.execute(request).instrument(span.clone()).await {
+                Ok(success) => success,
+                Err(error) => {
+                    span.record("status", "failed");
+                    span.record("otel.status_code", "ERROR");
+                    span.record("duration_ns", elapsed_ns(started_at));
+                    return self.model_call_failed(
+                        call_index,
+                        started_at,
+                        NanocodexError::Response(error.into()),
+                    );
+                }
+            };
+            let attempt = success.attempt();
+            let connection_generation = success.connection_generation();
+            let server_reasoning_included = success.server_reasoning_included();
+            let ResponsesOutput::Generation(response) = success.into_output() else {
                 span.record("status", "failed");
                 span.record("otel.status_code", "ERROR");
-                span.record("duration_ns", elapsed_ns(started_at));
-                return self.model_call_failed(
-                    call_index,
-                    started_at,
-                    NanocodexError::Response(error.into()),
-                );
+                return Err(NanocodexError::InvalidAttemptState {
+                    detail: "generation returned a non-generation response",
+                });
+            };
+            let output = RecordedModelResult {
+                response,
+                attempt,
+                connection_generation,
+                server_reasoning_included,
+                duration_ns: elapsed_ns(started_at),
+            };
+            validate_provider_response_id(&output.response.id)?;
+            if let Some(steps) = &execution_steps {
+                steps.complete(&step_id, &output).await?;
             }
+            (output, true)
         };
-        let attempt = success.attempt();
-        let connection_generation = success.connection_generation();
-        conversation.observe_server_reasoning(success.server_reasoning_included());
-        let ResponsesOutput::Generation(response) = success.into_output() else {
-            span.record("status", "failed");
-            span.record("otel.status_code", "ERROR");
-            return Err(NanocodexError::InvalidAttemptState {
-                detail: "generation returned a non-generation response",
-            });
-        };
+        let RecordedModelResult {
+            response,
+            attempt,
+            connection_generation,
+            server_reasoning_included,
+            duration_ns,
+        } = recorded_result;
+        validate_provider_response_id(&response.id)?;
+        conversation.observe_server_reasoning(server_reasoning_included);
         if prompt_repaired {
             conversation.adopt_prompt_history(prompt_history);
         }
-        let duration_ns = elapsed_ns(started_at);
         record_model_response(&span, &response);
         span.record("status", "completed");
         span.record("otel.status_code", "OK");
         span.record("duration_ns", duration_ns);
         if let Some(usage) = &response.usage {
-            record_usage(&span, usage, self.model, self.fast_mode);
+            record_usage(&span, usage, model, fast_mode);
         }
         self.stats.model_duration_ns += duration_ns;
         if let Some(usage) = &response.usage {
-            self.stats.usage.add(usage);
+            self.stats.usage.add(usage, model, fast_mode);
         }
-        self.stats.last_response_id = Some(response.id.clone());
+        self.stats.last_response_id = transport_continuation_valid.then(|| response.id.clone());
         self.events.emit(
             AgentEventKind::ModelCallCompleted,
             ModelCallCompleted {
                 call_index,
-                model: self.model.as_str(),
+                model: model.as_str(),
                 response_id: &response.id,
                 attempt,
                 connection_generation,
@@ -108,7 +163,10 @@ where
                 usage: response.usage.as_ref(),
             },
         )?;
-        Ok(response)
+        Ok(ModelCallOutcome {
+            response,
+            transport_continuation_valid,
+        })
     }
 
     pub(super) fn model_call_failed<T>(
@@ -131,6 +189,15 @@ where
         )?;
         Err(error)
     }
+}
+
+pub(super) fn validate_provider_response_id(response_id: &str) -> Result<()> {
+    if response_id.trim().is_empty() {
+        return Err(NanocodexError::MalformedResponse {
+            detail: "completed turn did not have a response ID",
+        });
+    }
+    Ok(())
 }
 
 pub(super) fn unsupported_tool_message(tools: &ToolRuntime, call: &CodeCall) -> Option<String> {
@@ -224,7 +291,10 @@ pub(super) fn owned_code_context(
     call: &CodeCall,
     history: Option<Arc<Vec<ResponseItem>>>,
     session_id: &str,
+    turn_id: &str,
     model: Model,
+    host_context: Option<&str>,
+    instruction_revision: Option<u64>,
 ) -> Result<Option<OwnedToolContext>> {
     if call.name != "exec" {
         return Ok(None);
@@ -232,13 +302,18 @@ pub(super) fn owned_code_context(
     let history = history.ok_or(NanocodexError::MalformedResponse {
         detail: "exec call did not have an owned history snapshot",
     })?;
-    Ok(Some(OwnedToolContext::new(
-        model.as_str(),
-        session_id,
-        &call.call_id,
-        history,
-        DEFAULT_TOOL_OUTPUT_TOKENS,
-    )))
+    Ok(Some(
+        OwnedToolContext::new(
+            model.as_str(),
+            session_id,
+            &call.call_id,
+            history,
+            DEFAULT_TOOL_OUTPUT_TOKENS,
+        )
+        .with_instruction_revision(instruction_revision)
+        .with_host_context(host_context.map(Arc::from))
+        .with_turn_id(Some(Arc::from(turn_id))),
+    ))
 }
 
 pub(super) fn record_span_content(span: &tracing::Span, kind: &'static str, content: &str) {
@@ -385,15 +460,7 @@ pub(super) fn record_usage(span: &tracing::Span, usage: &Usage, model: Model, fa
     span.record("output_tokens", usage.output_tokens);
     span.record("reasoning_output_tokens", reasoning_output_tokens);
     span.record("total_tokens", usage.total_tokens);
-    let estimate = estimate_for_model(
-        usage,
-        model,
-        if fast_mode {
-            ServiceTier::Priority
-        } else {
-            ServiceTier::Standard
-        },
-    );
+    let estimate = estimate_for_model(usage, model, ServiceTier::for_model(model, fast_mode));
     let amount = estimate.amount().decimal();
     span.record("cost.usd", amount.as_str());
     span.record("cost.service_tier", estimate.service_tier().as_str());
@@ -480,64 +547,36 @@ pub(super) fn request_profile(
     tool_specs: Vec<ToolDefinition>,
     code_mode_tool_names: Vec<(String, String)>,
     system_prompt: &str,
-) -> RequestProfile {
-    let mut prefix = [
-        ResponseItem::additional_tools(tool_specs),
-        ResponseItem::message(
-            MessageRole::Developer,
-            [ContentItem::InputText {
-                text: system_prompt.into(),
-            }],
-        ),
-    ];
-    assign_request_prefix_ids(&mut prefix);
-    with_code_mode_tool_names(
+) -> Result<RequestProfile> {
+    let prefix = responses_lite_request_prefix(prompt_cache_key, tool_specs, system_prompt)
+        .map_err(NanocodexError::SerializePromptPrefix)?;
+    Ok(with_code_mode_tool_names(
         RequestProfile::new(session_id, prompt_cache_key, Arc::from(prefix)),
         code_mode_tool_names,
-    )
-}
-
-pub(super) fn assign_request_prefix_ids(prefix: &mut [ResponseItem]) {
-    for item in prefix {
-        // Responses Lite request-prefix items are transport configuration, not
-        // retained conversation. Codex sends both without client-defined IDs.
-        if matches!(
-            item,
-            ResponseItem::AdditionalTools { .. }
-                | ResponseItem::Message {
-                    role: MessageRole::Developer,
-                    ..
-                }
-        ) {
-            item.strip_id();
-            continue;
-        }
-        if item.id().is_some_and(|id| !id.is_empty()) {
-            continue;
-        }
-        assign_missing_response_item_id(item);
-    }
+    ))
 }
 
 pub(super) fn attempt_factory(
     events: &EventSink,
     transport_stats: &Arc<TransportStats>,
+    provider_session_id: &str,
     prompt_cache_key: &str,
     tools: &ToolRuntime,
     system_prompt: &str,
-) -> ResponsesAttemptFactory {
+) -> Result<ResponsesAttemptFactory> {
     let (tool_specs, code_mode_tool_names) = model_tool_contract(tools, events.request_id());
-    ResponsesAttemptFactory::new(
+    Ok(ResponsesAttemptFactory::new(
         request_profile(
-            events.request_id(),
+            provider_session_id,
             prompt_cache_key,
             tool_specs,
             code_mode_tool_names,
             system_prompt,
-        ),
+        )?
+        .with_thread_id(events.request_id()),
         events.clone(),
         Arc::clone(transport_stats),
-    )
+    ))
 }
 
 pub(super) fn tool_runtime(workspace: &str, config: &ModelConfig, tools: &Tools) -> ToolRuntime {
@@ -564,4 +603,16 @@ pub(super) const fn status(success: bool) -> &'static str {
 
 pub(super) const fn otel_status(success: bool) -> &'static str {
     if success { "OK" } else { "ERROR" }
+}
+
+#[cfg(test)]
+mod response_id_tests {
+    use super::validate_provider_response_id;
+
+    #[test]
+    fn provider_response_ids_must_contain_non_whitespace_text() {
+        assert!(validate_provider_response_id("response-1").is_ok());
+        assert!(validate_provider_response_id("").is_err());
+        assert!(validate_provider_response_id(" \n\t").is_err());
+    }
 }

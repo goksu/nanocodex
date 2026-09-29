@@ -13,7 +13,6 @@ pub struct ResponsesServiceError {
     class: &'static str,
     pub(crate) retry_advice: Option<RetryAdvice>,
     pub(crate) connection_generation: u32,
-    billing_uncertain: bool,
 }
 
 impl ResponsesServiceError {
@@ -30,7 +29,6 @@ impl ResponsesServiceError {
             class,
             retry_advice,
             connection_generation,
-            billing_uncertain: false,
         }
     }
 
@@ -93,33 +91,15 @@ impl ResponsesServiceError {
         self
     }
 
-    pub(crate) const fn with_billing_uncertain(mut self) -> Self {
-        self.billing_uncertain = true;
-        self
-    }
-
-    pub(crate) const fn with_billing_uncertain_unless_provider_terminal(mut self) -> Self {
-        let provider_terminal = matches!(
-            self.responses_error(),
-            Some(
-                ResponsesError::Api { .. }
-                    | ResponsesError::ContextWindowExceeded { .. }
-                    | ResponsesError::InvalidImageRequest { .. }
-                    | ResponsesError::HttpRejected { .. }
-            )
-        );
-        self.billing_uncertain = !provider_terminal;
-        self
-    }
-
-    /// Returns whether a request may have reached the provider without a
-    /// terminal event reporting usage.
-    ///
-    /// This classification is populated by the standard Responses service. It
-    /// does not assert that the provider charged the request.
-    #[must_use]
-    pub const fn billing_uncertain(&self) -> bool {
-        self.billing_uncertain
+    pub(crate) fn with_request_input(self, request: &crate::ResponsesAttempt) -> Self {
+        match self.source {
+            ResponsesServiceErrorSource::Responses(source) => Self::responses(
+                source.with_request_input(request.input_items()),
+                self.phase,
+                self.connection_generation,
+            ),
+            _ => self,
+        }
     }
 
     /// Returns a stable low-cardinality error class.
@@ -181,16 +161,15 @@ impl std::error::Error for ResponsesServiceError {
 impl From<ResponsesError> for ResponsesServiceError {
     fn from(error: ResponsesError) -> Self {
         let phase = match error {
-            ResponsesError::IdleTimeout { .. } => FailurePhase::Idle,
             ResponsesError::UnexpectedEnd
             | ResponsesError::Closed { .. }
             | ResponsesError::Receive { .. } => FailurePhase::Receive,
             ResponsesError::HttpRequest { .. } | ResponsesError::InvalidSseUtf8 { .. } => {
                 FailurePhase::Receive
             }
-            ResponsesError::Api { .. } | ResponsesError::ContextWindowExceeded { .. } => {
-                FailurePhase::Api
-            }
+            ResponsesError::Api { .. }
+            | ResponsesError::ContextWindowExceeded { .. }
+            | ResponsesError::InvalidToolSchema { .. } => FailurePhase::Api,
             ResponsesError::HttpRejected { .. } => FailurePhase::Api,
             ResponsesError::HostUnavailable
             | ResponsesError::HandshakeTimeout { .. }
@@ -228,7 +207,6 @@ pub(crate) enum FailurePhase {
     Encode,
     Send,
     Receive,
-    Idle,
     Api,
     Protocol,
     Completion,

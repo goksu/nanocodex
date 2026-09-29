@@ -5,11 +5,21 @@ use std::{fmt, ops::Deref};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
+#[cfg(feature = "client")]
+use super::FunctionOutputContent;
 use super::{
     AgentMessageContent, ContentItem, FunctionOutputBody, InternalMessageMetadata, ItemStatus,
     JsonValue, LocalShellAction, LocalShellStatus, MessagePhase, MessageRole, ReasoningContent,
     ReasoningSummary, ToolCaller, ToolDefinition, WebSearchAction,
 };
+use crate::Thinking;
+
+/// Reasoning controls carried by a Responses `configuration_update` item.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub struct ConfigurationUpdateReasoning {
+    /// Reasoning effort that applies until a later configuration update overrides it.
+    pub effort: Thinking,
+}
 
 /// A stable Responses API item identifier.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -148,6 +158,10 @@ pub enum ResponseItem {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         namespace: Option<Box<str>>,
         arguments: Box<str>,
+        #[serde(default, rename = "async", skip_serializing_if = "is_false")]
+        asynchronous: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encrypted_function_args: Option<Vec<Box<str>>>,
         call_id: Box<str>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller: Option<ToolCaller>,
@@ -194,6 +208,8 @@ pub enum ResponseItem {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         namespace: Option<Box<str>>,
         input: Box<str>,
+        #[serde(default, rename = "async", skip_serializing_if = "is_false")]
+        asynchronous: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller: Option<ToolCaller>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -267,11 +283,41 @@ pub enum ResponseItem {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         internal_chat_message_metadata_passthrough: Option<InternalMessageMetadata>,
     },
+    ConfigurationUpdate {
+        reasoning: ConfigurationUpdateReasoning,
+    },
     #[serde(untagged)]
     Other(JsonValue),
 }
 
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 impl ResponseItem {
+    #[cfg(feature = "client")]
+    pub(crate) fn strip_image_details(&mut self) {
+        match self {
+            Self::Message { content, .. } => {
+                for item in content {
+                    if let ContentItem::InputImage { detail, .. } = item {
+                        *detail = None;
+                    }
+                }
+            }
+            Self::FunctionCallOutput { output, .. } | Self::CustomToolCallOutput { output, .. } => {
+                if let FunctionOutputBody::Content(content) = output {
+                    for item in content {
+                        if let FunctionOutputContent::InputImage { detail, .. } = item {
+                            *detail = None;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Creates the stable developer item that declares session tools.
     #[must_use]
     pub const fn additional_tools(tools: Vec<ToolDefinition>) -> Self {
@@ -334,6 +380,14 @@ impl ResponseItem {
         Self::CompactionTrigger {}
     }
 
+    /// Creates an Astra reasoning-effort update for insertion before the next user message.
+    #[must_use]
+    pub const fn configuration_update(effort: Thinking) -> Self {
+        Self::ConfigurationUpdate {
+            reasoning: ConfigurationUpdateReasoning { effort },
+        }
+    }
+
     /// Returns whether this item is a user-role message.
     #[must_use]
     pub const fn is_user_message(&self) -> bool {
@@ -365,7 +419,7 @@ impl ResponseItem {
             | Self::ImageGenerationCall { id, .. }
             | Self::Compaction { id, .. }
             | Self::ContextCompaction { id, .. } => id.as_ref(),
-            Self::CompactionTrigger {} | Self::Other(_) => None,
+            Self::CompactionTrigger {} | Self::ConfigurationUpdate { .. } | Self::Other(_) => None,
         }
     }
 
@@ -387,7 +441,7 @@ impl ResponseItem {
             | Self::ImageGenerationCall { id, .. }
             | Self::Compaction { id, .. }
             | Self::ContextCompaction { id, .. } => *id = new_id,
-            Self::CompactionTrigger {} | Self::Other(_) => {}
+            Self::CompactionTrigger {} | Self::ConfigurationUpdate { .. } | Self::Other(_) => {}
         }
     }
 
@@ -409,13 +463,40 @@ impl ResponseItem {
             Self::WebSearchCall { .. } => Some("ws"),
             Self::ImageGenerationCall { .. } => Some("ig"),
             Self::Compaction { .. } | Self::ContextCompaction { .. } => Some("cmp"),
-            Self::CompactionTrigger {} | Self::Other(_) => None,
+            Self::CompactionTrigger {} | Self::ConfigurationUpdate { .. } | Self::Other(_) => None,
         }
     }
 
     /// Removes the item ID from a derived copy that starts a separate history.
     pub fn strip_id(&mut self) {
         self.set_id(None);
+    }
+
+    /// Removes a replaceable item ID while preserving IDs bound into opaque
+    /// encrypted provider content.
+    ///
+    /// Recovered requests may assign fresh IDs to ordinary copied items. An
+    /// encrypted compaction, reasoning item, or function argument authenticates
+    /// the provider-issued ID inside its ciphertext, so changing that ID makes
+    /// the otherwise valid content impossible to replay.
+    pub fn strip_unbound_id(&mut self) {
+        let provider_bound = matches!(
+            self,
+            Self::Reasoning {
+                encrypted_content: Some(_),
+                ..
+            } | Self::FunctionCall {
+                encrypted_function_args: Some(_),
+                ..
+            } | Self::Compaction { .. }
+                | Self::ContextCompaction {
+                    encrypted_content: Some(_),
+                    ..
+                }
+        );
+        if !provider_bound {
+            self.strip_id();
+        }
     }
 }
 
@@ -450,6 +531,29 @@ mod tests {
     }
 
     #[test]
+    fn function_calls_preserve_encrypted_argument_markers() {
+        for value in [
+            serde_json::json!({
+                "type": "function_call",
+                "name": "send_message",
+                "arguments": "{}",
+                "encrypted_function_args": [],
+                "call_id": "call-empty"
+            }),
+            serde_json::json!({
+                "type": "function_call",
+                "name": "send_message",
+                "arguments": "{}",
+                "encrypted_function_args": ["opaque"],
+                "call_id": "call-opaque"
+            }),
+        ] {
+            let item: ResponseItem = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(item).unwrap(), value);
+        }
+    }
+
+    #[test]
     fn response_item_ids_distinguish_client_prefixes_from_server_ids() {
         let client = ResponseItemId::with_suffix("msg", "stable");
         let server = ResponseItemId::from_server("server-item-id");
@@ -457,6 +561,31 @@ mod tests {
         assert_eq!(client.as_str(), "msg_stable");
         assert!(client.is_prefixed());
         assert!(!server.is_prefixed());
+    }
+
+    #[test]
+    fn replay_copies_preserve_ids_bound_to_encrypted_provider_content() {
+        let mut compact: ResponseItem = serde_json::from_value(serde_json::json!({
+            "id": "cmp_01a0710d-9f5e-7f80-91ad-730ae4a6ba93",
+            "type": "compaction",
+            "encrypted_content": "opaque"
+        }))
+        .unwrap();
+        compact.strip_unbound_id();
+        assert_eq!(
+            compact.id().map(ResponseItemId::as_str),
+            Some("cmp_01a0710d-9f5e-7f80-91ad-730ae4a6ba93")
+        );
+
+        let mut message = ResponseItem::message(
+            MessageRole::User,
+            [ContentItem::InputText {
+                text: "copied".into(),
+            }],
+        );
+        message.set_id(Some(ResponseItemId::with_suffix("msg", "old")));
+        message.strip_unbound_id();
+        assert!(message.id().is_none());
     }
 
     #[test]
@@ -538,5 +667,39 @@ mod tests {
         ]);
         let items: Vec<ResponseItem> = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(serde_json::to_value(items).unwrap(), value);
+    }
+
+    #[test]
+    fn astra_protocol_items_preserve_async_calls_and_reasoning_updates() {
+        let value = serde_json::json!([
+            {
+                "type": "function_call",
+                "name": "lookup",
+                "arguments": "{}",
+                "async": true,
+                "call_id": "call-function"
+            },
+            {
+                "type": "custom_tool_call",
+                "name": "compile",
+                "input": "compile",
+                "async": true,
+                "call_id": "call-custom"
+            },
+            {
+                "type": "configuration_update",
+                "reasoning": {"effort": "high"}
+            }
+        ]);
+        let items: Vec<ResponseItem> = serde_json::from_value(value.clone()).unwrap();
+
+        assert_eq!(serde_json::to_value(items).unwrap(), value);
+        assert_eq!(
+            serde_json::to_value(ResponseItem::configuration_update(Thinking::Low)).unwrap(),
+            serde_json::json!({
+                "type": "configuration_update",
+                "reasoning": {"effort": "low"}
+            })
+        );
     }
 }

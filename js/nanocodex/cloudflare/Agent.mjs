@@ -1,0 +1,1048 @@
+import { steerInputKey } from "../runtime/steer-receipt.mjs";
+export { steerInputKey };
+import { createGatewayResponses } from "./gateway-responses.mjs";
+import { createWorkersAiResponses } from "./workers-ai-responses.mjs";
+import { responseControlsBody, responseControlsSocket } from "../runtime/response-controls.mjs";
+import * as HostAgent from "../host/Agent.mjs";
+import {
+  CLOUDFLARE_SESSION_RESERVATION,
+  checkpoint as checkpointAgent,
+  commitCloudflareAgentSession,
+  installHostBridge,
+  loadDurabilityRuntime,
+  mayBindCloudflareSubagentSession,
+  mayReleaseCloudflareSubagentSession,
+  observeAgentRelease,
+  prepareCloudflareAgentSession,
+  releaseAgentSession,
+  routePrompt,
+} from "../internal.mjs";
+import { pruneDurableReceipts as pruneWasmDurableReceipts } from "../pkg-web/nanocodex.js";
+import * as Transport from "../browser/Transport.mjs";
+import { initializeBrowserEngine } from "../browser/engine.mjs";
+import { createCloudflareDurabilityStore } from "../runtime/cloudflare-durability-store.mjs";
+import {
+  createMemoryDurabilityStore,
+  durabilityRevision,
+  exportDurabilityState as exportPortableState,
+  exportDurabilityStatePage as exportPortableStatePage,
+  importDurabilityState as importPortableState,
+} from "../runtime/durability-store.mjs";
+import { cloudflareEgress } from "./egress.mjs";
+import { prepareConnection } from "./prepared-connection.mjs";
+import { scopeCloudflareEgress } from "./egress-subject.mjs";
+import {
+  clearCloudflareEventSocket,
+  createCloudflareEventSocket,
+} from "./event-socket.mjs";
+
+const STARTUP_TIMEOUT_MS = 10_000;
+const INTERNAL_RUNTIME = Symbol.for("nanocodex.cloudflare.internalRuntime");
+const INTERNAL_CONFIGURATION = Symbol.for("nanocodex.cloudflare.internalConfiguration");
+const INTERNAL_FORK_RESUME = Symbol.for("nanocodex.cloudflare.internalForkResume");
+const EPHEMERAL_APPLICATION_OPTIONS = new Set([
+  "beforeCompaction",
+  "additionalInstructions",
+  "fastMode",
+  "instructions",
+  "model",
+  "reasoningMode",
+  "resume",
+  "sessionId",
+  "thinking",
+  "tools",
+  "workspace",
+]);
+const APPLICATION_OPTIONS = new Set([
+  "beforeCompaction",
+  "additionalInstructions",
+  "durabilityId",
+  "eventPersistence",
+  "instructions",
+  "terminalReceiptRetention",
+  "tools",
+]);
+const lifecycles = new WeakMap();
+
+/** @internal Binds the package-owned module to the public Cloudflare namespace. */
+export function bindAgent(module, hostAgent = HostAgent) {
+  return Object.freeze({
+    steerReceipt,
+    steerInputKey,
+    pruneDurableReceipts: (owner, options) => pruneDurableReceipts(module, owner, options),
+    create: (owner, options) => create(module, owner, options, hostAgent),
+    createEphemeral: (owner, options) => createEphemeral(module, owner, options),
+    checkpoint,
+    destroy,
+    exportDurabilityState,
+    exportDurabilityHead,
+    importDurabilityState: (owner, archive) => importDurabilityState(owner, archive, module),
+    route,
+  });
+}
+
+/** Copies the latest safe committed boundary as a resumable SessionSnapshot. */
+export function checkpoint(agent) {
+  return checkpointAgent(agent);
+}
+
+/** Atomically steers an active Cloudflare Agent turn or starts a new turn. */
+export function route(agent, options) {
+  return routePrompt(agent, options);
+}
+
+/** Removes the package-owned durable history for one Cloudflare Agent. */
+export function destroy(owner) {
+  const context = resolveContext(owner);
+  const lifecycle = lifecycles.get(context);
+  if (lifecycle?.creating) {
+    throw new Error("Cloudflare Agent creation must settle before destroy");
+  }
+  if (lifecycle?.active !== undefined) {
+    throw new Error("Cloudflare Agent shutdown must complete before destroy");
+  }
+  const storage = context.storage;
+  createCloudflareDurabilityStore(storage);
+  initializeAgentStorage(storage);
+  const stateId = storedStateId(storage) ?? legacyStateId(storage);
+  storage.transactionSync(() => {
+    if (stateId !== undefined) {
+      const retained = storage.sql.exec(
+        "SELECT fence FROM nanocodex_durable_owners WHERE state_id = ?",
+        stateId,
+      ).toArray();
+      const fence = durabilityRevision(
+        BigInt(durabilityRevision(retained[0]?.fence ?? "0")) + 1n,
+      );
+      storage.sql.exec(
+        `INSERT INTO nanocodex_durable_owners (state_id, owner_id, fence) VALUES (?, ?, ?)
+         ON CONFLICT (state_id) DO UPDATE SET owner_id = excluded.owner_id, fence = excluded.fence`,
+        stateId,
+        `destroy:${globalThis.crypto.randomUUID()}`,
+        fence,
+      );
+      storage.sql.exec(
+        "DELETE FROM nanocodex_durable_records WHERE state_id = ?",
+        stateId,
+      );
+      storage.sql.exec(
+        "DELETE FROM nanocodex_durable_states WHERE state_id = ?",
+        stateId,
+      );
+    }
+    storage.sql.exec("DROP TABLE IF EXISTS nanocodex_cloudflare_fork_resume");
+    clearCloudflareEventSocket(context);
+  });
+}
+
+/** Fences and exports this inactive Cloudflare Agent's provider-neutral state. */
+export async function exportDurabilityState(owner, request, headOnly = false) {
+  const context = reserveInactiveLifecycle(owner, "exporting durability state");
+  try {
+    const storage = context.storage;
+    const durability = createCloudflareDurabilityStore(storage);
+    initializeAgentStorage(storage);
+    const stateId = storedStateId(storage) ?? legacyStateId(storage);
+    if (stateId === undefined) {
+      throw new Error("Cloudflare Agent has no durability state to export");
+    }
+    return request === undefined
+      ? await exportPortableState(durability, stateId, { headOnly })
+      : await exportPortableStatePage(durability, stateId, request);
+  } finally {
+    lifecycleFor(context).creating = false;
+  }
+}
+
+/** Internal managed cutover: records are transferred through its bounded archive. */
+export function exportDurabilityHead(owner) { return exportDurabilityState(owner, undefined, true); }
+
+/** Imports provider-neutral state into a pristine Cloudflare Agent owner. */
+export async function importDurabilityState(owner, archive, module) {
+  const context = reserveInactiveLifecycle(owner, "importing durability state");
+  try {
+    const storage = context.storage;
+    const durability = createCloudflareDurabilityStore(storage);
+    initializeAgentStorage(storage);
+    const validationStateId = typeof archive?.stateId === "string" && archive.stateId
+      ? archive.stateId
+      : "nanocodex-invalid-import";
+    const validationStore = createMemoryDurabilityStore(validationStateId);
+    const validated = await importPortableState(validationStore, archive);
+    if (module !== undefined) {
+      const routeHost = {};
+      const route = (await loadDurabilityRuntime()).own(
+        routeHost,
+        validationStore,
+        validationStateId,
+      );
+      try {
+        installHostBridge();
+        await initializeBrowserEngine({ module });
+        // Opening the Rust durability session validates the complete canonical
+        // state. Pruning happens only in this throwaway memory copy.
+        await pruneWasmDurableReceipts(route.id, validationStateId, 4_096);
+      } finally {
+        route.abandon();
+      }
+    }
+    const retainedSessionId = storedSessionId(storage);
+    const retainedStateId = storedStateId(storage);
+    if (retainedSessionId !== undefined || retainedStateId !== undefined) {
+      if (retainedSessionId !== undefined
+        && retainedStateId === archive?.stateId
+        && archive?.format === "nanocodex-durability-state-v2") {
+        const retained = await durability.load(retainedStateId);
+        if (retained.revision === validated.revision
+          && retained.payload === validated.payload) {
+          return retained;
+        }
+      }
+      throw new Error("Cloudflare Agent durability import requires a pristine Durable Object");
+    }
+    const sessionId = uuidV7();
+    // Publish identity and the imported head together. Records staged by a
+    // bounded host transfer survive rollback and can be reused on retry.
+    return storage.transactionSync(() => {
+      const imported = durability.importState(archive.stateId, validated, { records: archive.records });
+      storage.sql.exec(
+        "INSERT INTO nanocodex_cloudflare_agent (singleton, session_id) VALUES (1, ?)", sessionId,
+      );
+      storage.sql.exec(
+        "INSERT INTO nanocodex_cloudflare_durability (singleton, state_id) VALUES (1, ?)", archive.stateId,
+      );
+      return imported;
+    });
+  } finally {
+    lifecycleFor(context).creating = false;
+  }
+}
+
+function reserveInactiveLifecycle(owner, operation) {
+  const context = resolveContext(owner);
+  const lifecycle = lifecycleFor(context);
+  if (lifecycle.creating) {
+    throw new Error("Cloudflare Agent lifecycle operation is already in progress");
+  }
+  if (lifecycle.active !== undefined) {
+    throw new Error(`Cloudflare Agent shutdown must complete before ${operation}`);
+  }
+  lifecycle.creating = true;
+  return context;
+}
+
+/** Prunes old terminal receipts before constructing the full Agent runtime. */
+export async function pruneDurableReceipts(module, owner, options = {}) {
+  if (!options || typeof options !== "object" || Array.isArray(options)) {
+    throw new TypeError("Cloudflare durability receipt-pruning options must be an object");
+  }
+  const terminalReceiptRetention = options.terminalReceiptRetention ?? 512;
+  if (!Number.isSafeInteger(terminalReceiptRetention)
+    || terminalReceiptRetention < 0
+    || terminalReceiptRetention > 4_096) {
+    throw new TypeError("terminalReceiptRetention must be an integer from 0 through 4096");
+  }
+  const context = resolveContext(owner);
+  const lifecycle = lifecycleFor(context);
+  if (lifecycle.creating) {
+    throw new Error("Cloudflare Agent lifecycle operation is already in progress");
+  }
+  if (lifecycle.active !== undefined) {
+    throw new Error("Cloudflare Agent shutdown must complete before pruning durability receipts");
+  }
+  lifecycle.creating = true;
+  try {
+    const storage = context.storage;
+    const durability = createCloudflareDurabilityStore(storage);
+    initializeAgentStorage(storage);
+    const stateId = storedStateId(storage) ?? legacyStateId(storage);
+    if (stateId === undefined) return;
+    const routeHost = {};
+    const route = (await loadDurabilityRuntime()).own(
+      routeHost,
+      durability,
+      stateId,
+    );
+    try {
+      installHostBridge();
+      await initializeBrowserEngine({ module });
+      await pruneWasmDurableReceipts(route.id, stateId, terminalReceiptRetention);
+    } finally {
+      route.abandon();
+    }
+  } finally {
+    lifecycle.creating = false;
+  }
+}
+
+/** @internal Creates one Agent with an explicitly supplied package module. */
+export async function create(module, owner, options = {}, hostAgent = HostAgent) {
+  const resolved = resolveOwner(owner);
+  const lifecycle = lifecycleFor(resolved.context);
+  if (lifecycle.creating) {
+    throw new Error("Cloudflare Agent creation is already in progress for this Durable Object");
+  }
+  if (lifecycle.active !== undefined) {
+    throw new Error("Cloudflare Agent shutdown must complete before create");
+  }
+  lifecycle.creating = true;
+  try {
+    const prepare = options?.[INTERNAL_RUNTIME]?.prepare;
+    if (prepare === undefined) return await createOwned(module, resolved, options, hostAgent, lifecycle);
+    return await createPrepared(module, resolved, options, hostAgent, lifecycle, prepare);
+  } finally {
+    lifecycle.creating = false;
+  }
+}
+
+// Private managed construction barrier. The adapter retains lifecycle, identity,
+// endpoint and socket ownership throughout tool discovery; callers receive only
+// a single-use continuation, never a transport or a session identity.
+async function createPrepared(module, resolved, options, hostAgent, lifecycle, prepare) {
+  applicationOptions(options);
+  if (typeof prepare !== "function") throw new TypeError("Cloudflare Agent preparation must be a function");
+  const configuration = options[INTERNAL_CONFIGURATION];
+  validateInternalConfiguration(configuration);
+  if (!configuration || !["gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna"].includes(configuration.model)) {
+    throw new Error("Cloudflare Agent preparation requires a native root configuration");
+  }
+  const runtime = options[INTERNAL_RUNTIME];
+  if (Object.keys(runtime).some(key => !["prepare", "preparationSignal"].includes(key))) {
+    throw new TypeError("Cloudflare Agent preparation owns its native transport policy");
+  }
+  const signal = runtime.preparationSignal;
+  signal?.throwIfAborted();
+  createCloudflareDurabilityStore(resolved.context.storage);
+  initializeAgentStorage(resolved.context.storage);
+  const pristineAtStart = storedSessionId(resolved.context.storage) === undefined
+    && storedStateId(resolved.context.storage) === undefined;
+  const initialForkResume = options?.[INTERNAL_FORK_RESUME];
+  let initialForkDigest;
+  if (initialForkResume !== undefined) {
+    if (!initialForkResume || typeof initialForkResume !== "object" || Array.isArray(initialForkResume))
+      throw new TypeError("Cloudflare Agent fork resume must be a SessionSnapshot");
+    const bytes = new Uint8Array(await crypto.subtle.digest("SHA-256",
+      new TextEncoder().encode(JSON.stringify(initialForkResume))));
+    initialForkDigest = [...bytes].map(byte => byte.toString(16).padStart(2, "0")).join("");
+  }
+  const { sessionId, stateId } = durableIdentity(resolved.context.storage, options.durabilityId);
+  if (initialForkDigest !== undefined) {
+    // Pin the seed before optional tool discovery/transport preparation. A
+    // failed preparation can reopen the exact fork with the same snapshot.
+    resolved.context.storage.sql.exec(`CREATE TABLE IF NOT EXISTS nanocodex_cloudflare_fork_resume (
+      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+      state_id TEXT NOT NULL, digest TEXT NOT NULL
+    )`);
+    const previous = resolved.context.storage.sql.exec(
+      "SELECT state_id, digest FROM nanocodex_cloudflare_fork_resume WHERE singleton = 1",
+    ).toArray()[0];
+    if ((!pristineAtStart && !previous) || (previous
+      && (previous.state_id !== stateId || previous.digest !== initialForkDigest))) {
+      throw new Error("Cloudflare Agent fork resume conflicts with its retained seed");
+    }
+    resolved.context.storage.sql.exec(
+      "INSERT OR IGNORE INTO nanocodex_cloudflare_fork_resume(singleton,state_id,digest) VALUES (1,?,?)",
+      stateId, initialForkDigest);
+  }
+  const endpoint = cloudflareEgress({ binding: scopeCloudflareEgress(resolved.egress, resolved.subject) });
+  const connection = prepareConnection(endpoint, sessionId, signal);
+  let completing;
+  let accepting = true;
+  let attempted = false;
+  try {
+    // Share the realm's engine initialization while the socket and tool metadata
+    // load. No Agent or durable runtime owner exists until preparation finishes.
+    installHostBridge();
+    const initializing = initializeBrowserEngine({ module });
+    void initializing.catch(() => {});
+    const result = await prepare((prepared) => {
+      if (!accepting || attempted) throw new Error("Cloudflare Agent preparation was already completed");
+      attempted = true;
+      signal?.throwIfAborted();
+      completing = initializing.then(() => {
+        signal?.throwIfAborted();
+        const runtime = prepared?.[INTERNAL_RUNTIME];
+        const pinned = prepared?.[INTERNAL_CONFIGURATION];
+        validateInternalConfiguration(pinned);
+        if (prepared?.durabilityId !== stateId
+          || ["model", "reasoning_mode"].some(key => pinned?.[key] !== configuration[key])
+          || runtime?.prepare !== undefined || runtime?.workersAi !== undefined || runtime?.gateway !== undefined
+          || (runtime?.inferenceForSession !== undefined && runtime?.preserveRootTransport !== true)
+          || (initialForkDigest !== undefined && JSON.stringify(prepared?.[INTERNAL_FORK_RESUME]) !== JSON.stringify(initialForkResume))) {
+          throw new Error("Cloudflare Agent preparation changed its pinned transport or configuration");
+        }
+        return createOwned(module, resolved, prepared, hostAgent, lifecycle, connection,
+          pristineAtStart ? { sessionId, stateId } : undefined);
+      });
+      void completing.catch(() => {});
+      return completing;
+    });
+    if (completing === undefined || result !== await completing) {
+      throw new Error("Cloudflare Agent preparation must return its completed Agent");
+    }
+    return result;
+  } catch (error) {
+    const agent = await completing?.catch(() => undefined);
+    if (agent !== undefined) await agent.session.shutdown();
+    throw error;
+  } finally {
+    accepting = false;
+    await connection.dispose();
+  }
+}
+
+async function createOwned(module, resolved, options, hostAgent, lifecycle, preparedConnection, pristinePreparedIdentity) {
+  const { context, egress, subject } = resolved;
+  const configured = applicationOptions(options);
+  const {
+    durabilityId,
+    eventPersistence = "durable",
+    [INTERNAL_RUNTIME]: internalRuntime,
+    [INTERNAL_CONFIGURATION]: internalConfiguration,
+    [INTERNAL_FORK_RESUME]: forkResume,
+    ...agentOptions
+  } = configured;
+  if (internalRuntime !== undefined
+    && (!internalRuntime || typeof internalRuntime !== "object" || Array.isArray(internalRuntime))) {
+    throw new TypeError("Cloudflare Agent internal runtime options must be an object");
+  }
+  if (internalRuntime?.onSocketTiming !== undefined
+    && typeof internalRuntime.onSocketTiming !== "function") {
+    throw new TypeError("Cloudflare Agent socket timing hook must be a function");
+  }
+  if (internalRuntime?.onResponseCreateSent !== undefined
+    && typeof internalRuntime.onResponseCreateSent !== "function") {
+    throw new TypeError("Cloudflare Agent response.create sent hook must be a function");
+  }
+  if (internalRuntime?.onRequestShape !== undefined
+    && typeof internalRuntime.onRequestShape !== "function") {
+    throw new TypeError("Cloudflare Agent request shape hook must be a function");
+  }
+  if (internalRuntime?.subagentLifecycle !== undefined
+    && typeof internalRuntime.subagentLifecycle !== "function") {
+    throw new TypeError("Cloudflare Agent subagent lifecycle hook must be a function");
+  }
+  if (internalRuntime?.waitForPreconnect !== undefined
+    && typeof internalRuntime.waitForPreconnect !== "boolean") {
+    throw new TypeError("Cloudflare Agent internal waitForPreconnect must be a boolean");
+  }
+  if (internalRuntime?.preserveRootTransport !== undefined
+    && typeof internalRuntime.preserveRootTransport !== "boolean") {
+    throw new TypeError("Cloudflare Agent root transport policy must be a boolean");
+  }
+  if (internalRuntime?.inferenceForSession !== undefined
+    && typeof internalRuntime.inferenceForSession !== "function") {
+    throw new TypeError("Cloudflare Agent inference routing must be a function");
+  }
+  if (internalRuntime?.subagentRouting !== undefined && internalRuntime?.inferenceForSession === undefined) {
+    throw new TypeError("Subagent routing requires session-specific inference routing");
+  }
+  validateInternalConfiguration(internalConfiguration);
+  const eventSocket = eventPersistence === "durable"
+    ? createCloudflareEventSocket(context)
+    : undefined;
+  if (eventPersistence === "caller") clearCloudflareEventSocket(context);
+  const durability = createCloudflareDurabilityStore(context.storage);
+  let resumeDigest;
+  if (forkResume !== undefined) {
+    if (!forkResume || typeof forkResume !== "object" || Array.isArray(forkResume)) {
+      throw new TypeError("Cloudflare Agent fork resume must be a SessionSnapshot");
+    }
+    initializeAgentStorage(context.storage);
+    context.storage.sql.exec(`CREATE TABLE IF NOT EXISTS nanocodex_cloudflare_fork_resume (
+      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+      state_id TEXT NOT NULL, digest TEXT NOT NULL
+    )`);
+    const digestBytes = new Uint8Array(await crypto.subtle.digest("SHA-256",
+      new TextEncoder().encode(JSON.stringify(forkResume))));
+    resumeDigest = [...digestBytes].map(byte => byte.toString(16).padStart(2, "0")).join("");
+    const recordedSeed = context.storage.sql.exec(
+      "SELECT state_id, digest FROM nanocodex_cloudflare_fork_resume WHERE singleton = 1",
+    ).toArray()[0];
+    const existingSessionId = storedSessionId(context.storage);
+    const existingStateId = storedStateId(context.storage);
+    // The preparation barrier may have installed the new identity already. A
+    // failed/restarted child construction may retain that identity and a
+    // revision-zero owner fence, but still has no executed checkpoint. The
+    // durable seed is unchanged; allow that cold retry and reject any real head.
+    if ((existingSessionId !== undefined || existingStateId !== undefined)
+      && !((pristinePreparedIdentity?.sessionId === existingSessionId
+          && pristinePreparedIdentity?.stateId === existingStateId)
+        || (existingSessionId !== undefined && existingStateId !== undefined
+          && (durabilityId === undefined || existingStateId === durabilityId)
+          && recordedSeed?.state_id === existingStateId
+          && recordedSeed?.digest === resumeDigest))) {
+      throw new Error("Cloudflare Agent fork resume requires a pristine Durable Object");
+    }
+    if (recordedSeed && (recordedSeed.digest !== resumeDigest
+      || (existingStateId !== undefined && recordedSeed.state_id !== existingStateId))) {
+      throw new Error("Cloudflare Agent fork resume conflicts with its retained seed");
+    }
+    const checkStateId = existingStateId ?? durabilityId;
+    if (checkStateId !== undefined && context.storage.sql.exec(
+      "SELECT revision, payload FROM nanocodex_durable_states WHERE state_id = ?", checkStateId,
+    ).toArray().some(row => row.revision !== "0" || row.payload !== null)) {
+      throw new Error("Cloudflare Agent fork resume requires pristine durability state");
+    }
+  }
+  const { sessionId, stateId } = durableIdentity(context.storage, durabilityId);
+  if (resumeDigest !== undefined) {
+    context.storage.sql.exec(
+      "INSERT OR IGNORE INTO nanocodex_cloudflare_fork_resume(singleton,state_id,digest) VALUES (1,?,?)",
+      stateId, resumeDigest);
+  }
+  const workersAi = internalRuntime?.workersAi;
+  const gateway = internalRuntime?.gateway;
+  if (gateway !== undefined && (workersAi !== undefined
+    || gateway.model !== internalConfiguration?.model
+    || gateway.reasoningEffort !== internalConfiguration?.thinking)) {
+    throw new TypeError("Gateway profile must match the pinned model and thinking, with one transport only");
+  }
+  const routedInference = internalRuntime?.inferenceForSession !== undefined;
+  const directInference = workersAi !== undefined || gateway !== undefined
+    || (routedInference && internalRuntime?.preserveRootTransport !== true);
+  if (workersAi !== undefined && (internalConfiguration?.model !== "@cf/zai-org/glm-5.3"
+    || workersAi.model !== internalConfiguration.model || workersAi.thinking !== internalConfiguration.thinking)) {
+    throw new TypeError("Workers AI profile must match the pinned model and thinking");
+  }
+  if (["@cf/zai-org/glm-5.3", "kimi-k3", "mimo-v2.6-pro"].includes(internalConfiguration?.model) && !directInference) {
+    throw new TypeError("GLM-5.3 requires a Workers AI or gateway transport binding");
+  }
+  const endpoint = gateway !== undefined ? createGatewayResponses(gateway) : workersAi === undefined ? cloudflareEgress({
+    binding: scopeCloudflareEgress(egress, subject),
+  }) : createWorkersAiResponses(workersAi.ai);
+  const frontierEndpoint = routedInference ? cloudflareEgress({ binding: scopeCloudflareEgress(egress, subject) }) : undefined;
+  const startup = deferred();
+  const transport = Transport.hostManaged({
+    ...endpoint,
+    stateless: directInference,
+    websocketPreconnect: !directInference,
+    async createResponse(url, id, request) {
+      let selected = endpoint;
+      const body = responseControlsBody(request.body, internalRuntime?.responseControls);
+      if (routedInference) {
+        // This callback rechecks retained authority on EVERY request, including
+        // the root. Never inherit the root provider when a child pin is missing.
+        // The transport session is the shared lineage; threadId identifies the
+        // actual root/child branch registered by the Rust host bridge.
+        const routedSessionId = request.threadId ?? id;
+        const profile = await internalRuntime.inferenceForSession(routedSessionId);
+        if (profile?.native === true) {
+          if (internalRuntime?.preserveRootTransport !== true || profile.gateway !== undefined || profile.workersAi !== undefined) {
+            throw new Error("Native inference cannot replace a routed transport");
+          }
+          const parsed = JSON.parse(body);
+          if (!["gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna"].includes(parsed.model)
+            || !["none", "low", "medium", "high", "xhigh", "max"].includes(parsed.reasoning?.effort)) {
+            throw new Error("Native inference requires a supported GPT model and thinking");
+          }
+          // Native roots and children retain Rust-owned live defaults/overrides.
+          // Only routed sessions have immutable model/thinking pins.
+          selected = frontierEndpoint;
+        } else {
+          if (!profile || typeof profile.model !== "string" || !["low", "medium", "high"].includes(profile.thinking)) {
+            throw new Error("Session inference route is missing or invalid");
+          }
+          if (routedSessionId === sessionId && (profile.model !== internalConfiguration?.model
+            || profile.thinking !== internalConfiguration?.thinking)) {
+            throw new Error("Root inference route conflicts with its pinned configuration");
+          }
+          const parsed = JSON.parse(body);
+          if (parsed.model !== profile.model || parsed.reasoning?.effort !== profile.thinking) {
+            throw new Error("Inference request conflicts with the session model or thinking pin");
+          }
+          if (profile.workersAi !== undefined && profile.gateway !== undefined) {
+            throw new Error("Session inference route has multiple transports");
+          }
+          if (profile.gateway !== undefined) {
+            if (profile.gateway.model !== profile.model || profile.gateway.reasoningEffort !== profile.thinking) {
+              throw new Error("Gateway profile conflicts with the session pin");
+            }
+            selected = createGatewayResponses(profile.gateway);
+          } else if (profile.workersAi !== undefined) {
+            if (profile.model !== "@cf/zai-org/glm-5.3" || profile.workersAi.model !== profile.model
+              || profile.workersAi.thinking !== profile.thinking) {
+              throw new Error("Workers AI profile conflicts with the session pin");
+            }
+            selected = createWorkersAiResponses(profile.workersAi.ai);
+          } else {
+            if (!["gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna"].includes(profile.model)) {
+              throw new Error("Session model requires an explicit inference binding");
+            }
+            selected = frontierEndpoint;
+          }
+          if (url !== `${endpoint.apiBaseUrl}/responses`) {
+            throw new Error("Routed inference supports only full-history Responses requests");
+          }
+          url = `${selected.apiBaseUrl}/responses`;
+        }
+      }
+      return selected.createResponse(url, id, { ...request, body });
+    },
+    async createWebSocket(url, id, request) {
+      if (directInference) throw new Error("Direct inference threads require HTTP Responses transport");
+      if (routedInference && (request.threadId ?? id) !== sessionId) {
+        const profile = await internalRuntime.inferenceForSession(request.threadId ?? id);
+        if (profile?.native !== true || profile.gateway !== undefined || profile.workersAi !== undefined) {
+          throw new Error("Routed children require full-history HTTP Responses transport");
+        }
+      }
+      try {
+        const preparation = request.authorization === "preconnect" ? preparedConnection : undefined;
+        if (preparation !== undefined) preparedConnection = undefined;
+        const opened = await (preparation === undefined
+          ? endpoint.createWebSocket(url, id, request) : preparation.take(url, id, request));
+        if (request.authorization === "preconnect") startup.resolve();
+        return { ...opened, socket: responseControlsSocket(opened.socket, internalRuntime?.responseControls, internalRuntime?.onRequestShape, internalRuntime?.onResponseCreateSent) };
+      } catch (error) {
+        if (request.authorization === "preconnect") startup.reject(error);
+        throw error;
+      }
+    },
+  });
+
+  const sessionReservation = prepareCloudflareAgentSession(sessionId, subject);
+  const subagentSessions = cloudflareSubagentSessions(
+    sessionReservation,
+    internalRuntime?.subagentLifecycle,
+  );
+  let agent;
+  let watcher;
+  let unwatch;
+  try {
+    agent = await hostAgent.create({
+      ...agentOptions,
+      ...(internalConfiguration === undefined ? {} : {
+        model: internalConfiguration.model,
+        thinking: internalConfiguration.thinking,
+        reasoningMode: internalConfiguration.reasoning_mode,
+        fastMode: internalConfiguration.fast_mode,
+      }),
+      module,
+      rawApiEvents: internalRuntime?.rawApiEvents,
+      toolMode: internalRuntime?.toolMode ?? "direct",
+      codeEvaluator: internalRuntime?.codeEvaluator,
+      [Symbol.for("nanocodex.browser.internalRuntime")]: {
+        toolProviders: internalRuntime?.toolProviders,
+        subagentsEnabled: internalRuntime?.subagentsEnabled,
+        subagentMaxConcurrency: internalRuntime?.subagentMaxConcurrency,
+        subagentSessions,
+        subagentRouting: internalRuntime?.subagentRouting,
+        onSocketTiming: internalRuntime?.onSocketTiming,
+        [CLOUDFLARE_SESSION_RESERVATION]: sessionReservation,
+      },
+      transport,
+      sessionId,
+      durability,
+      durabilityId: stateId,
+      ...(forkResume === undefined ? {} : { resume: forkResume }),
+    });
+    // Managed voice needs the durable session before the separate Responses
+    // relay is ready. Its preconnection remains owned by the host and a later
+    // text turn consumes it through the same credential-checked transport.
+    if (!directInference && internalRuntime?.waitForPreconnect !== false) {
+      await withTimeout(
+        startup.promise,
+        STARTUP_TIMEOUT_MS,
+        "Cloudflare Agent EGRESS startup validation timed out",
+      );
+    }
+
+    if (eventSocket !== undefined) {
+      watcher = agent.events.watch();
+      unwatch = watcher.onEvent((event) => {
+        try {
+          eventSocket.publish(event);
+        } catch (error) {
+          unwatch?.();
+          eventSocket.fail(error);
+          console.error("Nanocodex Cloudflare event projection failed", error);
+        }
+      });
+    }
+    const exposed = agent.extend((owned) => ({
+      events: {
+        connect: (request) => eventSocket?.connect(request) ?? Response.json(
+          { error: "event_persistence_caller_owned" },
+          { status: 409 },
+        ),
+      },
+      turn: {
+        ...owned.turn,
+        route: (options) => routePrompt(owned, options),
+      },
+    }));
+    const active = {};
+    lifecycle.active = active;
+    observeAgentRelease(exposed, () => {
+      if (lifecycle.active === active) lifecycle.active = undefined;
+    });
+    commitCloudflareAgentSession(sessionReservation);
+    return exposed;
+  } catch (error) {
+    const cleanupErrors = [];
+    try { unwatch?.(); } catch (cleanupError) { cleanupErrors.push(cleanupError); }
+    try { watcher?.off(); } catch (cleanupError) { cleanupErrors.push(cleanupError); }
+    if (agent) {
+      try { await agent.session.shutdown(); } catch (cleanupError) { cleanupErrors.push(cleanupError); }
+    }
+    releaseAgentSession(sessionReservation);
+    if (cleanupErrors.length > 0) {
+      const cause = new AggregateError(
+        [error, ...cleanupErrors],
+        "Cloudflare Agent creation and resource rollback both failed",
+      );
+      throw Object.assign(
+        new Error(
+          `Cloudflare Agent creation failed and rollback requires reopen: ${errorMessage(error)}`,
+          { cause },
+        ),
+        { code: "reopen_required" },
+      );
+    }
+    throw error;
+  }
+}
+
+function lifecycleFor(context) {
+  let lifecycle = lifecycles.get(context);
+  if (lifecycle === undefined) {
+    lifecycle = { active: undefined, creating: false };
+    lifecycles.set(context, lifecycle);
+  }
+  return lifecycle;
+}
+
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** @internal Creates one non-durable Agent in the current Cloudflare isolate. */
+export async function createEphemeral(module, owner, options = {}) {
+  const { egress, subject } = resolveOwner(owner);
+  const agentOptions = ephemeralApplicationOptions(options);
+  const endpoint = cloudflareEgress({
+    binding: scopeCloudflareEgress(egress, subject),
+  });
+  const startup = deferred();
+  const transport = Transport.hostManaged({
+    ...endpoint,
+    websocketPreconnect: true,
+    async createWebSocket(url, id, request) {
+      try {
+        const opened = await endpoint.createWebSocket(url, id, request);
+        if (request.authorization === "preconnect") startup.resolve();
+        return opened;
+      } catch (error) {
+        if (request.authorization === "preconnect") startup.reject(error);
+        throw error;
+      }
+    },
+  });
+
+  let agent;
+  try {
+    agent = await HostAgent.create({
+      ...agentOptions,
+      module,
+      toolMode: "direct",
+      transport,
+    });
+    await withTimeout(
+      startup.promise,
+      STARTUP_TIMEOUT_MS,
+      "Cloudflare ephemeral Agent EGRESS startup validation timed out",
+    );
+    return agent;
+  } catch (error) {
+    if (agent) await agent.session.shutdown().catch(() => {});
+    throw error;
+  }
+}
+
+function resolveOwner(owner) {
+  const context = resolveContext(owner);
+  const egress = owner.env?.NANOCODEX;
+  if (!egress || typeof egress.fetch !== "function") {
+    throw new TypeError(
+      "Cloudflare Agent.create requires the private owner.env.NANOCODEX Service Binding",
+    );
+  }
+  const subject = context.id?.toString?.();
+  if (typeof subject !== "string" || !subject) {
+    throw new TypeError("Cloudflare Agent.create requires owner.ctx.id");
+  }
+  return { context, egress, subject };
+}
+
+function resolveContext(owner) {
+  if (!owner || (typeof owner !== "object" && typeof owner !== "function")) {
+    throw new TypeError("Cloudflare Agent.create requires a Durable Object instance");
+  }
+  const context = owner.ctx;
+  if (!context || typeof context !== "object") {
+    throw new TypeError("Cloudflare Agent.create requires owner.ctx");
+  }
+  return context;
+}
+
+function applicationOptions(options) {
+  if (!options || typeof options !== "object" || Array.isArray(options)) {
+    throw new TypeError("Cloudflare Agent.create options must be an object");
+  }
+  for (const name of Object.keys(options)) {
+    if (!APPLICATION_OPTIONS.has(name)) {
+      throw new TypeError(
+        `Cloudflare Agent.create does not accept ${name}; only durabilityId, eventPersistence, instructions, additionalInstructions, terminalReceiptRetention, and tools are configurable`,
+      );
+    }
+  }
+  if (options.eventPersistence !== undefined
+    && options.eventPersistence !== "durable"
+    && options.eventPersistence !== "caller") {
+    throw new TypeError(
+      "Cloudflare Agent.create eventPersistence must be durable or caller",
+    );
+  }
+  if (options.terminalReceiptRetention !== undefined
+    && (!Number.isSafeInteger(options.terminalReceiptRetention)
+      || options.terminalReceiptRetention < 0
+      || options.terminalReceiptRetention > 4_096)) {
+    throw new TypeError(
+      "Cloudflare Agent.create terminalReceiptRetention must be an integer from 0 through 4096",
+    );
+  }
+  return options;
+}
+
+function validateInternalConfiguration(configuration) {
+  if (configuration === undefined) return;
+  if (!configuration || typeof configuration !== "object" || Array.isArray(configuration)
+    || Reflect.ownKeys(configuration).some((key) => ![
+      "model",
+      "thinking",
+      "reasoning_mode",
+      "fast_mode",
+    ].includes(key))
+    || !["gpt-6.1-sol", "gpt-6-luna", "gpt-6-astra", "@cf/zai-org/glm-5.3", "kimi-k3", "mimo-v2.6-pro"]
+      .includes(configuration.model)
+    || !["none", "low", "medium", "high", "xhigh", "max"].includes(configuration.thinking)
+    || !["standard", "pro"].includes(configuration.reasoning_mode)
+    || typeof configuration.fast_mode !== "boolean"
+    || (["@cf/zai-org/glm-5.3", "kimi-k3", "mimo-v2.6-pro"].includes(configuration.model)
+      && (!(configuration.model === "kimi-k3" ? ["low", "high"] : ["low", "medium", "high"]).includes(configuration.thinking) || configuration.reasoning_mode !== "standard"))
+    || (["gpt-6-astra", "gpt-6.1-sol"].includes(configuration.model) && configuration.thinking === "none")) {
+    throw new TypeError("Cloudflare Agent internal configuration is invalid");
+  }
+}
+
+function ephemeralApplicationOptions(options) {
+  if (!options || typeof options !== "object" || Array.isArray(options)) {
+    throw new TypeError("Cloudflare Agent.createEphemeral options must be an object");
+  }
+  for (const name of Object.keys(options)) {
+    if (!EPHEMERAL_APPLICATION_OPTIONS.has(name)) {
+      throw new TypeError(
+        `Cloudflare Agent.createEphemeral does not accept ${name}; transport and runtime policy are owned by the adapter`,
+      );
+    }
+  }
+  return options;
+}
+
+function durableIdentity(storage, configuredStateId) {
+  initializeAgentStorage(storage);
+  if (configuredStateId !== undefined
+    && (typeof configuredStateId !== "string" || !configuredStateId.trim())) {
+    throw new TypeError("Cloudflare Agent durabilityId must be a non-empty string");
+  }
+  const previousSessionId = storedSessionId(storage);
+  const previousStateId = storedStateId(storage);
+  if (previousStateId !== undefined
+    && configuredStateId !== undefined
+    && previousStateId !== configuredStateId) {
+    throw new Error("Cloudflare Agent durabilityId does not match the retained state identity");
+  }
+  const generated = previousSessionId ?? uuidV7();
+  const generatedStateId = previousStateId
+    ?? configuredStateId
+    ?? (previousSessionId === undefined ? generated : `cloudflare:${previousSessionId}`);
+  storage.transactionSync(() => {
+    storage.sql.exec(
+      "INSERT OR IGNORE INTO nanocodex_cloudflare_agent (singleton, session_id) VALUES (1, ?)",
+      generated,
+    );
+    storage.sql.exec(
+      "INSERT OR IGNORE INTO nanocodex_cloudflare_durability (singleton, state_id) VALUES (1, ?)",
+      generatedStateId,
+    );
+  });
+  const sessionId = storedSessionId(storage);
+  const stateId = storedStateId(storage);
+  if (typeof sessionId !== "string" || !sessionId) {
+    throw new Error("Cloudflare Agent failed to persist its runtime session ID");
+  }
+  if (typeof stateId !== "string" || !stateId) {
+    throw new Error("Cloudflare Agent failed to persist its durability state ID");
+  }
+  return { sessionId, stateId };
+}
+
+function initializeAgentStorage(storage) {
+  storage.sql.exec(`
+    CREATE TABLE IF NOT EXISTS nanocodex_cloudflare_agent (
+      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+      session_id TEXT NOT NULL UNIQUE
+    )
+  `);
+  storage.sql.exec(`
+    CREATE TABLE IF NOT EXISTS nanocodex_cloudflare_durability (
+      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+      state_id TEXT NOT NULL UNIQUE
+    )
+  `);
+  // These tables belonged to durable children. Root records and identity remain
+  // untouched; obsolete child data must never restore a task tree on startup.
+  storage.sql.exec("DROP TABLE IF EXISTS nanocodex_cloudflare_subagents");
+  storage.sql.exec("DROP TABLE IF EXISTS nanocodex_cloudflare_subagent_checkpoints");
+}
+
+function cloudflareSubagentSessions(reservation, lifecycle) {
+  const bindings = new Map();
+  return Object.freeze({
+    bindingDescriptor(sessionId, descriptor, hostContextRef) {
+      const retained = bindings.get(sessionId);
+      if (retained === undefined) return descriptor;
+      const original = retained.descriptor;
+      const attachesInitialProvenance = retained.hostContextRef === undefined
+        && typeof hostContextRef === "string" && descriptor.task === original.task;
+      if (original.sessionId !== descriptor.sessionId || original.agentId !== descriptor.agentId
+        || original.parentAgentId !== descriptor.parentAgentId || original.role !== descriptor.role
+        || (retained.hostContextRef !== hostContextRef && !attachesInitialProvenance)) {
+        throw new Error("Subagent binding identity or host context changed");
+      }
+      // Delegation replaces the Rust task, not its spawning-turn authority.
+      return original;
+    },
+    bind(sessionId, descriptor, hostContextRef) {
+      if (!mayBindCloudflareSubagentSession(reservation)) return;
+      if (hostContextRef !== undefined
+        && (typeof hostContextRef !== "string" || hostContextRef.length === 0)) {
+        throw new TypeError("subagent host context ref must be a non-empty string when supplied");
+      }
+      notifySubagentLifecycle(lifecycle, {
+        type: "bind", rootSessionId: reservation.sessionId,
+        sessionId, descriptor, hostContextRef,
+      });
+      bindings.set(sessionId, { descriptor, hostContextRef });
+    },
+    release(sessionId, hostContextRef) {
+      if (!mayReleaseCloudflareSubagentSession(reservation)) return;
+      const retained = bindings.get(sessionId);
+      if (retained === undefined || retained.hostContextRef !== hostContextRef) return;
+      // Closing a parent releases its complete live subtree.
+      const removed = new Set([retained.descriptor.agentId]);
+      let changed;
+      do {
+        changed = false;
+        for (const { descriptor } of bindings.values()) {
+          if (removed.has(descriptor.parentAgentId) && !removed.has(descriptor.agentId)) {
+            removed.add(descriptor.agentId);
+            changed = true;
+          }
+        }
+      } while (changed);
+      for (const { descriptor, hostContextRef: context } of bindings.values()) {
+        if (!removed.has(descriptor.agentId)) continue;
+        notifySubagentLifecycle(lifecycle, {
+          type: "release", rootSessionId: reservation.sessionId,
+          sessionId: descriptor.sessionId, hostContextRef: context,
+        });
+        bindings.delete(descriptor.sessionId);
+      }
+    },
+  });
+}
+
+function notifySubagentLifecycle(lifecycle, event) {
+  if (lifecycle === undefined) return;
+  lifecycle(Object.freeze(event));
+}
+
+function storedSessionId(storage) {
+  return storage.sql.exec(
+    "SELECT session_id FROM nanocodex_cloudflare_agent WHERE singleton = 1",
+  ).toArray()[0]?.session_id;
+}
+
+function storedStateId(storage) {
+  return storage.sql.exec(
+    "SELECT state_id FROM nanocodex_cloudflare_durability WHERE singleton = 1",
+  ).toArray()[0]?.state_id;
+}
+
+function legacyStateId(storage) {
+  const sessionId = storedSessionId(storage);
+  return sessionId === undefined ? undefined : `cloudflare:${sessionId}`;
+}
+
+function uuidV7() {
+  if (typeof globalThis.crypto?.getRandomValues !== "function") {
+    throw new Error("Cloudflare Agent requires crypto.getRandomValues()");
+  }
+  const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16));
+  let timestamp = Date.now();
+  for (let index = 5; index >= 0; index -= 1) {
+    bytes[index] = timestamp % 256;
+    timestamp = Math.floor(timestamp / 256);
+  }
+  bytes[6] = (bytes[6] & 0x0f) | 0x70;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const encoded = [...bytes].map((byte) => byte.toString(16).padStart(2, "0"));
+  return `${encoded.slice(0, 4).join("")}-${encoded.slice(4, 6).join("")}-${encoded.slice(6, 8).join("")}-${encoded.slice(8, 10).join("")}-${encoded.slice(10).join("")}`;
+}
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((onResolve, onReject) => {
+    resolve = onResolve;
+    reject = onReject;
+  });
+  // Preconnect may fail before HostAgent.create returns and installs the
+  // startup waiter. Mark the original promise handled without changing what
+  // the later await observes.
+  void promise.catch(() => {});
+  return { promise, resolve, reject };
+}
+
+async function withTimeout(promise, timeoutMs, message) {
+  let timer;
+  try {
+    await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Read a single Rust-owned receipt without loading/fencing the execution. */
+export function steerReceipt(owner, operationId, messageId) {
+  const { storage } = resolveContext(owner);
+  const tables = storage.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('nanocodex_cloudflare_durability', 'nanocodex_durable_states')").toArray();
+  if (tables.length !== 2) return null;
+  const stateId = storedStateId(storage);
+  if (stateId === undefined) return null;
+  const path = `$.nanocodex_durable_state.operations.${JSON.stringify(operationId)}.steer_receipts.${JSON.stringify(messageId)}`;
+  const row = storage.sql.exec("SELECT json_extract(payload, ?) AS receipt FROM nanocodex_durable_states WHERE state_id = ?", path, stateId).toArray()[0];
+  if (row?.receipt == null) return null;
+  const receipt = JSON.parse(row.receipt);
+  if (!/^[a-f0-9]{64}$/.test(receipt.input_key) || !Number.isSafeInteger(receipt.index) || receipt.index < 1 || typeof receipt.withdrawn !== "boolean") {
+    throw new Error("invalid durable steer receipt");
+  }
+  return Object.freeze(receipt);
+}

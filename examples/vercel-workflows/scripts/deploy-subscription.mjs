@@ -47,8 +47,15 @@ await addEnvironment("WORKFLOW_SEQUENTIAL_REPLAYS", "1", false);
 if (process.env.NANOCODEX_ADMIN_TOKEN?.trim()) {
   await addEnvironment("NANOCODEX_ADMIN_TOKEN", process.env.NANOCODEX_ADMIN_TOKEN.trim(), true);
 }
+if (process.env.NANOCODEX_TERMINAL_TOKEN?.trim()) {
+  await addEnvironment(
+    "NANOCODEX_TERMINAL_TOKEN",
+    process.env.NANOCODEX_TERMINAL_TOKEN.trim(),
+    true,
+  );
+}
 
-await run("./scripts/build-js-package.sh", [], repositoryRoot);
+await run("./js/nanocodex-vite/scripts/build-js-package.sh", [], repositoryRoot);
 const temporaryRoot = await mkdtemp(join(tmpdir(), "nanocodex-vercel-deploy-"));
 const stagingRoot = join(temporaryRoot, "app");
 try {
@@ -61,7 +68,7 @@ try {
   });
   const packed = (await capture(
     "npm",
-    ["pack", resolve(repositoryRoot, "js/bindings"), "--pack-destination", temporaryRoot],
+    ["pack", resolve(repositoryRoot, "js/nanocodex"), "--pack-destination", temporaryRoot],
     repositoryRoot,
   )).trim().split("\n").at(-1);
   if (!packed) throw new Error("npm pack did not return an archive name");

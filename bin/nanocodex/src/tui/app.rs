@@ -28,7 +28,7 @@ use super::composer::ComposerLayout;
 use super::selection::{
     ScreenSelection, SelectionClick, SelectionScrollDirection, SelectionScrollRequest,
 };
-use super::transcript::{ToolStatus, Transcript, TranscriptItem};
+use super::transcript::{InlineEdit, ToolStatus, Transcript, TranscriptItem};
 
 const MAX_TOOL_ARGUMENT_CHARS: usize = 180;
 const MAX_MULTILINE_TOOL_ARGUMENT_CHARS: usize = 4_000;
@@ -63,6 +63,12 @@ pub(super) const STANDARD_THINKING_OPTIONS: [(Thinking, &str, &str); 4] = [
     ),
 ];
 
+pub(super) const MODEL_OPTIONS: [(Model, &str); 3] = [
+    (Model::Astra, "Astra"),
+    (Model::Sol, "Sol"),
+    (Model::Luna, "Luna"),
+];
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ReasoningPicker {
     Standard { selected: usize },
@@ -73,6 +79,11 @@ pub(super) enum ReasoningPicker {
 pub(super) enum ReasoningPickerAction {
     OpenedAdvanced,
     Selected(Thinking),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ModelPickerAction {
+    Selected(Model),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -90,6 +101,7 @@ struct PendingPaste {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SubmittedPrompt {
     display: String,
+    instruction: Option<String>,
     local_images: Vec<PathBuf>,
 }
 
@@ -97,6 +109,7 @@ impl SubmittedPrompt {
     const fn new(display: String, local_images: Vec<PathBuf>) -> Self {
         Self {
             display,
+            instruction: None,
             local_images,
         }
     }
@@ -111,19 +124,42 @@ impl SubmittedPrompt {
 
     pub(super) fn set_display(&mut self, display: String) {
         self.display = display;
+        self.instruction = None;
     }
 
-    pub(super) fn prepend_text(&mut self, prefix: &str) {
-        self.display.insert_str(0, prefix);
+    pub(super) fn set_instruction(&mut self, instruction: String) {
+        self.instruction = Some(instruction);
+    }
+
+    pub(super) fn prepend_instruction(&mut self, prefix: &str) {
+        let instruction = self.instruction.get_or_insert_with(|| self.display.clone());
+        instruction.insert_str(0, prefix);
     }
 
     fn append(&mut self, mut other: Self) {
         let image_offset = self.local_images.len();
         for index in (1..=other.local_images.len()).rev() {
-            other.display = other.display.replace(
-                &format!("[Image #{index}]"),
-                &format!("[Image #{}]", image_offset + index),
-            );
+            let old = format!("[Image #{index}]");
+            let new = format!("[Image #{}]", image_offset + index);
+            other.display = other.display.replace(&old, &new);
+            if let Some(instruction) = &mut other.instruction {
+                *instruction = instruction.replace(&old, &new);
+            }
+        }
+        if self.instruction.is_some() || other.instruction.is_some() {
+            let mut instruction = self
+                .instruction
+                .take()
+                .unwrap_or_else(|| self.display.clone());
+            let other_instruction = other
+                .instruction
+                .take()
+                .unwrap_or_else(|| other.display.clone());
+            if !instruction.is_empty() && !other_instruction.is_empty() {
+                instruction.push('\n');
+            }
+            instruction.push_str(&other_instruction);
+            self.instruction = Some(instruction);
         }
         if !self.display.is_empty() && !other.display.is_empty() {
             self.display.push('\n');
@@ -133,8 +169,9 @@ impl SubmittedPrompt {
     }
 
     pub(super) fn into_prompt(self) -> Prompt {
+        let instruction = self.instruction.unwrap_or(self.display);
         if self.local_images.is_empty() {
-            return Prompt::new(self.display);
+            return Prompt::new(instruction);
         }
 
         let mut content = self
@@ -142,8 +179,8 @@ impl SubmittedPrompt {
             .into_iter()
             .map(|path| UserInput::LocalImage { path, detail: None })
             .collect::<Vec<_>>();
-        if !self.display.is_empty() {
-            content.push(UserInput::Text { text: self.display });
+        if !instruction.is_empty() {
+            content.push(UserInput::Text { text: instruction });
         }
         Prompt::content(content)
     }
@@ -228,6 +265,8 @@ pub(super) struct Conversation {
     viewport_height: Option<u16>,
     pending_scroll_anchor: Option<PendingScrollAnchor>,
     streamed_this_turn: bool,
+    first_response_pending: bool,
+    first_response_redraw_pending: bool,
     pending_run_error: Option<String>,
     run_started_at: Option<Instant>,
     pending_code_execs: HashMap<String, PendingCodeExec>,
@@ -261,6 +300,8 @@ impl Conversation {
             viewport_height: None,
             pending_scroll_anchor: None,
             streamed_this_turn: false,
+            first_response_pending: false,
+            first_response_redraw_pending: false,
             pending_run_error: None,
             run_started_at: None,
             pending_code_execs: HashMap::new(),
@@ -289,11 +330,6 @@ impl Conversation {
         self.run_started_at
             .map(|started_at| now.saturating_duration_since(started_at))
             .unwrap_or_default()
-    }
-
-    #[cfg(test)]
-    pub(super) const fn set_run_started_at(&mut self, started_at: Instant) {
-        self.run_started_at = Some(started_at);
     }
 
     fn queue_prompt(&mut self, id: u64, prompt: String) {
@@ -366,6 +402,8 @@ impl Conversation {
 
     fn on_agent_event(&mut self, event: &AgentEvent) -> bool {
         match event.kind {
+            // Submitted-input rows are already owned by the local composer queue.
+            AgentEventKind::InputAccepted => return false,
             AgentEventKind::RunStarted => {
                 if let (Some(prompt), Some(prompt_id)) = (
                     self.queued_prompts.pop_front(),
@@ -379,6 +417,8 @@ impl Conversation {
                 self.last_cost_usd = None;
                 self.run_generation = self.run_generation.saturating_add(1);
                 self.streamed_this_turn = false;
+                self.first_response_pending = false;
+                self.first_response_redraw_pending = false;
                 self.pending_run_error = None;
                 self.run_started_at = Some(Instant::now());
                 self.pending_code_execs.clear();
@@ -485,6 +525,7 @@ impl Conversation {
         }
         if payload.tool == "write_stdin"
             && let Some(session_id) = tool_integer_argument(&payload.arguments, "session_id")
+            && self.running_shell_sessions.contains_key(&session_id)
         {
             self.hidden_terminal_calls
                 .insert(payload.call_id, session_id);
@@ -526,10 +567,33 @@ impl Conversation {
     }
 
     fn on_tool_result(&mut self, event: &AgentEvent) -> bool {
-        let Ok(payload) = event.decode_payload::<ToolResultPayload>() else {
+        let Ok(mut payload) = event.decode_payload::<ToolResultPayload>() else {
             return false;
         };
+        payload.structured_result = normalize_tool_result(payload.structured_result);
+        if payload.structured_result.is_null()
+            || payload
+                .structured_result
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty)
+            || payload
+                .structured_result
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        {
+            payload.structured_result =
+                normalize_tool_result(payload.result.clone().unwrap_or_default());
+        }
         let status = match payload.status.as_str() {
+            "completed"
+                if (matches!(
+                    payload.tool.as_deref(),
+                    Some("exec_command" | "write_stdin")
+                ) || self.hidden_terminal_calls.contains_key(&payload.call_id))
+                    && shell_result_failed(&payload.structured_result) =>
+            {
+                ToolStatus::Failed
+            }
             "completed" => ToolStatus::Completed,
             "cancelled" => ToolStatus::Cancelled,
             _ => ToolStatus::Failed,
@@ -544,42 +608,80 @@ impl Conversation {
             return self.on_cell_transport_result(&cell_id, &payload, status);
         }
         let pending_code_exec = self.pending_code_execs.contains_key(&payload.call_id);
-        if payload.tool.as_deref() == Some("exec_command")
+        let shell_tool = matches!(
+            payload.tool.as_deref(),
+            Some("exec_command" | "write_stdin")
+        );
+        if shell_tool
             && status == ToolStatus::Completed
-            && let Some(session_id) = payload.result.as_ref().and_then(result_session_id)
+            && let Some(session_id) = result_session_id(&payload.structured_result)
+            && payload
+                .structured_result
+                .get("exit_code")
+                .and_then(Value::as_i64)
+                .is_none()
         {
-            self.running_shell_sessions.insert(
-                session_id,
-                ContinuedTool::new(
-                    payload.call_id,
-                    payload.started_after_ns,
-                    payload.duration_ns,
-                ),
+            let mut continued = ContinuedTool::new(
+                payload.call_id,
+                payload.started_after_ns,
+                payload.duration_ns,
+                self.run_generation,
             );
-            return true;
+            continued.result = merge_terminal_result(Value::Null, payload.structured_result);
+            let result = Some(summarize_tool_result(
+                Some("exec_command"),
+                &continued.result,
+                ToolStatus::Running,
+            ));
+            let changed = self.finish_continued_tool(&continued, ToolStatus::Running, result);
+            self.running_shell_sessions.insert(session_id, continued);
+            return changed;
         }
         if (payload.tool.as_deref() == Some("exec") || pending_code_exec)
             && status == ToolStatus::Completed
             && let Some(cell_id) = payload.result.as_ref().and_then(running_cell_id)
         {
-            let visible = self.pending_code_execs.remove(&payload.call_id).is_none();
-            self.running_cells.insert(
-                cell_id,
-                ContinuedTool::new(
-                    payload.call_id,
-                    payload.started_after_ns,
-                    payload.duration_ns,
-                ),
+            let mut continued = ContinuedTool::new(
+                payload.call_id.clone(),
+                payload.started_after_ns,
+                payload.duration_ns,
+                self.run_generation,
             );
-            return visible;
+            continued.arguments = self
+                .pending_code_execs
+                .remove(&payload.call_id)
+                .map(|pending| pending.arguments);
+            let changed = self.update_continued_code(
+                &mut continued,
+                payload.result.as_ref(),
+                ToolStatus::Running,
+            );
+            self.running_cells.insert(cell_id, continued);
+            return changed;
         }
-        if self.pending_code_execs.remove(&payload.call_id).is_some() {
-            return false;
+        if let Some(pending) = self.pending_code_execs.remove(&payload.call_id) {
+            let output = payload
+                .result
+                .as_ref()
+                .map(|result| summarize_tool_result(Some("exec"), result, status))
+                .unwrap_or_default();
+            if output.is_empty() && matches!(status, ToolStatus::Completed | ToolStatus::Cancelled)
+            {
+                return false;
+            }
+            self.push_output(TranscriptItem::Tool {
+                call_id: payload.call_id.clone(),
+                name: "exec".to_owned(),
+                arguments: pending.arguments,
+                status,
+            });
         }
-        let result = payload
-            .result
-            .as_ref()
-            .map(|result| summarize_tool_result(payload.tool.as_deref(), result, status));
+        let result = if shell_tool {
+            Some(&payload.structured_result)
+        } else {
+            payload.result.as_ref()
+        }
+        .map(|result| summarize_tool_result(payload.tool.as_deref(), result, status));
         self.note_tail_will_change();
         let _ = if payload.started_after_ns.is_some() {
             self.transcript.set_tool_result_timing(
@@ -622,22 +724,31 @@ impl Conversation {
         let Some(mut continued) = self.running_shell_sessions.remove(&session_id) else {
             return false;
         };
-        continued.add_duration(payload.duration_ns);
-        if status == ToolStatus::Completed
-            && payload
+        continued.add_timing(
+            payload.started_after_ns,
+            payload.duration_ns,
+            self.run_generation,
+        );
+        continued.result =
+            merge_terminal_result(continued.result, payload.structured_result.clone());
+        let running = status == ToolStatus::Completed
+            && result_session_id(&continued.result).is_some()
+            && continued
                 .result
-                .as_ref()
-                .and_then(result_session_id)
-                .is_some()
-        {
+                .get("exit_code")
+                .and_then(Value::as_i64)
+                .is_none();
+        let status = if running { ToolStatus::Running } else { status };
+        let result = Some(summarize_tool_result(
+            Some("exec_command"),
+            &continued.result,
+            status,
+        ));
+        let changed = self.finish_continued_tool(&continued, status, result);
+        if running {
             self.running_shell_sessions.insert(session_id, continued);
-            return false;
         }
-        let result = payload
-            .result
-            .as_ref()
-            .map(|result| summarize_tool_result(Some("exec_command"), result, status));
-        self.finish_continued_tool(&continued, status, result)
+        changed
     }
 
     fn on_cell_transport_result(
@@ -649,18 +760,51 @@ impl Conversation {
         let Some(mut continued) = self.running_cells.remove(cell_id) else {
             return false;
         };
-        continued.add_duration(payload.duration_ns);
-        if status == ToolStatus::Completed
-            && payload.result.as_ref().and_then(running_cell_id).is_some()
-        {
+        continued.add_timing(
+            payload.started_after_ns,
+            payload.duration_ns,
+            self.run_generation,
+        );
+        let running = status == ToolStatus::Completed
+            && payload.result.as_ref().and_then(running_cell_id).is_some();
+        let status = if running { ToolStatus::Running } else { status };
+        let changed = self.update_continued_code(&mut continued, payload.result.as_ref(), status);
+        if running {
             self.running_cells.insert(cell_id.to_owned(), continued);
-            return false;
         }
-        let result = payload
-            .result
-            .as_ref()
-            .map(|result| summarize_tool_result(Some("exec"), result, status));
-        self.finish_continued_tool(&continued, status, result)
+        changed
+    }
+
+    fn update_continued_code(
+        &mut self,
+        continued: &mut ContinuedTool,
+        result: Option<&Value>,
+        status: ToolStatus,
+    ) -> bool {
+        let output = result
+            .map(|result| summarize_tool_result(Some("exec"), result, status))
+            .unwrap_or_default();
+        let previous = continued.result.as_str().unwrap_or_default();
+        let combined = if previous.is_empty() {
+            output
+        } else if output.is_empty() {
+            previous.to_owned()
+        } else {
+            format!("{previous}\n{output}")
+        };
+        let combined = bounded_multiline_text(&combined, 64 * 1024, 128);
+        if (!combined.is_empty() || matches!(status, ToolStatus::Failed | ToolStatus::Cancelled))
+            && let Some(arguments) = continued.arguments.take()
+        {
+            self.push_output(TranscriptItem::Tool {
+                call_id: continued.call_id.clone(),
+                name: "exec".to_owned(),
+                arguments,
+                status,
+            });
+        }
+        continued.result = Value::String(combined.clone());
+        self.finish_continued_tool(continued, status, Some(combined))
     }
 
     fn finish_continued_tool(
@@ -775,7 +919,12 @@ impl Conversation {
     }
 
     pub(super) fn push_assistant_delta(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
         let append_to_current = self.streamed_this_turn;
+        self.first_response_pending |= !append_to_current;
+        self.first_response_redraw_pending |= !append_to_current;
         self.streamed_this_turn = true;
         if append_to_current && self.transcript.tail_is_assistant() {
             self.note_tail_will_change();
@@ -810,6 +959,7 @@ impl Conversation {
     ) {
         let viewport_changed =
             self.viewport_width != Some(width) || self.viewport_height != Some(height);
+        let first_response = std::mem::take(&mut self.first_response_pending);
         if let Some(pending) = self.pending_scroll_anchor.take() {
             let changed_tail_rows = pending.changed_tail.map_or(0, |(index, before)| {
                 self.transcript
@@ -834,8 +984,20 @@ impl Conversation {
                     .saturating_add(changed_tail_rows)
                     .saturating_add(new_entry_rows)
                     .saturating_sub(usize::from(height));
-                self.queue_smooth_scroll(viewport_shift);
+                if !first_response {
+                    self.queue_smooth_scroll(viewport_shift);
+                }
             }
+        }
+        // A new answer must be visible in its first frame. Keep manual history
+        // and selection anchoring, but do not animate the response in from below
+        // the viewport when the reader is following the live bottom.
+        if first_response
+            && self.scroll_from_bottom == 0
+            && self.selected_user.is_none()
+            && !preserve_view
+        {
+            self.smooth_scroll_from_bottom = 0;
         }
         self.viewport_width = Some(width);
         self.viewport_height = Some(height);
@@ -1009,6 +1171,8 @@ fn smooth_scroll_drain(pending_rows: usize) -> usize {
 pub(super) struct BtwPane {
     pub(super) id: u64,
     pub(super) request_id: Option<Arc<str>>,
+    collapsing: bool,
+    splitting: bool,
     pub(super) conversation: Conversation,
 }
 
@@ -1137,6 +1301,7 @@ fn append_branch_tree(
 }
 
 pub(super) struct App {
+    pub(super) voice: super::voice::VoiceUi,
     pub(super) cwd: PathBuf,
     pub(super) main: Conversation,
     main_branch_id: u64,
@@ -1162,10 +1327,12 @@ pub(super) struct App {
     next_input_id: u64,
     cancel_confirmation: Option<CancelConfirmation>,
     screen_selection: ScreenSelection,
+    pending_link_destination: Option<String>,
     tool_details_expanded: bool,
     fast_mode: bool,
     model: Model,
     thinking: Thinking,
+    model_picker: Option<usize>,
     reasoning_picker: Option<ReasoningPicker>,
 }
 
@@ -1187,10 +1354,39 @@ pub(super) enum EscapeAction {
 }
 
 impl App {
+    pub(super) fn reject_external(&mut self, target: PaneId, id: u64, steer: bool, error: String) {
+        if steer {
+            self.steer_failed(target, id, error);
+        } else if let Some(conversation) = self.conversation_mut(target) {
+            conversation.remove_queued_prompt(id);
+            conversation.push_output(TranscriptItem::Error(error));
+        }
+    }
+
+    pub(super) fn control_snapshot(&self) -> serde_json::Value {
+        let conversation = self.conversation(self.focus);
+        let menu = if self.model_picker.is_some() {
+            Some("model")
+        } else if self.reasoning_picker.is_some() {
+            Some("effort")
+        } else if self.branch_navigator.is_some() {
+            Some("branches")
+        } else {
+            None
+        };
+        serde_json::json!({"connection": if self.pending_branch_switch.is_some() || self.pending_historical_edit.is_some() {"switching"} else {"ready"},
+            "execution": if conversation.is_some_and(|c| c.running || c.pending_turns > 0) {"running"} else {"idle"},
+            "composer":{"text":self.input,"cursor":self.cursor,"attachments":self.local_images.iter().map(|i| serde_json::json!({"path":i.path,"placeholder":i.placeholder})).collect::<Vec<_>>()},
+            "menu":menu,"ui_blocked": self.historical_editor.is_some() || self.cancel_confirmation.is_some(),
+            "questions":{"supported":false},
+            "settings":{"model":self.model.as_str(),"effort":self.thinking.to_string(),"fast_mode":self.fast_mode,"model_mutable":self.focus == PaneId::Main && self.can_change_start_settings(),"mutable":self.focus == PaneId::Main}})
+    }
+
     pub(super) fn new(cwd: PathBuf) -> Self {
         Self {
             cwd,
             main: Conversation::new("Ready"),
+            voice: super::voice::VoiceUi::default(),
             main_branch_id: 0,
             main_branch_parent_id: None,
             main_branch_request_id: None,
@@ -1214,10 +1410,12 @@ impl App {
             next_input_id: 1,
             cancel_confirmation: None,
             screen_selection: ScreenSelection::default(),
+            pending_link_destination: None,
             tool_details_expanded: true,
             fast_mode: false,
             model: Model::default(),
             thinking: Thinking::default(),
+            model_picker: None,
             reasoning_picker: None,
         }
     }
@@ -2079,6 +2277,8 @@ impl App {
         self.btw = Some(BtwPane {
             id,
             request_id: None,
+            collapsing: false,
+            splitting: false,
             conversation,
         });
         if !self.tool_details_expanded
@@ -2117,17 +2317,137 @@ impl App {
     }
 
     pub(super) fn btw_busy(&self) -> bool {
+        self.btw.as_ref().is_some_and(|btw| {
+            btw.collapsing
+                || btw.splitting
+                || btw.conversation.running
+                || btw.conversation.pending_turns > 0
+        })
+    }
+
+    pub(super) fn btw_collapsing(&self, id: u64) -> bool {
         self.btw
             .as_ref()
-            .is_some_and(|btw| btw.conversation.running || btw.conversation.pending_turns > 0)
+            .is_some_and(|btw| btw.id == id && btw.collapsing)
+    }
+
+    pub(super) fn btw_splitting(&self, id: u64) -> bool {
+        self.btw
+            .as_ref()
+            .is_some_and(|btw| btw.id == id && btw.splitting)
     }
 
     pub(super) fn reject_btw_close_while_busy(&mut self) {
         if let Some(btw) = self.btw.as_mut() {
+            let (error, status) = if btw.collapsing {
+                ("BTW is already collapsing into main", "Collapsing BTW")
+            } else if btw.splitting {
+                ("BTW is already moving to another terminal", "Moving BTW")
+            } else {
+                (
+                    "BTW has an active or queued turn; wait for it to finish before /close",
+                    "BTW still running",
+                )
+            };
+            btw.conversation
+                .push_output(TranscriptItem::Error(error.to_owned()));
+            status.clone_into(&mut btw.conversation.status);
+        }
+    }
+
+    pub(super) fn reject_btw_collapse_while_busy(&mut self) {
+        if let Some(btw) = self.btw.as_mut() {
+            let (error, status) = if btw.collapsing {
+                ("BTW is already collapsing into main", "Collapsing BTW")
+            } else if btw.splitting {
+                ("BTW is already moving to another terminal", "Moving BTW")
+            } else {
+                (
+                    "BTW has an active or queued turn; wait for it to finish before /collapse",
+                    "BTW still running",
+                )
+            };
+            btw.conversation
+                .push_output(TranscriptItem::Error(error.to_owned()));
+            status.clone_into(&mut btw.conversation.status);
+        }
+    }
+
+    pub(super) fn begin_btw_collapse(&mut self, id: u64) -> bool {
+        let Some(btw) = self.btw.as_mut().filter(|btw| btw.id == id) else {
+            return false;
+        };
+        if btw.request_id.is_none() {
             btw.conversation.push_output(TranscriptItem::Error(
-                "BTW has an active or queued turn; wait for it to finish before /close".to_owned(),
+                "wait for the BTW fork to finish opening before /collapse".to_owned(),
+            ));
+            "BTW still opening".clone_into(&mut btw.conversation.status);
+            return false;
+        }
+        btw.collapsing = true;
+        "Collapsing BTW into main".clone_into(&mut btw.conversation.status);
+        true
+    }
+
+    pub(super) fn btw_collapse_completed(&mut self, id: u64) {
+        self.close_btw(id);
+    }
+
+    pub(super) fn btw_collapse_failed(&mut self, id: u64, error: String) {
+        if let Some(btw) = self.btw.as_mut().filter(|btw| btw.id == id) {
+            btw.collapsing = false;
+            btw.conversation.push_output(TranscriptItem::Error(error));
+            "Collapse unavailable".clone_into(&mut btw.conversation.status);
+        }
+    }
+
+    pub(super) fn reject_btw_split_while_busy(&mut self) {
+        if let Some(btw) = self.btw.as_mut() {
+            btw.conversation.push_output(TranscriptItem::Error(
+                "BTW has an active or queued turn; wait for it to finish before /split".to_owned(),
             ));
             "BTW still running".clone_into(&mut btw.conversation.status);
+        }
+    }
+
+    pub(super) fn begin_btw_split(&mut self, id: u64) -> bool {
+        let Some(btw) = self.btw.as_mut().filter(|btw| btw.id == id) else {
+            return false;
+        };
+        if btw.request_id.is_none() {
+            btw.conversation.push_output(TranscriptItem::Error(
+                "wait for the BTW fork to finish opening before /split".to_owned(),
+            ));
+            "BTW still opening".clone_into(&mut btw.conversation.status);
+            return false;
+        }
+        btw.splitting = true;
+        "Moving BTW to another terminal".clone_into(&mut btw.conversation.status);
+        true
+    }
+
+    pub(super) fn btw_split_completed(&mut self, id: u64, destination: &str) {
+        if self.btw_id() != Some(id) {
+            return;
+        }
+        self.close_btw(id);
+        self.main.status = format!("BTW moved to {destination}");
+    }
+
+    pub(super) fn btw_split_failed(&mut self, id: u64, error: String, detached: bool) {
+        if self.btw_id() != Some(id) {
+            return;
+        }
+        if detached {
+            self.close_btw(id);
+            self.main.push_output(TranscriptItem::Error(error));
+            "BTW detached; terminal launch failed".clone_into(&mut self.main.status);
+            return;
+        }
+        if let Some(btw) = self.btw.as_mut() {
+            btw.splitting = false;
+            btw.conversation.push_output(TranscriptItem::Error(error));
+            "Split unavailable".clone_into(&mut btw.conversation.status);
         }
     }
 
@@ -2300,6 +2620,13 @@ impl App {
             .is_some_and(|conversation| conversation.running)
     }
 
+    pub(super) const fn main_accepts_automatic_prompt(&self) -> bool {
+        !self.main.running
+            && self.main.pending_turns == 0
+            && self.pending_historical_edit.is_none()
+            && self.pending_branch_switch.is_none()
+    }
+
     pub(super) fn has_input(&self) -> bool {
         !self.input.chars().all(char::is_whitespace)
     }
@@ -2417,6 +2744,7 @@ impl App {
     }
 
     pub(super) fn begin_mouse_selection(&mut self, position: Position) -> bool {
+        self.pending_link_destination = None;
         let changed = self.screen_selection.begin(position);
         if self.screen_selection.is_active() {
             self.main.scroll_up(0);
@@ -2433,11 +2761,16 @@ impl App {
 
     pub(super) fn finish_mouse_selection(&mut self, position: Position) -> bool {
         let changed = self.screen_selection.finish(position);
-        let clicked = self
-            .screen_selection
-            .take_pending_click()
-            .is_some_and(|click| self.place_composer_cursor(click));
+        let click = self.screen_selection.take_pending_click();
+        self.pending_link_destination = click
+            .as_ref()
+            .and_then(|click| self.transcript_link_destination(*click));
+        let clicked = click.is_some_and(|click| self.place_composer_cursor(click));
         changed || clicked
+    }
+
+    pub(super) fn take_pending_link_destination(&mut self) -> Option<String> {
+        self.pending_link_destination.take()
     }
 
     pub(super) fn clear_mouse_selection(&mut self) -> bool {
@@ -2493,6 +2826,39 @@ impl App {
             conversation.selected_user = None;
         }
         changed
+    }
+
+    fn transcript_link_destination(&self, click: SelectionClick) -> Option<String> {
+        let inline_edit = self.historical_editor_index().map(|index| InlineEdit {
+            index,
+            input: self.input.as_str(),
+            cursor: self.cursor,
+        });
+        let conversation = if click.surface_index == 0 {
+            if let Some(selected) = self.branch_navigator {
+                if selected == self.main_branch_id {
+                    &self.main
+                } else {
+                    self.main_branches
+                        .iter()
+                        .find(|branch| branch.id == selected)
+                        .map_or(&self.main, |branch| &branch.conversation)
+                }
+            } else {
+                &self.main
+            }
+        } else if click.surface_index == 1 {
+            &self.btw.as_ref()?.conversation
+        } else {
+            return None;
+        };
+        conversation.transcript.link_destination_at(
+            click.surface,
+            conversation.display_scroll_from_bottom(),
+            conversation.selected_user,
+            inline_edit.filter(|_| click.surface_index == 0),
+            click.position,
+        )
     }
 
     fn auto_scroll_mouse_selection(&mut self, request: SelectionScrollRequest) {
@@ -2553,6 +2919,28 @@ impl App {
         transcript.semanticize_copy(text)
     }
 
+    // Consume scheduling independently of viewport settlement: branch navigation
+    // may render another conversation while this response remains offscreen.
+    pub(super) fn take_first_response_redraw(&mut self) -> bool {
+        let mut pending = std::mem::take(&mut self.main.first_response_redraw_pending);
+        if let Some(btw) = &mut self.btw {
+            pending |= std::mem::take(&mut btw.conversation.first_response_redraw_pending);
+        }
+        for branch in &mut self.main_branches {
+            pending |= std::mem::take(&mut branch.conversation.first_response_redraw_pending);
+        }
+        pending
+    }
+
+    #[cfg(test)]
+    pub(super) fn first_response_pending(&self) -> bool {
+        self.main.first_response_pending
+            || self
+                .btw
+                .as_ref()
+                .is_some_and(|btw| btw.conversation.first_response_pending)
+    }
+
     pub(super) fn advance_smooth_scroll(&mut self) {
         self.main.advance_smooth_scroll();
         if let Some(btw) = &mut self.btw {
@@ -2582,6 +2970,14 @@ impl App {
         self.fast_mode
     }
 
+    pub(super) fn can_change_start_settings(&self) -> bool {
+        self.main.run_generation == 0
+            && self.main.pending_turns == 0
+            && self.main.transcript.is_empty()
+            && self.main_branches.is_empty()
+            && self.btw.is_none()
+    }
+
     pub(super) const fn fast_mode_changed(&mut self, enabled: bool) {
         self.fast_mode = enabled;
     }
@@ -2597,6 +2993,45 @@ impl App {
 
     pub(super) const fn model(&self) -> Model {
         self.model
+    }
+
+    pub(super) const fn model_changed(&mut self, model: Model) {
+        self.model = model;
+    }
+
+    pub(super) fn model_change_failed(&mut self, error: &str) {
+        self.push_active_error(format!("Could not change model: {error}"));
+        self.set_active_status("Model unchanged");
+    }
+
+    pub(super) const fn model_picker(&self) -> Option<usize> {
+        self.model_picker
+    }
+
+    pub(super) fn open_model_picker(&mut self) {
+        let selected = MODEL_OPTIONS
+            .iter()
+            .position(|(model, _)| *model == self.model)
+            .unwrap_or(0);
+        self.model_picker = Some(selected);
+    }
+
+    pub(super) fn move_model_picker(&mut self, direction: isize) {
+        let Some(selected) = &mut self.model_picker else {
+            return;
+        };
+        *selected = selected
+            .saturating_add_signed(direction)
+            .min(MODEL_OPTIONS.len().saturating_sub(1));
+    }
+
+    pub(super) fn confirm_model_picker(&mut self) -> Option<ModelPickerAction> {
+        let selected = self.model_picker.take()?;
+        Some(ModelPickerAction::Selected(MODEL_OPTIONS[selected].0))
+    }
+
+    pub(super) const fn close_model_picker(&mut self) {
+        self.model_picker = None;
     }
 
     pub(super) const fn reasoning_picker(&self) -> Option<ReasoningPicker> {
@@ -2870,29 +3305,62 @@ struct ToolResultPayload {
     started_after_ns: Option<u64>,
     #[serde(default)]
     result: Option<Value>,
+    #[serde(default)]
+    structured_result: Value,
 }
 
 struct ContinuedTool {
     call_id: String,
     started_after_ns: Option<u64>,
     duration_ns: Option<u64>,
+    result: Value,
+    run_generation: u64,
+    received_at: Instant,
+    initial_duration_ns: u64,
+    arguments: Option<String>,
 }
 
 impl ContinuedTool {
-    const fn new(call_id: String, started_after_ns: Option<u64>, duration_ns: Option<u64>) -> Self {
+    fn new(
+        call_id: String,
+        started_after_ns: Option<u64>,
+        duration_ns: Option<u64>,
+        run_generation: u64,
+    ) -> Self {
         Self {
             call_id,
             started_after_ns,
             duration_ns,
+            result: Value::Null,
+            run_generation,
+            received_at: Instant::now(),
+            initial_duration_ns: duration_ns.unwrap_or_default(),
+            arguments: None,
         }
     }
 
-    const fn add_duration(&mut self, duration_ns: Option<u64>) {
-        self.duration_ns = match (self.duration_ns, duration_ns) {
-            (Some(total), Some(duration)) => Some(total.saturating_add(duration)),
-            (total, None) => total,
-            (None, duration) => duration,
-        };
+    fn add_timing(
+        &mut self,
+        started_after_ns: Option<u64>,
+        duration_ns: Option<u64>,
+        run_generation: u64,
+    ) {
+        if self.run_generation == run_generation
+            && let (Some(start), Some(next_start), Some(duration)) =
+                (self.started_after_ns, started_after_ns, duration_ns)
+            && next_start >= start
+        {
+            self.duration_ns = Some(next_start.saturating_add(duration).saturating_sub(start));
+            return;
+        }
+        let elapsed = u64::try_from(self.received_at.elapsed().as_nanos())
+            .unwrap_or(u64::MAX)
+            .saturating_add(self.initial_duration_ns);
+        let summed = self
+            .duration_ns
+            .unwrap_or_default()
+            .saturating_add(duration_ns.unwrap_or_default());
+        self.duration_ns = Some(elapsed.max(summed));
     }
 }
 
@@ -2992,6 +3460,9 @@ fn summarize_tool_arguments(tool: &str, arguments: &Value) -> String {
 }
 
 fn present_tool_name(tool: &str, arguments: &Value) -> String {
+    if tool == "write_stdin" {
+        return "Process".to_owned();
+    }
     if tool == "browser" {
         return arguments.get("action").and_then(Value::as_str).map_or_else(
             || "Browser".to_owned(),
@@ -3166,6 +3637,54 @@ fn code_parent_call_id(call_id: &str) -> Option<&str> {
     call_id.split_once("/code-").map(|(parent, _)| parent)
 }
 
+fn normalize_tool_result(value: Value) -> Value {
+    match value {
+        Value::String(ref text) => serde_json::from_str(text).unwrap_or(value),
+        _ => value,
+    }
+}
+
+fn merge_terminal_result(current: Value, next: Value) -> Value {
+    let previous = current
+        .get("output")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut next = match next {
+        Value::Object(fields) => fields,
+        other => serde_json::Map::from_iter([("error".to_owned(), other)]),
+    };
+    let output = next
+        .get("output")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let output = format!("{previous}{output}");
+    // Keep recent diagnostics without growing every time a long-running process is polled.
+    let mut start = output.len().saturating_sub(64 * 1024);
+    while !output.is_char_boundary(start) {
+        start += 1;
+    }
+    let output = if start == 0 {
+        output
+    } else {
+        format!("…\n{}", &output[start..])
+    };
+    next.insert("output".to_owned(), Value::String(output));
+    Value::Object(next)
+}
+
+fn shell_result_failed(result: &Value) -> bool {
+    if result
+        .get("error")
+        .is_some_and(|error| !error.is_null() && error != false && error != "")
+    {
+        return true;
+    }
+    result
+        .get("exit_code")
+        .and_then(Value::as_i64)
+        .map_or_else(|| result_session_id(result).is_none(), |code| code != 0)
+}
+
 fn result_session_id(result: &Value) -> Option<i64> {
     let decoded = result
         .as_str()
@@ -3178,7 +3697,12 @@ fn result_session_id(result: &Value) -> Option<i64> {
 }
 
 fn running_cell_id(result: &Value) -> Option<String> {
-    let text = result.as_str()?;
+    if let Some(items) = result.as_array() {
+        return items.iter().find_map(running_cell_id);
+    }
+    let text = result
+        .as_str()
+        .or_else(|| result.get("text").and_then(Value::as_str))?;
     let marker = "Script running with cell ID ";
     let suffix = text.lines().find_map(|line| line.strip_prefix(marker))?;
     let cell_id = suffix.split_whitespace().next()?;
@@ -3186,7 +3710,7 @@ fn running_cell_id(result: &Value) -> Option<String> {
 }
 
 fn summarize_tool_result(tool: Option<&str>, result: &Value, status: ToolStatus) -> String {
-    if tool == Some("exec_command") {
+    if matches!(tool, Some("exec_command" | "write_stdin")) {
         let decoded = result
             .as_str()
             .and_then(|value| serde_json::from_str::<Value>(value).ok())
@@ -3203,7 +3727,20 @@ fn summarize_tool_result(tool: Option<&str>, result: &Value, status: ToolStatus)
                 }
             }
             if !parts.is_empty() {
-                return parts.join(" · ");
+                let mut summary = parts.join(" · ");
+                if let Some(output) = object
+                    .get("output")
+                    .and_then(Value::as_str)
+                    .filter(|output| !output.is_empty())
+                {
+                    summary.push('\n');
+                    summary.push_str(output);
+                }
+                if let Some(error) = object.get("error").and_then(Value::as_str) {
+                    summary.push('\n');
+                    summary.push_str(error);
+                }
+                return summary;
             }
         }
     }
@@ -3214,10 +3751,67 @@ fn summarize_tool_result(tool: Option<&str>, result: &Value, status: ToolStatus)
     {
         return "applied".to_owned();
     }
+    if tool.is_some_and(|tool| {
+        matches!(tool, "exec" | "wait" | "view_image" | "image_gen__imagegen")
+            || tool.starts_with("mcp__")
+    }) {
+        return display_tool_output(result, 0);
+    }
     if matches!(status, ToolStatus::Failed | ToolStatus::Cancelled) {
         return compact_arguments(result);
     }
     String::new()
+}
+
+fn display_tool_output(value: &Value, depth: usize) -> String {
+    if depth > 10 {
+        return "…".to_owned();
+    }
+    match value {
+        Value::Null => String::new(),
+        Value::String(text) => {
+            if text.starts_with("data:") {
+                return "[embedded attachment]".to_owned();
+            }
+            if let Ok(decoded) = serde_json::from_str::<Value>(text) {
+                return display_tool_output(&decoded, depth + 1);
+            }
+            let text = if text.starts_with("Script completed")
+                || text.starts_with("Script running with cell ID")
+            {
+                text.split_once("Output:\n")
+                    .map_or("", |(_, output)| output)
+            } else {
+                text.as_str()
+            };
+            bounded_multiline_text(text, 64 * 1024, 128)
+        }
+        Value::Array(items) => items
+            .iter()
+            .take(64)
+            .map(|item| display_tool_output(item, depth + 1))
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(fields) => {
+            let mut lines = Vec::new();
+            for (key, value) in fields.iter().take(64) {
+                if key == "type" {
+                    continue;
+                }
+                if matches!(key.as_str(), "data" | "blob" | "file_data") {
+                    lines.push(format!("{key}: [embedded attachment]"));
+                } else {
+                    let text = display_tool_output(value, depth + 1);
+                    if !text.is_empty() {
+                        lines.push(format!("{key}: {text}"));
+                    }
+                }
+            }
+            bounded_multiline_text(&lines.join("\n"), 64 * 1024, 128)
+        }
+        _ => value.to_string(),
+    }
 }
 
 fn compact_arguments(arguments: &Value) -> String {
@@ -3303,6 +3897,104 @@ mod tests {
     }
 
     #[test]
+    fn yielded_code_output_is_visible_when_wait_finishes() {
+        let mut app = App::new(".".into());
+        for (kind, payload) in [
+            (
+                AgentEventKind::ToolCall,
+                json!({"call_id": "code", "tool": "exec", "arguments": "text(await render());"}),
+            ),
+            (
+                AgentEventKind::ToolResult,
+                json!({"call_id": "code", "tool": "exec", "status": "completed", "result": [{"type": "input_text", "text": "Script running with cell ID cell-1\nWall time 1 seconds\nOutput:\n"}]}),
+            ),
+            (
+                AgentEventKind::ToolCall,
+                json!({"call_id": "wait", "tool": "wait", "arguments": {"cell_id": "cell-1"}}),
+            ),
+            (
+                AgentEventKind::ToolResult,
+                json!({"call_id": "wait", "tool": "wait", "status": "completed", "result": [{"type": "input_text", "text": "Script completed\nWall time 2 seconds\nOutput:\nReport ready"}]}),
+            ),
+        ] {
+            app.main.on_agent_event(&event(kind, &payload));
+        }
+        assert_eq!(app.main.transcript.len(), 1);
+        assert!(app.main.running_cells.is_empty());
+        let area = Rect::new(0, 0, 100, 20);
+        let mut buffer = Buffer::empty(area);
+        app.main
+            .transcript
+            .widget(0, None, None, "empty")
+            .render(area, &mut buffer);
+        let rendered = buffer
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("Report ready"), "{rendered}");
+    }
+
+    #[test]
+    fn command_progress_retains_output_and_real_exit_status() {
+        let mut app = App::new(".".into());
+        for (kind, payload) in [
+            (
+                AgentEventKind::ToolCall,
+                json!({"call_id": "build", "tool": "exec_command", "arguments": {"cmd": "cargo test"}}),
+            ),
+            (
+                AgentEventKind::ToolResult,
+                json!({"call_id": "build", "tool": "exec_command", "status": "completed", "started_after_ns": 10, "duration_ns": 5, "structured_result": {"session_id": 7, "output": "Compiling\n"}}),
+            ),
+            (
+                AgentEventKind::ToolCall,
+                json!({"call_id": "poll", "tool": "write_stdin", "arguments": {"session_id": 7}}),
+            ),
+            (
+                AgentEventKind::ToolResult,
+                json!({"call_id": "poll", "tool": "write_stdin", "status": "completed", "started_after_ns": 100, "duration_ns": 10, "structured_result": {"exit_code": 101, "output": "build failed\n"}}),
+            ),
+        ] {
+            app.main.on_agent_event(&event(kind, &payload));
+        }
+        assert_eq!(app.main.transcript.len(), 1);
+        assert!(app.main.running_shell_sessions.is_empty());
+        let area = Rect::new(0, 0, 100, 20);
+        let mut buffer = Buffer::empty(area);
+        app.main
+            .transcript
+            .widget(0, None, None, "empty")
+            .render(area, &mut buffer);
+        let rendered = buffer
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        for expected in ["✗", "exit 101", "Compiling", "build failed"] {
+            assert!(rendered.contains(expected), "{rendered}");
+        }
+        let mut timing = super::ContinuedTool::new("build".to_owned(), Some(10), Some(5), 0);
+        timing.add_timing(Some(100), Some(10), 0);
+        assert_eq!(timing.duration_ns, Some(100));
+    }
+
+    #[test]
+    fn code_output_keeps_text_and_resource_links_without_inline_binary() {
+        let output = super::display_tool_output(
+            &json!([
+                {"type": "input_text", "text": "Chart ready"},
+                {"type": "image", "mimeType": "image/png", "data": "PRIVATE_IMAGE_BYTES"},
+                {"type": "resource_link", "name": "report.pdf", "uri": "https://example.com/report.pdf"},
+            ]),
+            0,
+        );
+        assert!(output.contains("Chart ready"));
+        assert!(output.contains("https://example.com/report.pdf"));
+        assert!(!output.contains("PRIVATE_IMAGE_BYTES"));
+    }
+
+    #[test]
     fn restored_rollout_activity_seeds_the_visible_transcript() {
         let mut app = App::new(std::path::PathBuf::from("/worktree"));
         app.restore_transcript([
@@ -3321,13 +4013,6 @@ mod tests {
             app.main.transcript.latest_user_message(),
             Some("visible prompt")
         );
-    }
-
-    #[test]
-    fn configured_fast_mode_seeds_the_tui_state() {
-        let app = App::new(std::path::PathBuf::from("/worktree")).with_fast_mode(true);
-
-        assert!(app.fast_mode());
     }
 
     #[test]
@@ -3669,6 +4354,34 @@ mod tests {
     }
 
     #[test]
+    fn btw_split_state_retains_preflight_failures_and_closes_detached_threads() {
+        let mut app = App::new("/workspace".into());
+        let id = app.begin_btw();
+        assert!(!app.begin_btw_split(id));
+        assert!(!app.btw_splitting(id));
+
+        app.btw_opened(id, Arc::from("btw-thread"));
+        assert!(app.begin_btw_split(id));
+        assert!(app.btw_busy());
+        app.btw_split_failed(id, "no terminal".to_owned(), false);
+        assert_eq!(app.btw_id(), Some(id));
+        assert!(!app.btw_splitting(id));
+
+        assert!(app.begin_btw_split(id));
+        app.btw_split_completed(id, "the right tmux pane");
+        assert!(app.btw.is_none());
+        assert_eq!(app.focus, PaneId::Main);
+        assert_eq!(app.main.status, "BTW moved to the right tmux pane");
+
+        let id = app.begin_btw();
+        app.btw_opened(id, Arc::from("second-btw-thread"));
+        assert!(app.begin_btw_split(id));
+        app.btw_split_failed(id, "launch failed; resume manually".to_owned(), true);
+        assert!(app.btw.is_none());
+        assert_eq!(app.main.status, "BTW detached; terminal launch failed");
+    }
+
+    #[test]
     fn submitted_prompt_is_selectable_before_run_started_without_clearing_the_view() {
         let mut app = App::new(".".into());
         app.main
@@ -3917,6 +4630,50 @@ mod tests {
             limit.saturating_sub(3),
             "scrolling down should move immediately after reaching the top",
         );
+    }
+
+    #[test]
+    fn first_response_is_visible_without_smooth_scroll_after_viewport_fills() {
+        let mut app = App::new(".".into());
+        for index in 0..12 {
+            app.main
+                .push_output(TranscriptItem::User(format!("prompt {index}")));
+        }
+        app.main.settle_viewport(20, 6);
+        app.main.jump_to_bottom();
+
+        app.main.push_assistant_delta("");
+        assert!(!app.first_response_pending());
+        app.main.push_assistant_delta("first response");
+        assert!(app.first_response_pending());
+        app.main.settle_viewport(20, 6);
+
+        assert_eq!(app.main.display_scroll_from_bottom(), 0);
+        assert!(!app.smooth_scroll_pending());
+        assert!(!app.first_response_pending());
+    }
+
+    #[test]
+    fn first_response_preserves_manual_history_and_selection_anchors() {
+        for preserve_selection in [false, true] {
+            let mut app = App::new(".".into());
+            for index in 0..12 {
+                app.main
+                    .push_output(TranscriptItem::User(format!("prompt {index}")));
+            }
+            app.main.settle_viewport(20, 6);
+            app.main.jump_to_bottom();
+            if !preserve_selection {
+                app.main.scroll_up(3);
+            }
+            let before = app.main.display_scroll_from_bottom();
+            app.main.push_assistant_delta("first response");
+            app.main
+                .settle_viewport_with_selection(20, 6, preserve_selection);
+
+            assert!(app.main.display_scroll_from_bottom() > before);
+            assert!(!app.smooth_scroll_pending());
+        }
     }
 
     #[test]
@@ -4563,7 +5320,7 @@ mod tests {
                     "tool": "exec",
                     "status": "completed",
                     "duration_ns": 10_000_000_000_u64,
-                    "result": "Script completed\nWall time 10 seconds\nOutput:\ndone"
+                    "result": "Script completed\nWall time 10 seconds\nOutput:\n"
                 }),
             ));
         }
@@ -4595,7 +5352,8 @@ mod tests {
                 "tool": "exec_command",
                 "status": "completed",
                 "duration_ns": 10_000_000,
-                "result": "{\"session_id\":7,\"output\":\"\"}"
+                "result": "Wall time: 10.0000 seconds\nProcess running with session ID 7\nOutput:\n",
+                "structured_result": {"session_id": 7, "output": ""}
             }),
         ));
         app.main.on_agent_event(&event(
@@ -4613,7 +5371,8 @@ mod tests {
                 "tool": "write_stdin",
                 "status": "completed",
                 "duration_ns": 5_000_000,
-                "result": "{\"session_id\":7,\"output\":\"\"}"
+                "result": "Wall time: 5.0000 seconds\nProcess running with session ID 7\nOutput:\n",
+                "structured_result": {"session_id": 7, "output": ""}
             }),
         ));
         app.main.on_agent_event(&event(
@@ -4631,7 +5390,8 @@ mod tests {
                 "tool": "write_stdin",
                 "status": "completed",
                 "duration_ns": 1_000_000,
-                "result": "{\"exit_code\":130,\"output\":\"\"}"
+                "result": "Wall time: 1.0000 seconds\nProcess exited with code 130\nOutput:\n",
+                "structured_result": {"exit_code": 130, "output": ""}
             }),
         ));
         app.main.on_agent_event(&event(
@@ -4673,7 +5433,7 @@ mod tests {
         assert!(!rendered.contains("terminal input"));
         assert!(!rendered.contains("session 7"));
         assert!(!rendered.contains("terminal wait"));
-        assert!(!rendered.contains("unknown session 99"));
+        assert!(rendered.contains("unknown session 99"));
         assert!(rendered.contains("sleep 1"));
         assert!(rendered.contains("exit 130"));
         assert!(!app.main.hidden_terminal_calls.contains_key("call-1/code-2"));
@@ -4713,7 +5473,20 @@ mod tests {
             }),
         ));
 
-        assert!(app.main.transcript.is_empty());
+        assert_eq!(app.main.transcript.len(), 1);
+        let area = Rect::new(0, 0, 100, 12);
+        let mut buffer = Buffer::empty(area);
+        app.main
+            .transcript
+            .widget(0, None, None, "empty")
+            .render(area, &mut buffer);
+        let rendered = buffer
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("done"));
+        assert!(!rendered.contains("await work()"));
         assert!(!app.main.running_cells.contains_key("3"));
     }
 

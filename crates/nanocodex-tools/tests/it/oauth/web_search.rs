@@ -23,6 +23,7 @@ async fn chatgpt_auth_recovers_for_web_search() -> Result<()> {
         "x-injected-client",
         reqwest::header::HeaderValue::from_static("true"),
     );
+    nanocodex_oai_api::transport::install_default_rustls_crypto_provider();
     let client = reqwest::Client::builder()
         .default_headers(headers)
         .build()?;
@@ -56,14 +57,15 @@ async fn chatgpt_auth_recovers_for_web_search() -> Result<()> {
                 "search_query": [{"q": "standalone web search"}],
             }))?),
             ToolContext::new(
-                "gpt-5.6-sol",
+                "gpt-6.1-sol",
                 "search-session",
                 "call-search",
                 &history,
                 DEFAULT_TOOL_OUTPUT_TOKENS,
             ),
         )
-        .await;
+        .await
+        .unwrap();
 
     assert!(output.success);
     assert!(matches!(
@@ -87,7 +89,7 @@ async fn chatgpt_auth_recovers_for_web_search() -> Result<()> {
 
     let request = server.await??;
     assert_eq!(request["id"], "search-session");
-    assert_eq!(request["model"], "gpt-5.6-sol");
+    assert_eq!(request["model"], "gpt-6.1-sol");
     assert_eq!(
         request["commands"],
         json!({"search_query": [{"q": "standalone web search"}]})

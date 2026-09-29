@@ -5,7 +5,7 @@ use nanocodex_oai_api::pricing::EstimatedUsdCost;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{AgentId, Task};
+use crate::Task;
 
 /// Execution environment used for one evaluation attempt.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -100,16 +100,6 @@ pub struct EvalException {
     pub traceback: String,
     /// Time at which the primary exception was observed.
     pub occurred_at: DateTime<Utc>,
-}
-
-/// Whether all potentially billable model operations reached a terminal event.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BillingCompleteness {
-    /// Every operation that could incur provider usage reached a terminal event.
-    Complete,
-    /// Cancellation interrupted a potentially billable operation in flight.
-    Unknown,
 }
 
 /// Terminal health for one explicit cleanup boundary.
@@ -276,7 +266,7 @@ pub struct EvalResult {
     /// Execution environment used by this attempt.
     pub environment: EvalEnvironment,
     /// Typed terminal agent output and usage, when cancellation or failure
-    /// still produced a terminal billing snapshot.
+    /// still produced a retained terminal snapshot.
     pub agent: Option<AgentResult>,
     /// Verifier exit code and component rewards.
     pub verifier: VerifierResult,
@@ -290,94 +280,6 @@ pub struct EvalResult {
     pub artifacts: EvalArtifacts,
     #[serde(skip)]
     pub(crate) task: Task,
-}
-
-/// Results from an advanced task-by-agent-by-trial sweep.
-#[derive(Clone, Debug, Serialize)]
-pub struct SweepResults {
-    attempts: Vec<SweepAttemptResult>,
-    skipped: usize,
-}
-
-/// One self-identifying result in a [`SweepResults`] collection.
-#[derive(Clone, Debug, Serialize)]
-pub struct SweepAttemptResult {
-    agent: AgentId,
-    trial: u16,
-    outcome: EvalAttemptOutcome,
-}
-
-impl SweepResults {
-    pub(crate) const fn new(attempts: Vec<SweepAttemptResult>, skipped: usize) -> Self {
-        Self { attempts, skipped }
-    }
-
-    /// Returns attempts in stable task × agent × trial order.
-    #[must_use]
-    pub fn attempts(&self) -> &[SweepAttemptResult] {
-        &self.attempts
-    }
-
-    /// Returns the number of already-completed attempts skipped while resuming.
-    #[must_use]
-    pub const fn skipped(&self) -> usize {
-        self.skipped
-    }
-
-    /// Consumes the sweep and discards its coordinate wrappers.
-    #[must_use]
-    pub fn into_outcomes(self) -> Vec<EvalAttemptOutcome> {
-        self.attempts
-            .into_iter()
-            .map(|attempt| attempt.outcome)
-            .collect()
-    }
-}
-
-impl SweepAttemptResult {
-    pub(crate) const fn new(agent: AgentId, trial: u16, outcome: EvalAttemptOutcome) -> Self {
-        Self {
-            agent,
-            trial,
-            outcome,
-        }
-    }
-
-    /// Returns the task name for this coordinate.
-    #[must_use]
-    pub fn task_name(&self) -> &str {
-        self.outcome.task_name()
-    }
-
-    /// Returns the caller-defined agent recipe identity.
-    #[must_use]
-    pub const fn agent(&self) -> &AgentId {
-        &self.agent
-    }
-
-    /// Returns the one-based trial number.
-    #[must_use]
-    pub const fn trial(&self) -> u16 {
-        self.trial
-    }
-
-    /// Returns the complete typed terminal attempt output.
-    #[must_use]
-    pub const fn outcome(&self) -> &EvalAttemptOutcome {
-        &self.outcome
-    }
-
-    /// Returns the scored verifier result, when one exists.
-    #[must_use]
-    pub const fn result(&self) -> Option<&EvalResult> {
-        self.outcome.scored()
-    }
-
-    /// Returns the unscored terminal failure, when one exists.
-    #[must_use]
-    pub const fn failure(&self) -> Option<&EvalFailure> {
-        self.outcome.unscored()
-    }
 }
 
 impl EvalAttemptOutcome {
@@ -443,6 +345,33 @@ impl EvalAttemptOutcome {
             Self::Unscored(failure) => Some(failure),
         }
     }
+
+    /// Returns the immutable task definition used by this attempt.
+    #[must_use]
+    pub const fn task(&self) -> &Task {
+        match self {
+            Self::Scored(result) => result.task(),
+            Self::Unscored(failure) => failure.task(),
+        }
+    }
+
+    /// Returns the terminal agent output, when the attempt produced one.
+    #[must_use]
+    pub const fn agent(&self) -> Option<&AgentResult> {
+        match self {
+            Self::Scored(result) => result.agent.as_ref(),
+            Self::Unscored(failure) => failure.agent.as_ref(),
+        }
+    }
+
+    /// Returns the artifacts retained for this attempt.
+    #[must_use]
+    pub const fn artifacts(&self) -> &EvalArtifacts {
+        match self {
+            Self::Scored(result) => &result.artifacts,
+            Self::Unscored(failure) => &failure.artifacts,
+        }
+    }
 }
 
 impl EvalResult {
@@ -491,24 +420,6 @@ impl EvalFailure {
     }
 }
 
-impl EvalExceptionKind {
-    /// Harbor's exception class for this terminal failure.
-    #[must_use]
-    pub const fn harbor_exception_type(self) -> &'static str {
-        match self {
-            Self::AgentSafetyRefusal => "AgentSafetyRefusalError",
-            Self::AgentAuthentication => "AgentAuthenticationError",
-            Self::AgentTimeout => "AgentTimeoutError",
-            Self::VerifierTimeout => "VerifierTimeoutError",
-            Self::Agent => "AgentError",
-            Self::Verifier => "VerifierError",
-            Self::Cleanup => "CleanupError",
-            Self::Environment => "EnvironmentError",
-            Self::Internal => "NanocodexEvalError",
-        }
-    }
-}
-
 /// Terminal agent output and aggregate runtime metadata.
 #[derive(Clone, Debug, Serialize)]
 pub struct AgentResult {
@@ -525,32 +436,9 @@ pub struct AgentResult {
     /// Aggregate provider usage, excluding warmup.
     pub usage: UsageTotals,
     /// Estimated aggregate USD cost when provider usage can be priced.
-    ///
-    /// This is a lower bound when [`Self::billing_completeness`] is
-    /// [`BillingCompleteness::Unknown`].
     pub cost_usd: Option<f64>,
-    /// Whether the provider billing snapshot is known to be terminal.
-    pub billing_completeness: BillingCompleteness,
     /// Complete typed terminal event metadata.
     pub metadata: AgentMetadata,
-}
-
-impl AgentResult {
-    /// Returns whether this snapshot contains provider-reported usage.
-    ///
-    /// A reported all-zero usage record is observed. A runtime-only snapshot
-    /// whose usage was never reported is not.
-    #[must_use]
-    pub fn has_observed_usage(&self) -> bool {
-        self.cost_usd.is_some()
-            || self.metadata.estimated_cost.is_some()
-            || matches!(
-                self.metadata.cost_status.as_str(),
-                "estimated_from_usage" | "estimated_lower_bound"
-            )
-            || self.usage.has_nonzero_value()
-            || self.metadata.warmup_usage.has_nonzero_value()
-    }
 }
 
 /// Typed metadata emitted by Nanocodex's terminal event.
@@ -592,8 +480,6 @@ pub struct AgentMetadata {
     pub response_attempts: u32,
     /// Retried Responses attempts.
     pub response_retries: u32,
-    /// Potentially billable sent attempts whose provider usage was unavailable.
-    pub billing_uncertain_response_attempts: u32,
     /// Time spent connecting to the Responses API.
     pub connection_duration_ns: u64,
     /// Time spent in owned retry backoff.
@@ -660,17 +546,6 @@ pub struct UsageTotals {
     pub total_tokens: u64,
 }
 
-impl UsageTotals {
-    const fn has_nonzero_value(&self) -> bool {
-        self.input_tokens != 0
-            || self.cached_input_tokens != 0
-            || self.cache_write_input_tokens != 0
-            || self.output_tokens != 0
-            || self.reasoning_output_tokens != 0
-            || self.total_tokens != 0
-    }
-}
-
 /// Terminal output from the task verifier.
 #[derive(Clone, Debug, Serialize)]
 pub struct VerifierResult {
@@ -687,7 +562,7 @@ pub struct EvalTiming {
     pub started_at: DateTime<Utc>,
     /// Time at which the terminal result became durable.
     pub finished_at: DateTime<Utc>,
-    /// Interval spent waiting for scheduler admission.
+    /// Interval between invocation and attempt setup.
     pub queue_wait: PhaseTiming,
     /// Disposable environment preparation interval.
     pub environment_setup: PhaseTiming,
@@ -704,7 +579,7 @@ pub struct EvalTiming {
 /// Completed attempt phases retained for an unscored terminal failure.
 #[derive(Clone, Debug, Serialize)]
 pub struct EvalFailureTiming {
-    /// Time waiting for scheduler admission, from queued to admitted.
+    /// Time between invocation and attempt setup.
     pub queue_wait: PhaseTiming,
     /// Disposable environment preparation interval, when it completed.
     pub environment_setup: Option<PhaseTiming>,
@@ -758,69 +633,4 @@ fn format_error_chain(error: &(dyn Error + 'static)) -> String {
         source = error.source();
     }
     traceback
-}
-
-#[cfg(test)]
-mod tests {
-    use serde_json::{Value, json};
-
-    #[test]
-    fn terminal_metadata_requires_runtime_completeness() {
-        let encoded = terminal_metadata("completed");
-        let error = serde_json::from_value::<super::AgentMetadata>(encoded).unwrap_err();
-        assert!(error.to_string().contains("runtime_completeness"));
-
-        let mut encoded = terminal_metadata("failed");
-        encoded["runtime_completeness"] = json!("observed_lower_bound");
-        let metadata: super::AgentMetadata = serde_json::from_value(encoded).unwrap();
-        assert_eq!(
-            metadata.runtime_completeness,
-            super::MeasurementCompleteness::ObservedLowerBound
-        );
-    }
-
-    fn terminal_metadata(status: &str) -> Value {
-        json!({
-            "status": status,
-            "model": "gpt-5.6-sol",
-            "effort": "medium",
-            "transport": "responses_websocket_v2",
-            "orchestration": "agent",
-            "duration_ms": 1,
-            "duration_ns": 1_000_000,
-            "model_calls": 1,
-            "steers": 0,
-            "compactions": 0,
-            "tool_calls": 0,
-            "connection_attempts": 1,
-            "websocket_reconnects": 0,
-            "response_attempts": 1,
-            "response_retries": 0,
-            "billing_uncertain_response_attempts": 0,
-            "connection_duration_ns": 1,
-            "retry_backoff_duration_ns": 0,
-            "model_duration_ns": 1,
-            "warmup_duration_ns": 0,
-            "tool_work_duration_ns": 0,
-            "tool_wall_duration_ns": 0,
-            "usage": {
-                "input_tokens": 1,
-                "cached_input_tokens": 0,
-                "cache_write_input_tokens": 0,
-                "output_tokens": 1,
-                "reasoning_output_tokens": 0,
-                "total_tokens": 2,
-            },
-            "warmup_usage": {
-                "input_tokens": 0,
-                "cached_input_tokens": 0,
-                "cache_write_input_tokens": 0,
-                "output_tokens": 0,
-                "reasoning_output_tokens": 0,
-                "total_tokens": 0,
-            },
-            "cost_usd": null,
-            "cost_status": "usage_not_reported",
-        })
-    }
 }

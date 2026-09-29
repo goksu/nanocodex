@@ -11,15 +11,19 @@ repository.workspace = true
 description = "Public Nanocodex library examples"
 
 [dependencies]
+base64.workspace = true
 dotenvy.workspace = true
 eyre.workspace = true
 futures-util.workspace = true
 http.workspace = true
 nanocodex = { workspace = true, features = ["realtime"] }
+nanocodex-oai-api = { workspace = true, features = ["realtime"] }
+nanocodex-managed = { workspace = true, features = ["voice"] }
+nanocodex-voice-protocol.workspace = true
+uuid.workspace = true
 nanocodex-browser.workspace = true
 nanocodex-egress.workspace = true
 nanocodex-voice.workspace = true
-nanocodex-eval.workspace = true
 nanocodex-vm.workspace = true
 reqwest.workspace = true
 reflink-copy.workspace = true
@@ -33,6 +37,10 @@ tempfile.workspace = true
 [[bin]]
 name = "minimal"
 path = "minimal.rs"
+
+[[bin]]
+name = "durable"
+path = "durable.rs"
 
 [[bin]]
 name = "follow-on"
@@ -95,20 +103,16 @@ name = "realtime-pipe"
 path = "realtime_pipe.rs"
 
 [[bin]]
+name = "realtime-external"
+path = "realtime_external.rs"
+
+[[bin]]
 name = "voice"
 path = "voice.rs"
 
-[[bin]]
-name = "eval-task"
-path = "src/bin/eval_task.rs"
-
-[[bin]]
-name = "eval-sweep"
-path = "src/bin/eval_sweep.rs"
-
-[[bin]]
-name = "eval-differential"
-path = "src/bin/eval_differential.rs"
-
 [lints]
 workspace = true
+
+[[bin]]
+name = "phone-voice"
+path = "phone_voice.rs"

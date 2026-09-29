@@ -17,6 +17,7 @@ pub(crate) struct ServicePlatform {
 
 impl ServicePlatform {
     pub(crate) fn new(config: &ModelConfig) -> Self {
+        crate::transport::install_default_rustls_crypto_provider();
         Self::with_http_client(config, reqwest::Client::new())
     }
 
@@ -36,7 +37,15 @@ pub(crate) async fn connect_socket(
     config: &ModelConfig,
     auth: &OpenAiAuthSnapshot,
     session_id: &str,
+    thread_id: &str,
     turn_state: Option<&str>,
 ) -> Result<(ResponsesSocket, ConnectionMetadata), ResponsesError> {
-    ResponsesSocket::connect(&config.websocket_url, auth, session_id, turn_state).await
+    ResponsesSocket::connect(
+        &config.websocket_url,
+        auth,
+        session_id,
+        thread_id,
+        turn_state,
+    )
+    .await
 }

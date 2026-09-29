@@ -18,8 +18,8 @@
   "dependencies": {
     "@tanstack/react-query": "^5.101.4",
     "accounts": "^0.14.12",
-    "mppx": "^0.8.14",
-    "nanocodex": "file:../../js/bindings",
+    "mppx": "0.8.17",
+    "nanocodex": "workspace:*",
     "react": "19.2.6",
     "react-dom": "19.2.6",
     "viem": "^2.55.8",
@@ -27,6 +27,7 @@
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "^1.45.1",
+    "nanocodex-vite": "workspace:*",
     "@playwright/test": "^1.61.1",
     "@types/react": "19.2.14",
     "@types/react-dom": "19.2.3",

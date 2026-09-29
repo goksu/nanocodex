@@ -1,6 +1,7 @@
 //! Prompt image preparation and model-output image normalization.
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, VecDeque},
     io::Cursor,
     path::Path,
@@ -12,13 +13,12 @@ use image::{
     ColorType, DynamicImage, GenericImageView, ImageDecoder, ImageEncoder, ImageFormat,
     ImageReader,
     codecs::{jpeg::JpegEncoder, png::PngEncoder, webp::WebPEncoder},
-    imageops::FilterType,
 };
 pub use nanocodex_oai_api::ImageDetail;
 use nanocodex_oai_api::{PromptInput, UserInput, responses::ContentItem};
 use sha1::{Digest as _, Sha1};
 
-use super::{ToolOutputBody, ToolOutputContent};
+use crate::contract::{ToolOutputBody, ToolOutputContent};
 
 pub(super) const IMAGE_PROCESSING_ERROR_PLACEHOLDER: &str =
     "image content omitted because it could not be processed";
@@ -31,6 +31,14 @@ const REMOTE_IMAGE_URL_PLACEHOLDER: &str =
 const DATA_URL_PREFIX: &str = "data:";
 const PROMPT_IMAGE_PATCH_SIZE: u32 = 32;
 const MAX_PROMPT_IMAGE_INPUT_BYTES: usize = 1024 * 1024 * 1024;
+// Pixel buffers expand independently of compressed file size. Keep ordinary
+// 12 MP RGB photos usable in Workers, but reject larger decodes before
+// allocating their pixels. RGBA needs more headroom for source/destination
+// buffers and serialized tool results. Native hosts retain the usual budget.
+#[cfg(target_family = "wasm")]
+const MAX_PROMPT_IMAGE_DECODE_BYTES: u64 = 40 * 1024 * 1024;
+#[cfg(not(target_family = "wasm"))]
+const MAX_PROMPT_IMAGE_DECODE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_IMAGE_CACHE_ENTRIES: usize = 32;
 const MAX_IMAGE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -156,7 +164,11 @@ impl ImagePreparationError {
 /// Validates, normalizes, and bounds images returned by a tool.
 ///
 /// Unsupported or failed images become model-visible text placeholders. CPU
-/// image work runs on the blocking pool.
+/// image work runs on the blocking pool on native targets and inline on WASM.
+#[allow(
+    clippy::unused_async,
+    reason = "WASM prepares images inline without a blocking pool"
+)]
 pub async fn prepare_output_images(output: &mut ToolOutputBody) {
     let ToolOutputBody::Content(content) = output else {
         return;
@@ -168,6 +180,12 @@ pub async fn prepare_output_images(output: &mut ToolOutputBody) {
         return;
     }
     let content = std::mem::take(content);
+    #[cfg(target_family = "wasm")]
+    {
+        *output = ToolOutputBody::Content(prepare_content(content));
+        output.replace_invalid_image_envelopes();
+    }
+    #[cfg(not(target_family = "wasm"))]
     match tokio::task::spawn_blocking(move || prepare_content(content)).await {
         Ok(prepared) => {
             let ToolOutputBody::Content(output) = output else {
@@ -176,7 +194,7 @@ pub async fn prepare_output_images(output: &mut ToolOutputBody) {
             *output = prepared;
         }
         Err(error) => {
-            eprintln!("failed to join image preparation task: {error}");
+            tracing::warn!(%error, "failed to join image preparation task");
             *output = ToolOutputBody::Content(vec![ToolOutputContent::InputText {
                 text: IMAGE_PROCESSING_ERROR_PLACEHOLDER.to_owned(),
             }]);
@@ -184,38 +202,138 @@ pub async fn prepare_output_images(output: &mut ToolOutputBody) {
     }
 }
 
+/// Prepares reconstructed history with the same decoder and limits as fresh images.
+/// Returns whether any image was replaced or normalized; item order is preserved.
+pub fn prepare_history_images(items: &mut [nanocodex_oai_api::responses::ResponseItem]) -> bool {
+    use nanocodex_oai_api::responses::{FunctionOutputBody, FunctionOutputContent, ResponseItem};
+    let mut changed = false;
+    for item in items {
+        match item {
+            ResponseItem::Message { content, .. } => {
+                for part in content {
+                    if let ContentItem::InputImage { image_url, detail } = part {
+                        let mut url = image_url.to_string();
+                        match prepare_image(&mut url, detail.unwrap_or(ImageDetail::Auto)) {
+                            Ok(()) => {
+                                changed |= url != image_url.as_ref();
+                                *image_url = url.into_boxed_str();
+                            }
+                            Err(error) => {
+                                *part = ContentItem::input_text(error.placeholder());
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+            ResponseItem::FunctionCallOutput { output, .. }
+            | ResponseItem::CustomToolCallOutput { output, .. } => {
+                let FunctionOutputBody::Content(content) = output else {
+                    continue;
+                };
+                for part in content {
+                    if let FunctionOutputContent::InputImage { image_url, detail } = part {
+                        let mut url = image_url.to_string();
+                        match prepare_image(&mut url, detail.unwrap_or(ImageDetail::Auto)) {
+                            Ok(()) => {
+                                changed |= url != image_url.as_ref();
+                                *image_url = url.into_boxed_str();
+                            }
+                            Err(error) => {
+                                *part = FunctionOutputContent::InputText {
+                                    text: error.placeholder().into(),
+                                };
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    changed
+}
+
 /// Converts public prompt input into provider-ready typed content.
 ///
 /// Local or data-URL images are validated and resized according to their detail
 /// policy. Audio input is retained as an explicit placeholder until supported.
+#[allow(
+    clippy::unused_async,
+    reason = "WASM prepares images inline without a blocking pool"
+)]
 pub async fn prepare_user_input(input: &PromptInput) -> Vec<ContentItem> {
     let input = match input {
         PromptInput::Text(text) => vec![UserInput::Text { text: text.clone() }],
         PromptInput::Content(items) => items.clone(),
     };
+    #[cfg(target_family = "wasm")]
+    {
+        prepare_user_content(input)
+    }
+    #[cfg(not(target_family = "wasm"))]
     match tokio::task::spawn_blocking(move || prepare_user_content(input)).await {
         Ok(content) => content,
         Err(error) => {
-            eprintln!("failed to join user image preparation task: {error}");
+            tracing::warn!(%error, "failed to join user image preparation task");
             vec![input_text(IMAGE_PROCESSING_ERROR_PLACEHOLDER)]
         }
     }
 }
 
+pub(crate) fn prepare_embedded_output_images(output: &mut ToolOutputBody) {
+    if let ToolOutputBody::Content(content) = output {
+        *content = prepare_content(std::mem::take(content));
+    }
+    output.replace_invalid_image_envelopes();
+}
+
+pub(crate) fn prepare_embedded_user_input(input: &PromptInput) -> Vec<ContentItem> {
+    let input = match input {
+        PromptInput::Text(text) => vec![UserInput::Text { text: text.clone() }],
+        PromptInput::Content(items) => items.clone(),
+    };
+    prepare_user_content_for_host(input, true)
+}
+
 fn prepare_user_content(input: Vec<UserInput>) -> Vec<ContentItem> {
+    prepare_user_content_for_host(input, cfg!(target_family = "wasm"))
+}
+
+fn prepare_user_content_for_host(input: Vec<UserInput>, embedded: bool) -> Vec<ContentItem> {
     let mut content = Vec::with_capacity(input.len());
+    #[cfg(not(target_family = "wasm"))]
     let mut image_index = 0;
     for item in input {
         match item {
             UserInput::Text { text } => content.push(input_text(text)),
             UserInput::Image { image_url, detail } => {
-                image_index += 1;
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    image_index += 1;
+                }
                 content.push(prepare_user_image(
                     image_url,
                     detail.unwrap_or(ImageDetail::High),
                 ));
             }
+            #[cfg(target_family = "wasm")]
+            UserInput::LocalImage { path, .. } => {
+                content.push(input_text(format!(
+                    "Local image paths are unavailable in browser WASM: {}",
+                    path.display()
+                )));
+            }
+            #[cfg(not(target_family = "wasm"))]
             UserInput::LocalImage { path, detail } => {
+                if embedded {
+                    content.push(input_text(format!(
+                        "Local image paths are unavailable in browser WASM: {}",
+                        path.display()
+                    )));
+                    continue;
+                }
                 image_index += 1;
                 let detail = detail.unwrap_or(ImageDetail::High);
                 match std::fs::read(&path) {
@@ -239,11 +357,24 @@ fn prepare_user_content(input: Vec<UserInput>) -> Vec<ContentItem> {
                     ))),
                 }
             }
-            UserInput::Audio { .. } => {
-                content.push(input_text("Codex does not support audio input yet."));
+            UserInput::Audio { audio_url } => {
+                if embedded {
+                    content.push(ContentItem::InputAudio {
+                        audio_url: audio_url.into_boxed_str(),
+                    });
+                } else {
+                    content.push(input_text("Codex does not support audio input yet."));
+                }
             }
-            UserInput::LocalAudio { .. } => {
-                content.push(input_text("Codex does not support local audio input yet."));
+            UserInput::LocalAudio { path } => {
+                if embedded {
+                    content.push(input_text(format!(
+                        "Local audio paths are unavailable in browser WASM: {}",
+                        path.display()
+                    )));
+                } else {
+                    content.push(input_text("Codex does not support local audio input yet."));
+                }
             }
         }
     }
@@ -257,7 +388,7 @@ fn prepare_user_image(mut image_url: String, detail: ImageDetail) -> ContentItem
             detail: Some(detail),
         },
         Err(error) => {
-            eprintln!("failed to prepare message image: {error}");
+            tracing::warn!(%error, "failed to prepare message image");
             input_text(error.placeholder())
         }
     }
@@ -275,7 +406,7 @@ fn prepare_content(mut content: Vec<ToolOutputContent>) -> Vec<ToolOutputContent
             continue;
         };
         if let Err(error) = prepare_image(image_url, *detail) {
-            eprintln!("failed to prepare tool output image: {error}");
+            tracing::warn!(%error, "failed to prepare tool output image");
             *item = ToolOutputContent::InputText {
                 text: error.placeholder().to_owned(),
             };
@@ -381,14 +512,24 @@ fn load_for_prompt_bytes(
         ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::WebP => Some(guessed_format),
         _ => None,
     };
-    let mut decoder = ImageReader::with_format(Cursor::new(&file_bytes), guessed_format)
-        .into_decoder()
-        .map_err(|error| {
-            ImagePreparationError::Processing(format!(
-                "unable to decode image at `{}`: {error}",
-                path.display()
-            ))
-        })?;
+    let mut reader = ImageReader::with_format(Cursor::new(&file_bytes), guessed_format);
+    let mut decode_limits = image::Limits::default();
+    decode_limits.max_alloc = Some(MAX_PROMPT_IMAGE_DECODE_BYTES);
+    reader.limits(decode_limits);
+    let mut decoder = reader.into_decoder().map_err(|error| {
+        ImagePreparationError::Processing(format!(
+            "unable to decode image at `{}`: {error}",
+            path.display()
+        ))
+    })?;
+    let pixel_bytes = decoder.total_bytes();
+    if pixel_bytes > MAX_PROMPT_IMAGE_DECODE_BYTES {
+        return Err(ImagePreparationError::ImageTooLarge {
+            representation: "decoded pixels",
+            size: usize::try_from(pixel_bytes).unwrap_or(usize::MAX),
+            max: usize::try_from(MAX_PROMPT_IMAGE_DECODE_BYTES).unwrap_or(usize::MAX),
+        });
+    }
     let metadata = ImageMetadata {
         icc_profile: decoder
             .icc_profile()
@@ -417,7 +558,11 @@ fn load_for_prompt_bytes(
             encode_image(&dynamic, ImageFormat::Png, metadata)?
         }
     } else {
-        let resized = dynamic.resize_exact(target_width, target_height, FilterType::Triangle);
+        // Triangle resize constructs an input-width x output-height RGBA-f32
+        // intermediate: about 170 MiB for an ordinary 12 MP original-detail
+        // photo. Area downsampling needs only source and destination pixels.
+        let resized = dynamic.thumbnail_exact(target_width, target_height);
+        drop(dynamic);
         encode_image(
             &resized,
             preserved_format.unwrap_or(ImageFormat::Png),
@@ -432,6 +577,7 @@ fn load_for_prompt_bytes(
     Ok(image)
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub(super) fn load_for_prompt_data_url(
     path: &Path,
     file_bytes: Vec<u8>,
@@ -517,16 +663,11 @@ fn encode_image(
     let ImageMetadata { icc_profile, exif } = metadata;
     match target_format {
         ImageFormat::Png => {
-            let rgba = image.to_rgba8();
+            let (pixels, color) = rgb_or_rgba8_bytes(image);
             let mut encoder = PngEncoder::new(&mut bytes);
             apply_image_metadata(&mut encoder, icc_profile, exif, target_format)?;
             encoder
-                .write_image(
-                    rgba.as_raw(),
-                    image.width(),
-                    image.height(),
-                    ColorType::Rgba8.into(),
-                )
+                .write_image(pixels.as_ref(), image.width(), image.height(), color.into())
                 .map_err(|error| encode_error(target_format, &error))?;
         }
         ImageFormat::Jpeg => {
@@ -537,16 +678,11 @@ fn encode_image(
                 .map_err(|error| encode_error(target_format, &error))?;
         }
         ImageFormat::WebP => {
-            let rgba = image.to_rgba8();
+            let (pixels, color) = rgb_or_rgba8_bytes(image);
             let mut encoder = WebPEncoder::new_lossless(&mut bytes);
             apply_image_metadata(&mut encoder, icc_profile, exif, target_format)?;
             encoder
-                .write_image(
-                    rgba.as_raw(),
-                    image.width(),
-                    image.height(),
-                    ColorType::Rgba8.into(),
-                )
+                .write_image(pixels.as_ref(), image.width(), image.height(), color.into())
                 .map_err(|error| encode_error(target_format, &error))?;
         }
         _ => unreachable!("target format is normalized above"),
@@ -555,6 +691,15 @@ fn encode_image(
         bytes: bytes.into(),
         mime: format_to_mime(target_format),
     })
+}
+
+// Keep already-supported 8-bit buffers borrowed. Converting a 10 MP RGB
+// result to owned RGBA adds a 40 MiB allocation at the encoder boundary.
+fn rgb_or_rgba8_bytes(image: &DynamicImage) -> (Cow<'_, [u8]>, ColorType) {
+    match image.color() {
+        color @ (ColorType::Rgb8 | ColorType::Rgba8) => (Cow::Borrowed(image.as_bytes()), color),
+        _ => (Cow::Owned(image.to_rgba8().into_raw()), ColorType::Rgba8),
+    }
 }
 
 fn apply_image_metadata(
@@ -592,10 +737,33 @@ const fn format_to_mime(format: ImageFormat) -> &'static str {
 mod tests {
     use std::io::Cursor;
 
-    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
     use image::{DynamicImage, GenericImageView, ImageFormat, Rgba, RgbaImage};
 
     use super::*;
+
+    #[test]
+    fn replay_prepares_messages_and_both_tool_output_kinds() {
+        use nanocodex_oai_api::responses::ResponseItem;
+        let mut items: Vec<ResponseItem> = serde_json::from_value(serde_json::json!([
+            {"type":"message", "role":"user", "content":[
+                {"type":"input_text", "text":"retained"},
+                {"type":"input_image", "image_url":"data:image/png;base64,YQ==", "detail":"original"}]},
+            {"type":"function_call_output", "call_id":"function", "output":[
+                {"type":"input_image", "image_url":"data:image/png;base64,YQ=="}]},
+            {"type":"custom_tool_call_output", "call_id":"custom", "output":[
+                {"type":"input_image", "image_url":"data:image/png;base64,YQ=="}]}
+        ])).unwrap();
+        assert!(prepare_history_images(&mut items));
+        let encoded = serde_json::to_string(&items).unwrap();
+        assert!(!encoded.contains("input_image"));
+        assert!(encoded.contains("retained"));
+        assert_eq!(
+            encoded.matches(IMAGE_PROCESSING_ERROR_PLACEHOLDER).count(),
+            3
+        );
+        assert!(!prepare_history_images(&mut items));
+    }
 
     #[test]
     fn detail_policies_match_codex_patch_budgets() {
@@ -629,6 +797,115 @@ mod tests {
             .expect("decode prepared data URL");
         let prepared = image::load_from_memory(&bytes).expect("decode prepared image");
         assert_eq!(prepared.dimensions(), (1600, 1600));
+    }
+
+    #[test]
+    fn downsampling_preserves_format_color_regions_and_metadata() {
+        let image = DynamicImage::ImageRgb8(image::RgbImage::from_fn(80, 60, |x, y| {
+            match (x < 40, y < 30) {
+                (true, true) => image::Rgb([220, 30, 10]),
+                (false, true) => image::Rgb([20, 210, 40]),
+                (true, false) => image::Rgb([10, 40, 230]),
+                (false, false) => image::Rgb([240, 240, 240]),
+            }
+        }));
+        let mut profile = vec![0_u8; 128];
+        profile[16..20].copy_from_slice(b"RGB ");
+        // Minimal little-endian TIFF with an empty IFD.
+        let exif = b"II\x2a\x00\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00".to_vec();
+        for format in [ImageFormat::Png, ImageFormat::Jpeg, ImageFormat::WebP] {
+            let encoded = encode_image(
+                &image,
+                format,
+                ImageMetadata {
+                    icc_profile: Some(profile.clone()),
+                    exif: Some(exif.clone()),
+                },
+            )
+            .unwrap();
+            let prepared = load_for_prompt_bytes(
+                Path::new("fixture"),
+                encoded.bytes.to_vec(),
+                PromptImageResizeLimits {
+                    max_dimension: 40,
+                    max_patches: 100,
+                },
+            )
+            .unwrap();
+            assert_eq!(prepared.mime, format_to_mime(format));
+            let mut decoder = ImageReader::with_format(Cursor::new(&prepared.bytes), format)
+                .into_decoder()
+                .unwrap();
+            assert_eq!(decoder.dimensions(), (40, 30));
+            assert_eq!(decoder.icc_profile().unwrap(), Some(profile.clone()));
+            assert_eq!(decoder.exif_metadata().unwrap(), Some(exif.clone()));
+            let resized = DynamicImage::from_decoder(decoder).unwrap().to_rgb8();
+            for (x, y, expected) in [
+                (5, 5, [220_u8, 30, 10]),
+                (30, 5, [20, 210, 40]),
+                (5, 25, [10, 40, 230]),
+                (30, 25, [240, 240, 240]),
+            ] {
+                for (actual, expected) in resized.get_pixel(x, y).0.into_iter().zip(expected) {
+                    assert!(
+                        actual.abs_diff(expected) <= 5,
+                        "{format:?}: color region changed"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lossless_encoding_preserves_rgb_samples_and_rgba_transparency() {
+        for image in [
+            DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                12,
+                8,
+                image::Rgb([20, 80, 160]),
+            )),
+            DynamicImage::ImageRgba8(image::RgbaImage::from_fn(12, 8, |x, _| {
+                image::Rgba([20, 80, 160, if x < 6 { 50 } else { 200 }])
+            })),
+        ] {
+            for format in [ImageFormat::Png, ImageFormat::WebP] {
+                let encoded = encode_image(
+                    &image,
+                    format,
+                    ImageMetadata {
+                        icc_profile: None,
+                        exif: None,
+                    },
+                )
+                .unwrap();
+                let decoded = image::load_from_memory(&encoded.bytes).unwrap();
+                assert_eq!(decoded.to_rgba8(), image.to_rgba8(), "{format:?}");
+                if format == ImageFormat::Png {
+                    assert_eq!(decoded.color(), image.color());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn original_detail_preserves_bytes_when_the_image_already_fits() {
+        let image = DynamicImage::new_rgb8(64, 48);
+        let encoded = encode_image(
+            &image,
+            ImageFormat::Jpeg,
+            ImageMetadata {
+                icc_profile: None,
+                exif: None,
+            },
+        )
+        .unwrap();
+        let prepared = load_for_prompt_bytes(
+            Path::new("fixture"),
+            encoded.bytes.to_vec(),
+            ORIGINAL_DETAIL_LIMITS,
+        )
+        .unwrap();
+        assert_eq!(prepared.bytes.as_ref(), encoded.bytes.as_ref());
     }
 
     #[test]

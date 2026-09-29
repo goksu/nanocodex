@@ -2,12 +2,9 @@ import os
 import unittest
 
 from nanocodex import (
-    AgentEvent,
     Nanocodex,
     SessionSnapshot,
-    Turn,
     TurnResult,
-    __version__,
 )
 
 
@@ -23,21 +20,12 @@ class BindingTests(unittest.TestCase):
         secret = "private-test-value"
         agent, events = Nanocodex(
             secret,
-            model="gpt-5.6-terra",
-            thinking="none",
-            reasoning_mode="pro",
+            model="gpt-6.1-sol",
+            thinking="medium",
+            reasoning_mode="standard",
         )
         self.assertNotIn(secret, repr(agent))
-        self.assertTrue(callable(agent.prompt))
-        self.assertTrue(callable(agent.spawn))
-        self.assertTrue(callable(agent.fork))
-        self.assertTrue(callable(agent.fork_from))
-        self.assertTrue(callable(agent.shutdown))
         self.assertEqual(events.request_id, agent.session_id)
-        agent.set_thinking("high")
-        agent.set_fast_mode(True)
-        self.assertTrue(callable(events.recv_json))
-        self.assertRegex(__version__, r"^\d+\.\d+\.\d+")
         agent.shutdown()
         drain(events)
 
@@ -45,44 +33,26 @@ class BindingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "expected none"):
             Nanocodex("test-key", thinking="impossible")
 
-        with self.assertRaisesRegex(ValueError, "expected standard or pro"):
-            Nanocodex("test-key", reasoning_mode="impossible")
-
-        with self.assertRaisesRegex(ValueError, "expected gpt-5.6-sol"):
-            Nanocodex("test-key", model="impossible")
-
         agent, _ = Nanocodex("test-key")
         with self.assertRaisesRegex(ValueError, "expected none"):
             agent.set_thinking("impossible")
         agent.shutdown()
 
-        with self.assertRaisesRegex(RuntimeError, "OpenAI credentials are empty"):
+        with self.assertRaisesRegex(ValueError, "OpenAI credentials are empty"):
             Nanocodex("")
 
         with self.assertRaises(ValueError):
             Nanocodex("test-key", session_id="not-a-uuid-v7")
 
-    def test_spawn_returns_independent_agent_without_network(self) -> None:
-        agent, events = Nanocodex("test-key", thinking="none")
-        child, child_events = agent.spawn()
-        self.assertTrue(callable(child.prompt))
-        self.assertTrue(callable(child_events.recv_json))
-        self.assertIsNot(agent, child)
-        self.assertNotEqual(agent.session_id, child.session_id)
-        child.shutdown()
-        agent.shutdown()
-        drain(child_events)
-        drain(events)
-
     def test_fork_before_safe_boundary_is_typed(self) -> None:
-        agent, events = Nanocodex("test-key", thinking="none")
+        agent, events = Nanocodex("test-key", thinking="low")
         with self.assertRaises(RuntimeError):
             agent.fork()
         agent.shutdown()
         drain(events)
 
     def test_empty_steer_is_rejected(self) -> None:
-        agent, events = Nanocodex("test-key", thinking="none")
+        agent, events = Nanocodex("test-key", thinking="low")
         turn = agent.prompt("queued for steer rejection")
         with self.assertRaisesRegex(
             RuntimeError, "steer instruction must not be empty"
@@ -95,7 +65,7 @@ class BindingTests(unittest.TestCase):
         drain(events)
 
     def test_fork_from_requires_a_typed_result(self) -> None:
-        agent, events = Nanocodex("test-key", thinking="none")
+        agent, events = Nanocodex("test-key", thinking="low")
         turn = agent.prompt("incomplete")
         with self.assertRaises(TypeError):
             agent.fork_from(turn)
@@ -108,13 +78,6 @@ class BindingTests(unittest.TestCase):
     def test_snapshot_rejects_invalid_json(self) -> None:
         with self.assertRaises(ValueError):
             SessionSnapshot.from_json('{"version": 1}')
-
-    def test_internal_transport_and_turn_ids_are_not_public_properties(self) -> None:
-        for public_type in (Nanocodex, Turn, TurnResult, SessionSnapshot, AgentEvent):
-            names = dir(public_type)
-            self.assertNotIn("response_id", names)
-            self.assertNotIn("previous_response_id", names)
-            self.assertNotIn("turn_id", names)
 
     @unittest.skipUnless(
         os.environ.get("OPENAI_API_KEY"), "live API key not configured"

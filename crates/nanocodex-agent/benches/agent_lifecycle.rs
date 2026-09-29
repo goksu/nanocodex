@@ -41,6 +41,7 @@ impl Service<ResponsesAttempt> for ImmediateResponses {
                 );
                 ResponsesOutput::Generation(GenerationOutput {
                     id: "resp_generation".to_owned(),
+                    reported_model: None,
                     status: "completed".to_owned(),
                     end_turn: Some(true),
                     final_message: Some("done".to_owned()),
@@ -109,7 +110,12 @@ fn benchmark_agent_lifecycle(criterion: &mut Criterion) {
                     .expect("prompt accepted")
                     .await
                     .expect("turn completed");
-                black_box((result.final_message(), result.usage().total_tokens()));
+                black_box((
+                    result.final_message(),
+                    result
+                        .usage()
+                        .map_or(0, nanocodex_agent::TurnUsage::total_tokens),
+                ));
             },
             BatchSize::SmallInput,
         );

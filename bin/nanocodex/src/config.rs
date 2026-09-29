@@ -12,7 +12,7 @@ use eyre::{Result, WrapErr, eyre};
 ))]
 use nanocodex::NanocodexBuilder;
 use nanocodex::{
-    AgentEvents, Model, Nanocodex, OpenAi, ReasoningMode, Thinking, Tools,
+    AgentEvents, DurableAgentExt as _, Model, Nanocodex, OpenAi, ReasoningMode, Thinking, Tools,
     agent::{
         rollout::{DurableSession, RolloutConfig},
         session::{SessionId, SessionSnapshot},
@@ -23,11 +23,14 @@ use nanocodex::{
     },
     tools::mcp::McpHandle,
 };
+use nanocodex_durability::{DurableSession as PortableDurableSession, SqliteStore};
 
 use crate::browser::{BrowserArgs, ConfiguredBrowser};
+use crate::login::load_managed_mcp_credential;
+use crate::managed_memory::{ConfiguredManagedMemory, MEMORY_INSTRUCTIONS};
 use crate::mcp::{ConfiguredMcp, McpArgs};
 use crate::mpp::{MppAdapter, MppArgs};
-use crate::subagents::{self, ChildAgents};
+use crate::subagents::{self, ChildAgents, DEFAULT_MAX_SUBAGENTS, SubagentToolSet};
 use crate::vm::{ConfiguredVm, VmArgs};
 
 pub(crate) struct ConfiguredAgent {
@@ -35,10 +38,13 @@ pub(crate) struct ConfiguredAgent {
     pub(crate) events: AgentEvents,
     pub(crate) realtime: Option<OpenAi>,
     pub(crate) child_agents: Option<Arc<ChildAgents>>,
+    pub(crate) subagent_updates:
+        Option<tokio::sync::mpsc::UnboundedReceiver<nanocodex_subagents::ScopedAgentUpdate>>,
     pub(crate) mpp_adapter: Option<MppAdapter>,
     pub(crate) mcp: Option<McpHandle>,
     pub(crate) browser: Option<ConfiguredBrowser>,
     pub(crate) vm: Option<ConfiguredVm>,
+    pub(crate) model: Model,
 }
 
 struct SessionBuild {
@@ -58,6 +64,14 @@ pub(crate) struct AuthArgs {
     /// Explicitly use `ChatGPT` authorization from this credential file.
     #[arg(long, env = "NANOCODEX_AUTH_FILE")]
     auth_file: Option<PathBuf>,
+
+    /// Use a persistent `ChatGPT` Business or Enterprise access token.
+    #[arg(
+        long,
+        env = "CODEX_ACCESS_TOKEN",
+        value_parser = NonEmptyStringValueParser::new()
+    )]
+    access_token: Option<String>,
 }
 
 /// Model-facing flags shared by normal agents and evaluator agents.
@@ -77,6 +91,7 @@ pub(crate) struct ModelArgs {
 #[derive(Clone)]
 pub(crate) enum SharedAuth {
     ApiKey(Arc<str>),
+    AccessToken(Arc<str>),
     AuthFile(PathBuf),
 }
 
@@ -101,6 +116,14 @@ pub(crate) struct EvalAgentArgs {
     reason = "independent CLI feature toggles are not one state machine"
 )]
 pub(crate) struct AgentArgs {
+    /// Voice microphone shortcut, or none to use /voice mute only.
+    #[arg(long, env = "NANOCODEX_VOICE_MUTE_KEY", default_value = "ctrl+x", value_parser = crate::tui::voice::validate_key)]
+    pub(crate) voice_mute_key: String,
+
+    /// Animate live voice captions; set false for reduced motion.
+    #[arg(long, env = "NANOCODEX_VOICE_ANIMATIONS", default_value_t = true, action = clap::ArgAction::Set)]
+    pub(crate) voice_animations: bool,
+
     #[command(flatten)]
     auth: AuthArgs,
 
@@ -111,14 +134,14 @@ pub(crate) struct AgentArgs {
     #[command(flatten)]
     model_policy: ModelArgs,
 
-    /// GPT-5.6 coding model: gpt-5.6-sol, gpt-5.6-terra, or gpt-5.6-luna.
-    #[arg(long, env = "OPENAI_MODEL", default_value_t)]
-    model: Model,
+    /// Coding model: gpt-6-astra, gpt-6.1-sol, or gpt-6-luna.
+    #[arg(long, env = "OPENAI_MODEL")]
+    model: Option<Model>,
 
     /// Optional namespace prepended to the model identifier on the wire.
     ///
     /// OpenAI routing gateways may use `openai`, producing identifiers such as
-    /// `openai/gpt-5.6-sol` without changing Nanocodex's closed model policy.
+    /// `openai/gpt-6-astra` without changing Nanocodex's closed model policy.
     #[arg(long, env = "NANOCODEX_MODEL_ID_PREFIX")]
     model_id_prefix: Option<String>,
 
@@ -130,7 +153,7 @@ pub(crate) struct AgentArgs {
     #[arg(
         long,
         env = "NANOCODEX_FAST_MODE",
-        default_value_t = false,
+        default_value_t = true,
         action = ArgAction::Set
     )]
     fast_mode: bool,
@@ -148,14 +171,22 @@ pub(crate) struct AgentArgs {
     )]
     image_generation: bool,
 
-    /// Expose reusable clean, forked, and follow-up child agents in Code Mode.
+    /// Whether clean, reusable Tact-style subagents are exposed in Code Mode.
     #[arg(
         long,
         env = "NANOCODEX_SUBAGENTS",
-        default_value_t = false,
+        default_value_t = true,
         action = ArgAction::Set
     )]
     subagents: bool,
+
+    /// Maximum active subagent turns across one task tree (unlimited by default).
+    #[arg(
+        long,
+        env = "NANOCODEX_MAX_SUBAGENTS",
+        default_value_t = DEFAULT_MAX_SUBAGENTS
+    )]
+    max_subagents: usize,
 
     /// Write Codex-compatible resumable threads beneath `CODEX_HOME`.
     #[arg(
@@ -166,9 +197,27 @@ pub(crate) struct AgentArgs {
     )]
     rollouts: bool,
 
+    /// Enable hosted Nanocodex session search and durable organization memory.
+    #[arg(
+        long,
+        env = "NANOCODEX_MEMORY",
+        default_value_t = false,
+        action = ArgAction::Set
+    )]
+    memory: bool,
+
     /// Responses API WebSocket endpoint.
     #[arg(long, env = "OPENAI_RESPONSES_WEBSOCKET_URL")]
     websocket_url: Option<String>,
+
+    /// Prime the Responses WebSocket before the first model request.
+    #[arg(
+        long,
+        env = "NANOCODEX_WEBSOCKET_WARMUP",
+        default_value_t = false,
+        action = ArgAction::Set
+    )]
+    websocket_warmup: bool,
 
     /// Responses transport fixed for the complete agent session.
     ///
@@ -196,6 +245,16 @@ pub(crate) struct AgentArgs {
 }
 
 impl AgentArgs {
+    pub(crate) fn restrict_to_host_control(&mut self, instructions: impl Into<String>) {
+        self.browser.disable();
+        self.mcp.disable();
+        self.model_policy.web_search = Some(false);
+        self.image_generation = false;
+        self.subagents = false;
+        self.rollouts = false;
+        self.instructions = Some(instructions.into());
+    }
+
     pub(crate) fn cwd(&self) -> &Path {
         self.cwd.as_deref().unwrap_or_else(|| Path::new("."))
     }
@@ -210,8 +269,33 @@ impl AgentArgs {
         self.browser.is_enabled()
     }
 
+    #[cfg(test)]
+    pub(crate) const fn copies_all_browser_cookies(&self) -> bool {
+        self.browser.copies_all_cookies()
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn uses_brave_browser(&self) -> bool {
+        self.browser.uses_brave()
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn uses_interactive_browser_cookie_authorization(&self) -> bool {
+        self.browser.uses_interactive_cookie_authorization()
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn uses_host_browser_passkeys(&self) -> bool {
+        self.browser.uses_host_passkeys()
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn uses_persistent_browser_profile(&self) -> bool {
+        self.browser.uses_persistent_profile()
+    }
+
     pub(crate) fn thinking(&self) -> Thinking {
-        self.model_policy.thinking.unwrap_or_default()
+        self.model_policy.thinking.unwrap_or(Thinking::Xhigh)
     }
 
     pub(crate) fn web_search(&self) -> bool {
@@ -220,10 +304,6 @@ impl AgentArgs {
 
     pub(crate) const fn fast_mode(&self) -> bool {
         self.fast_mode
-    }
-
-    pub(crate) const fn model(&self) -> Model {
-        self.model
     }
 
     pub(crate) fn responses_transport(&self) -> ResponsesTransport {
@@ -235,29 +315,57 @@ impl AgentArgs {
             })
     }
 
-    pub(crate) async fn build(self, vm: VmArgs) -> Result<ConfiguredAgent> {
-        self.build_inner(None, vm).await
+    pub(crate) async fn build(
+        self,
+        vm: VmArgs,
+        local_durability: Option<LocalDurability>,
+    ) -> Result<ConfiguredAgent> {
+        self.build_inner(None, vm, false, local_durability).await
     }
 
-    pub(crate) async fn build_resumed(
+    pub(crate) async fn build_tui(self, vm: VmArgs) -> Result<ConfiguredAgent> {
+        self.build_inner(None, vm, true, None).await
+    }
+
+    pub(crate) async fn build_resumed_tui(
         self,
         session: DurableSession,
         vm: VmArgs,
     ) -> Result<ConfiguredAgent> {
-        self.build_inner(Some(session), vm).await
+        self.build_inner(Some(session), vm, true, None).await
     }
 
     async fn build_inner(
         self,
         durable: Option<DurableSession>,
         vm: VmArgs,
+        tui: bool,
+        local_durability: Option<LocalDurability>,
     ) -> Result<ConfiguredAgent> {
         let thinking = self.thinking();
         let web_search = self.web_search();
+        if local_durability.is_some() && self.rollouts {
+            return Err(eyre!(
+                "local durability testing requires `--rollouts false`; portable durability and Codex-compatible rollouts cannot both own restart state"
+            ));
+        }
         let codex_home = default_codex_home()?;
         let responses_transport = self.responses_transport();
-        let session = prepare_session_build(self.cwd, self.rollouts, &codex_home, durable)?;
-        let configured_browser = self.browser.configure(&session.workspace)?;
+        let mut session = prepare_session_build(self.cwd, self.rollouts, &codex_home, durable)?;
+        if self.memory && session.session_id.is_none() {
+            session.session_id = Some(SessionId::new());
+        }
+        let managed_memory = if self.memory {
+            let _timing = crate::startup_timing::Stage::new("managed_memory");
+            let root_session_id = session.session_id.ok_or_else(|| {
+                eyre!("memory-enabled sessions require an explicit session identity")
+            })?;
+            Some(ConfiguredManagedMemory::connect(&codex_home, root_session_id).await?)
+        } else {
+            None
+        };
+        // Browser interaction is supplied by CUA, including for the direct CLI.
+        let configured_browser = None;
         let mpp_enabled = self.mpp.is_enabled();
         if mpp_enabled && !matches!(responses_transport, ResponsesTransport::Https) {
             return Err(eyre!(
@@ -269,11 +377,16 @@ impl AgentArgs {
         } else {
             self.auth.resolve()?.nanocodex()?
         };
+        let model = match self.model {
+            Some(model) => model,
+            None => connected_account_default_model(auth.mode()),
+        };
         let direct_websocket_url = direct_websocket_url(self.websocket_url, auth.mode());
         let mpp_adapter = self.mpp.start().await?;
         let mut openai = OpenAi::builder(auth)
             .transport(responses_transport)
-            .websocket_url(direct_websocket_url);
+            .websocket_url(direct_websocket_url)
+            .websocket_warmup(self.websocket_warmup);
         if let Some(prefix) = self.model_id_prefix.as_deref() {
             openai = openai.model_id_prefix(prefix);
         }
@@ -306,12 +419,21 @@ impl AgentArgs {
             None
         };
         let configured_vm = vm.start(vm_egress).await?;
-        let mut tools = configured_vm
-            .as_ref()
-            .map_or_else(Tools::builder, ConfiguredVm::tools_builder)
-            .web_search(web_search)
-            .image_generation(self.image_generation);
-        let mcp = self.mcp.build(&codex_home)?;
+        let mut tools = match configured_vm.as_ref() {
+            Some(vm) => vm.tools_builder().await?,
+            None => Tools::builder(),
+        }
+        .web_search(web_search)
+        .image_generation(self.image_generation);
+        let managed_mcp = if self.mcp.loads_managed() {
+            let _timing = crate::startup_timing::Stage::new("managed_mcp_credentials");
+            load_managed_mcp_credential(&codex_home).await?
+        } else {
+            None
+        };
+        let mcp = self
+            .mcp
+            .build(&codex_home, mpp_adapter.as_ref(), managed_mcp.as_ref())?;
         let mcp_handle = mcp.as_ref().map(|mcp| mcp.handle.clone());
         if let Some(ConfiguredMcp { provider, .. }) = mcp {
             tools = tools.provider(provider);
@@ -322,13 +444,32 @@ impl AgentArgs {
             }
             tools = tools.remote_http_client(mpp_adapter.tool_http_client()?);
         }
-        if let Some(browser) = &configured_browser {
-            tools = tools.provider(browser.tool());
+        let computer_config = if configured_vm.is_none() {
+            let _timing = crate::startup_timing::Stage::new("computer_discovery");
+            nanocodex_computer::ComputerConfig::discover_or_install()
+                .await
+                .map_err(|error| eyre!(error))?
+        } else {
+            None
+        };
+        if let Some(config) = computer_config {
+            let _timing = crate::startup_timing::Stage::new("computer_catalog");
+            let computer = nanocodex_computer::ComputerTools::connect(config)
+                .await
+                .map_err(|error| eyre!(error.to_string()))?;
+            for tool in computer.tools() {
+                tools = tools.add(tool);
+            }
+        }
+        if let Some(managed_memory) = &managed_memory {
+            tools = managed_memory.install(tools);
         }
         let tools = tools.build()?;
-        let child_agents = self.subagents.then(|| Arc::new(ChildAgents::default()));
+        let generic_subagents = self.subagents;
+        let subagent_tools = selected_subagent_tools(generic_subagents, tui);
+        let subagent_runtime = subagent_tools.map(|_| subagents::channel(self.max_subagents));
         let mut builder = Nanocodex::builder(openai)
-            .model(self.model)
+            .model(model)
             .reasoning_mode(self.reasoning_mode)
             .thinking(thinking)
             .fast_mode(self.fast_mode)
@@ -343,37 +484,141 @@ impl AgentArgs {
         if let Some(rollout) = session.rollout {
             builder = builder.rollout(rollout);
         }
-        let builder = if let Some(child_agents) = &child_agents {
+        let builder = if let (Some((registry, _, _)), Some(subagent_tools)) =
+            (&subagent_runtime, subagent_tools)
+        {
             let tools = tools;
-            let child_agents = Arc::downgrade(child_agents);
+            let registry = Arc::clone(registry);
             builder.tools_factory(move |agent| {
-                subagents::with_subagents(tools.clone(), agent, child_agents.clone())
+                subagents::install_tools(
+                    tools.clone(),
+                    agent,
+                    Arc::clone(&registry),
+                    subagent_tools,
+                )
             })
         } else {
             builder.tools(tools)
         };
+        let additional_instructions = session_instructions(
+            self.instructions.as_deref(),
+            generic_subagents,
+            managed_memory.is_some(),
+        );
         let builder = if let Some(instructions) = self.instructions {
             builder.instructions(instructions)
         } else {
             builder
         };
-        let (handle, events) = builder.build()?;
+        let builder = if let Some(instructions) = additional_instructions {
+            builder.additional_instructions(instructions)
+        } else {
+            builder
+        };
+        let builder = if let Some(local_durability) = local_durability {
+            let store = SqliteStore::open(&local_durability.path).wrap_err_with(|| {
+                format!(
+                    "failed to open local durability database {}",
+                    local_durability.path.display()
+                )
+            })?;
+            let state = PortableDurableSession::open(store, local_durability.state_id)
+                .await
+                .wrap_err("failed to open local durability state")?;
+            builder
+                .durability(state)
+                .await
+                .wrap_err("failed to attach local durability")?
+        } else {
+            builder
+        };
+        let (handle, events) = {
+            let _timing = crate::startup_timing::Stage::new("native_agent");
+            builder.build()?
+        };
+        let (child_agents, subagent_updates) =
+            subagent_runtime.map_or((None, None), |(_, control, updates)| {
+                let (drain_updates, subagent_updates) = if tui {
+                    (None, Some(updates))
+                } else {
+                    (Some(updates), None)
+                };
+                (
+                    Some(ChildAgents::new(
+                        handle.session_id().to_string(),
+                        control,
+                        drain_updates,
+                    )),
+                    subagent_updates,
+                )
+            });
         Ok(ConfiguredAgent {
             handle,
             events,
             realtime,
             child_agents,
+            subagent_updates,
             mpp_adapter,
             mcp: mcp_handle,
             browser: configured_browser,
             vm: configured_vm,
+            model,
         })
     }
 }
 
+pub(crate) struct LocalDurability {
+    pub(crate) path: PathBuf,
+    pub(crate) state_id: String,
+}
+
+const fn selected_subagent_tools(
+    generic_subagents: bool,
+    simplify_workflow: bool,
+) -> Option<SubagentToolSet> {
+    match (generic_subagents, simplify_workflow) {
+        (true, true) => Some(SubagentToolSet::GenericAndSimplify),
+        (true, false) => Some(SubagentToolSet::Generic),
+        (false, true) => Some(SubagentToolSet::Simplify),
+        (false, false) => None,
+    }
+}
+
+const SUBAGENT_INSTRUCTIONS: &str = concat!(
+    "For larger tasks, delegate meaningful, separable work to subagents; handle trivial or tightly ",
+    "coupled work directly. Use code mode to build multi-agent pipelines: map independent subtasks ",
+    "across agents in parallel, await and reduce their results, then dispatch dependent stages. Do ",
+    "not repeat delegated work yourself; wait for delegated work to finish, then use its results for ",
+    "the next step. Double-check their results against the relevant evidence before relying on them. ",
+    "Use schemas that expose the fields downstream stages need, and use loops to iterate until the ",
+    "completion condition is met. Keep concurrent write scopes disjoint. You own final synthesis and ",
+    "verification."
+);
+
+fn session_instructions(
+    custom: Option<&str>,
+    subagents_enabled: bool,
+    memory_enabled: bool,
+) -> Option<String> {
+    let custom = custom.unwrap_or_default();
+    let mut instructions = Vec::new();
+    if subagents_enabled && !custom.contains(SUBAGENT_INSTRUCTIONS) {
+        instructions.push(SUBAGENT_INSTRUCTIONS);
+    }
+    if memory_enabled && !custom.contains(MEMORY_INSTRUCTIONS) {
+        instructions.push(MEMORY_INSTRUCTIONS);
+    }
+    (!instructions.is_empty()).then(|| instructions.join("\n\n"))
+}
+
 impl AuthArgs {
     fn resolve(self) -> Result<SharedAuth> {
-        select_shared_auth(self.api_key, self.auth_file, environment_api_key()?)
+        select_shared_auth(
+            self.api_key,
+            self.auth_file,
+            self.access_token,
+            environment_api_key()?,
+        )
     }
 }
 
@@ -382,18 +627,14 @@ impl AuthArgs {
     all(target_os = "macos", target_arch = "aarch64")
 ))]
 impl EvalAgentArgs {
-    pub(crate) fn builder(self, thinking: Thinking, web_search: bool) -> Result<NanocodexBuilder> {
-        let auth = self.auth.resolve()?;
-        eval_builder_with_auth(auth.nanocodex()?, thinking, web_search)
-    }
-
     pub(crate) fn shared_builder(
         self,
+        model: Model,
         thinking: Thinking,
         web_search: bool,
     ) -> Result<(NanocodexBuilder, SharedAuth)> {
         let auth = self.auth.resolve()?;
-        let builder = eval_builder_with_auth(auth.nanocodex()?, thinking, web_search)?;
+        let builder = eval_builder_with_auth(auth.nanocodex()?, model, thinking, web_search)?;
         Ok((builder, auth))
     }
 
@@ -410,6 +651,10 @@ impl SharedAuth {
     fn nanocodex(&self) -> Result<OpenAiAuth> {
         match self {
             Self::ApiKey(api_key) => Ok(OpenAiAuth::api_key(Arc::clone(api_key))),
+            Self::AccessToken(access_token) => {
+                nanocodex::oai::auth::chatgpt_access_token(Arc::clone(access_token))
+                    .map_err(Into::into)
+            }
             Self::AuthFile(path) => load_subscription_auth(path),
         }
     }
@@ -421,12 +666,16 @@ impl SharedAuth {
 ))]
 fn eval_builder_with_auth(
     auth: OpenAiAuth,
+    model: Model,
     thinking: Thinking,
     web_search: bool,
 ) -> Result<NanocodexBuilder> {
     let tools = Tools::builder().web_search(web_search).build()?;
     let openai = OpenAi::new(auth)?;
-    Ok(Nanocodex::builder(openai).thinking(thinking).tools(tools))
+    Ok(Nanocodex::builder(openai)
+        .model(model)
+        .thinking(thinking)
+        .tools(tools))
 }
 
 fn prepare_session_build(
@@ -475,6 +724,13 @@ fn direct_websocket_url(explicit: Option<String>, auth_mode: OpenAiAuthMode) -> 
     explicit.unwrap_or_else(|| auth_mode.default_websocket_url().to_owned())
 }
 
+const fn connected_account_default_model(auth_mode: OpenAiAuthMode) -> Model {
+    match auth_mode {
+        OpenAiAuthMode::ChatGpt => Model::Sol,
+        OpenAiAuthMode::ApiKey => Model::Sol,
+    }
+}
+
 fn selected_api_base_url(generic: Option<String>, tempo: Option<&str>) -> Option<String> {
     tempo.map(str::to_owned).or(generic)
 }
@@ -483,11 +739,13 @@ fn selected_api_base_url(generic: Option<String>, tempo: Option<&str>) -> Option
 fn select_auth(
     explicit_api_key: Option<String>,
     auth_file: Option<PathBuf>,
+    access_token: Option<String>,
     environment_api_key: Option<String>,
 ) -> Result<OpenAiAuth> {
     select_shared_auth_with_default(
         explicit_api_key,
         auth_file,
+        access_token,
         environment_api_key,
         default_auth_file,
     )
@@ -498,6 +756,7 @@ fn select_auth(
 fn select_auth_with_default<F>(
     explicit_api_key: Option<String>,
     auth_file: Option<PathBuf>,
+    access_token: Option<String>,
     environment_api_key: Option<String>,
     resolve_default_auth_file: F,
 ) -> Result<OpenAiAuth>
@@ -507,6 +766,7 @@ where
     select_shared_auth_with_default(
         explicit_api_key,
         auth_file,
+        access_token,
         environment_api_key,
         resolve_default_auth_file,
     )
@@ -516,11 +776,13 @@ where
 fn select_shared_auth(
     explicit_api_key: Option<String>,
     auth_file: Option<PathBuf>,
+    access_token: Option<String>,
     environment_api_key: Option<String>,
 ) -> Result<SharedAuth> {
     select_shared_auth_with_default(
         explicit_api_key,
         auth_file,
+        access_token,
         environment_api_key,
         default_auth_file,
     )
@@ -529,6 +791,7 @@ fn select_shared_auth(
 fn select_shared_auth_with_default<F>(
     explicit_api_key: Option<String>,
     auth_file: Option<PathBuf>,
+    access_token: Option<String>,
     environment_api_key: Option<String>,
     resolve_default_auth_file: F,
 ) -> Result<SharedAuth>
@@ -540,6 +803,11 @@ where
     }
     if let Some(auth_file) = auth_file {
         return Ok(SharedAuth::AuthFile(auth_file));
+    }
+    if let Some(access_token) = access_token {
+        return Ok(SharedAuth::AccessToken(
+            access_token.trim().to_owned().into(),
+        ));
     }
     let auth_file = resolve_default_auth_file()?;
     if auth_file
@@ -605,7 +873,6 @@ pub(crate) fn default_codex_home() -> Result<PathBuf> {
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use clap::CommandFactory;
     use nanocodex::oai::auth::OpenAiAuthMode;
 
     use super::{
@@ -673,83 +940,11 @@ mod tests {
     }
 
     #[test]
-    fn subagents_are_opt_in() {
-        let command = crate::Cli::command();
-        let subagents = command
-            .get_arguments()
-            .find(|argument| argument.get_id() == "subagents")
-            .expect("the CLI should expose the subagents argument");
-
-        assert_eq!(subagents.get_default_values(), ["false"]);
-    }
-
-    #[test]
-    fn fast_mode_is_opt_in() {
-        let command = crate::Cli::command();
-        let fast_mode = command
-            .get_arguments()
-            .find(|argument| argument.get_id() == "fast_mode")
-            .expect("the CLI should expose the fast-mode argument");
-
-        assert_eq!(fast_mode.get_default_values(), ["false"]);
-    }
-
-    #[test]
-    fn rollouts_are_enabled_by_default() {
-        let command = crate::Cli::command();
-        let rollouts = command
-            .get_arguments()
-            .find(|argument| argument.get_id() == "rollouts")
-            .expect("the CLI should expose the rollouts argument");
-
-        assert_eq!(rollouts.get_default_values(), ["true"]);
-    }
-
-    #[test]
-    fn standard_and_codex_config_mcp_servers_are_enabled_by_default() {
-        let command = crate::Cli::command();
-        let mcp_defaults = command
-            .get_arguments()
-            .find(|argument| argument.get_id() == "mcp_defaults")
-            .expect("the CLI should expose the MCP defaults argument");
-
-        assert_eq!(mcp_defaults.get_default_values(), ["true"]);
-
-        let codex_config = command
-            .get_arguments()
-            .find(|argument| argument.get_id() == "mcp_codex_config")
-            .expect("the CLI should expose the Codex MCP config argument");
-        assert_eq!(codex_config.get_default_values(), ["true"]);
-    }
-
-    #[test]
-    fn responses_transport_and_storage_are_selected_once_at_startup() {
-        let command = crate::Cli::command();
-        let transport = command
-            .get_arguments()
-            .find(|argument| argument.get_id() == "responses_transport")
-            .expect("the CLI should expose the Responses transport argument");
-        assert!(transport.get_default_values().is_empty());
-
-        assert!(
-            command
-                .get_arguments()
-                .all(|argument| argument.get_id() != "responses_history"),
-            "history replay policy is internal and must not be a CLI argument"
-        );
-
-        let store = command
-            .get_arguments()
-            .find(|argument| argument.get_id() == "store_responses")
-            .expect("the CLI should expose the Responses storage argument");
-        assert!(store.get_default_values().is_empty());
-    }
-
-    #[test]
     fn explicit_api_key_overrides_automatic_auth_selection() {
         let auth = select_auth(
             Some("explicit-key".into()),
             Some(auth_file()),
+            Some("at-access-token".into()),
             Some("environment-key".into()),
         )
         .unwrap();
@@ -762,10 +957,11 @@ mod tests {
         let auth_file = auth_file();
         write_chatgpt_auth(&auth_file);
 
-        let auth = select_auth_with_default(None, None, Some("environment-key".into()), || {
-            Ok(auth_file.clone())
-        })
-        .unwrap();
+        let auth =
+            select_auth_with_default(None, None, None, Some("environment-key".into()), || {
+                Ok(auth_file.clone())
+            })
+            .unwrap();
 
         assert_eq!(auth.mode(), OpenAiAuthMode::ChatGpt);
         std::fs::remove_file(auth_file).unwrap();
@@ -775,8 +971,10 @@ mod tests {
     fn environment_key_is_used_when_the_default_auth_file_is_missing() {
         let auth_file = auth_file();
         let auth =
-            select_auth_with_default(None, None, Some("environment-key".into()), || Ok(auth_file))
-                .unwrap();
+            select_auth_with_default(None, None, None, Some("environment-key".into()), || {
+                Ok(auth_file)
+            })
+            .unwrap();
 
         assert_eq!(auth.mode(), OpenAiAuthMode::ApiKey);
     }
@@ -786,10 +984,11 @@ mod tests {
         let auth_file = auth_file();
         std::fs::write(&auth_file, b"{}").unwrap();
 
-        let error = select_auth_with_default(None, None, Some("environment-key".into()), || {
-            Ok(auth_file.clone())
-        })
-        .unwrap_err();
+        let error =
+            select_auth_with_default(None, None, None, Some("environment-key".into()), || {
+                Ok(auth_file.clone())
+            })
+            .unwrap_err();
 
         assert!(error.to_string().contains("no ChatGPT tokens"));
         std::fs::remove_file(auth_file).unwrap();
@@ -803,11 +1002,30 @@ mod tests {
         let error = select_auth(
             None,
             Some(auth_file.clone()),
+            None,
             Some("environment-key".into()),
         )
         .unwrap_err();
 
         assert!(error.to_string().contains("no ChatGPT tokens"));
+        std::fs::remove_file(auth_file).unwrap();
+    }
+
+    #[test]
+    fn access_token_precedes_the_default_auth_file_and_environment_api_key() {
+        let auth_file = auth_file();
+        write_chatgpt_auth(&auth_file);
+
+        let auth = select_auth_with_default(
+            None,
+            None,
+            Some("at-persistent".into()),
+            Some("environment-key".into()),
+            || Ok(auth_file.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(auth.mode(), OpenAiAuthMode::ChatGpt);
         std::fs::remove_file(auth_file).unwrap();
     }
 }

@@ -3,10 +3,12 @@ use super::*;
 
 pub(in crate::rollout) struct RolloutWriter {
     file: tokio::fs::File,
+    pub(super) committed_bytes: Arc<AtomicU64>,
     pub(in crate::rollout) pending: Option<RolloutCommit>,
     written_revision: Option<u64>,
     written_len: usize,
     written_context_baseline: Option<ContextBaseline>,
+    written_client_authored: Option<std::collections::BTreeSet<String>>,
     workspace: PathBuf,
     window_number: u64,
     first_window_id: String,
@@ -23,10 +25,12 @@ impl RolloutWriter {
     ) -> Self {
         Self {
             file,
+            committed_bytes: Arc::new(AtomicU64::new(0)),
             pending: None,
             written_revision: None,
             written_len: 0,
             written_context_baseline: None,
+            written_client_authored: None,
             workspace,
             window_number: 0,
             first_window_id: initial_window_id.clone(),
@@ -39,10 +43,12 @@ impl RolloutWriter {
     pub(super) fn resumed(file: tokio::fs::File, state: ResumeWriterState) -> Self {
         Self {
             file,
+            committed_bytes: Arc::new(AtomicU64::new(0)),
             pending: None,
             written_revision: Some(0),
             written_len: state.written_len,
             written_context_baseline: state.context_baseline,
+            written_client_authored: None,
             workspace: state.workspace,
             window_number: state.window_number,
             first_window_id: state.first_window_id,
@@ -58,6 +64,32 @@ impl RolloutWriter {
     ) -> (io::Result<()>, Option<oneshot::Sender<io::Result<()>>>) {
         while let Some(command) = commands.recv().await {
             match command {
+                RolloutCommand::Input { input, result } => {
+                    let start = self.file.metadata().await.map(|m| m.len());
+                    let outcome = match start {
+                        Ok(start) => {
+                            let outcome = async {
+                                self.write_event(CodexEvent::InputAccepted(&input)).await?;
+                                self.file.flush().await?;
+                                self.file.sync_data().await?;
+                                self.committed_bytes
+                                    .store(self.file.metadata().await?.len(), Ordering::Release);
+                                Ok(())
+                            }
+                            .await;
+                            if outcome.is_err() {
+                                match self.rollback(start).await {
+                                    Ok(()) => outcome,
+                                    Err(error) => Err(error),
+                                }
+                            } else {
+                                outcome
+                            }
+                        }
+                        Err(error) => Err(error),
+                    };
+                    drop(result.send(outcome));
+                }
                 RolloutCommand::Commit { commit, result } => {
                     self.pending = Some(*commit);
                     drop(result.send(self.persist_pending().await));
@@ -150,7 +182,10 @@ impl RolloutWriter {
                     turn: commit.turn.clone(),
                     model: commit.model,
                     context_baseline: commit.context_baseline.clone(),
-                    write_state: true,
+                    client_authored: commit.client_authored.clone(),
+                    write_state: self.written_context_baseline.as_ref()
+                        != Some(&commit.context_baseline)
+                        || self.written_client_authored.as_ref() != Some(&commit.client_authored),
                 })
             }
             None => Ok(PreparedAppend {
@@ -164,8 +199,10 @@ impl RolloutWriter {
                 turn: commit.turn.clone(),
                 model: commit.model,
                 context_baseline: commit.context_baseline.clone(),
+                client_authored: commit.client_authored.clone(),
                 write_state: self.written_context_baseline.as_ref()
-                    != Some(&commit.context_baseline),
+                    != Some(&commit.context_baseline)
+                    || self.written_client_authored.as_ref() != Some(&commit.client_authored),
             }),
             Some(revision) if revision == commit.revision => {
                 if len < self.written_len {
@@ -185,8 +222,10 @@ impl RolloutWriter {
                     turn: commit.turn.clone(),
                     model: commit.model,
                     context_baseline: commit.context_baseline.clone(),
+                    client_authored: commit.client_authored.clone(),
                     write_state: self.written_context_baseline.as_ref()
-                        != Some(&commit.context_baseline),
+                        != Some(&commit.context_baseline)
+                        || self.written_client_authored.as_ref() != Some(&commit.client_authored),
                 })
             }
             Some(_) => {
@@ -210,6 +249,7 @@ impl RolloutWriter {
                     turn: commit.turn.clone(),
                     model: commit.model,
                     context_baseline: commit.context_baseline.clone(),
+                    client_authored: commit.client_authored.clone(),
                     // A compaction starts a new history window, whose context
                     // baseline must be independently reconstructable.
                     write_state: true,
@@ -271,6 +311,7 @@ impl RolloutWriter {
                         full: true,
                         state: PersistedContextState {
                             nanocodex_context: &prepared.context_baseline,
+                            nanocodex_client_authored: &prepared.client_authored,
                         },
                     }),
                 },
@@ -336,7 +377,10 @@ impl RolloutWriter {
             }
         }
         self.file.flush().await?;
-        self.file.sync_data().await
+        self.file.sync_data().await?;
+        self.committed_bytes
+            .store(self.file.metadata().await?.len(), Ordering::Release);
+        Ok(())
     }
 
     async fn write_event(&mut self, event: CodexEvent<'_>) -> io::Result<()> {
@@ -375,6 +419,7 @@ impl RolloutWriter {
         self.written_len = prepared.len;
         if prepared.write_state {
             self.written_context_baseline = Some(prepared.context_baseline);
+            self.written_client_authored = Some(prepared.client_authored);
         }
         if let Some(window) = prepared.window {
             self.window_number = window.number;
@@ -402,6 +447,7 @@ struct PreparedAppend {
     turn: RolloutTurn,
     model: Model,
     context_baseline: ContextBaseline,
+    client_authored: std::collections::BTreeSet<String>,
     write_state: bool,
 }
 

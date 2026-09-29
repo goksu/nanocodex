@@ -6,11 +6,7 @@
 //! handlers without linking Code Mode, MCP, HTTP clients, or provider
 //! transports.
 
-use std::{
-    ffi::OsString,
-    path::PathBuf,
-    sync::{Arc, atomic::AtomicU64},
-};
+use std::{ffi::OsString, path::PathBuf, sync::Arc};
 
 use crate::{
     StandardTool, Tool, ToolContext, ToolInput, ToolOutput,
@@ -30,6 +26,28 @@ pub struct WorkspaceToolRuntime {
     view_image: ViewImageHandler,
     write_stdin: WriteStdinHandler,
     sessions: Arc<ShellSessions>,
+}
+
+/// Canonical local workspace tools rooted at one directory.
+#[derive(Clone, Debug)]
+pub struct WorkspaceTools {
+    pub(crate) root: PathBuf,
+}
+
+impl WorkspaceTools {
+    /// Creates canonical workspace tools rooted at `workspace`.
+    #[must_use]
+    pub fn new(workspace: impl Into<PathBuf>) -> Self {
+        Self {
+            root: workspace.into(),
+        }
+    }
+
+    /// Returns the configured workspace root.
+    #[must_use]
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
+    }
 }
 
 impl WorkspaceToolRuntime {
@@ -84,10 +102,7 @@ impl WorkspaceToolRuntime {
         max_wire_bytes: Option<u64>,
         environment: Arc<Vec<(OsString, OsString)>>,
     ) -> Self {
-        let sessions = Arc::new(ShellSessions::with_environment_and_turn(
-            environment,
-            Arc::new(AtomicU64::new(0)),
-        ));
+        let sessions = Arc::new(ShellSessions::with_environment(environment));
         Self {
             apply_patch: ApplyPatchHandler::new(workspace.clone()),
             exec_command: ExecCommandHandler::new(workspace.clone(), Arc::clone(&sessions)),
@@ -220,6 +235,6 @@ mod tests {
             .await;
 
         assert!(output.success);
-        assert_eq!(output.code_mode_value()["output"], "from-image");
+        assert_eq!(output.structured_result()["output"], "from-image");
     }
 }

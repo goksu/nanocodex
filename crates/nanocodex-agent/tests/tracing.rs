@@ -188,6 +188,7 @@ impl Service<ResponsesAttempt> for PricingTraceService {
             (1, ResponsesAttemptKind::Generation) => {
                 ResponsesOutput::Generation(GenerationOutput {
                     id: "resp-final".to_owned(),
+                    reported_model: None,
                     status: "completed".to_owned(),
                     end_turn: Some(true),
                     final_message: Some("priced".to_owned()),
@@ -221,6 +222,7 @@ fn pending_tool_generation() -> ResponsesOutput {
     .expect("function call item decodes");
     ResponsesOutput::Generation(GenerationOutput {
         id: "resp-tool".to_owned(),
+        reported_model: None,
         status: "completed".to_owned(),
         end_turn: Some(false),
         final_message: None,
@@ -242,6 +244,7 @@ fn pending_tool_generation() -> ResponsesOutput {
 fn final_generation() -> ResponsesOutput {
     ResponsesOutput::Generation(GenerationOutput {
         id: "resp-final".to_owned(),
+        reported_model: None,
         status: "completed".to_owned(),
         end_turn: Some(true),
         final_message: Some("steering recorded".to_owned()),
@@ -424,9 +427,12 @@ fn luna_model_call_span_uses_luna_rates() {
         .expect("model call span was captured");
     assert_eq!(
         call.fields.get("model").map(String::as_str),
-        Some("gpt-5.6-luna")
+        Some("gpt-6-luna")
     );
-    assert_eq!(call.fields.get("cost.usd").map(String::as_str), Some("1.4"));
+    assert_eq!(
+        call.fields.get("cost.usd").map(String::as_str),
+        Some("0.95")
+    );
 }
 
 #[test]

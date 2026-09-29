@@ -3,10 +3,14 @@
 use std::sync::Arc;
 
 use serde::Deserialize;
-use serde_json::value::RawValue;
+use serde_json::{Value, value::RawValue};
 
-use crate::CostStatus;
-use crate::{AgentEventKind, EstimatedUsdCost, MessagePhase, ToolOutputBody, Usage};
+use super::stream::AgentEventKind;
+use crate::{
+    pricing::{CostStatus, EstimatedUsdCost},
+    responses::{MessagePhase, Usage},
+    tools::ToolOutputBody,
+};
 
 /// A normalized view of one event in the session-wide agent firehose.
 ///
@@ -17,11 +21,14 @@ use crate::{AgentEventKind, EstimatedUsdCost, MessagePhase, ToolOutputBody, Usag
 #[non_exhaustive]
 pub enum AgentEventData {
     /// One complete inbound or outbound `OpenAI` protocol frame.
+    #[cfg(feature = "client")]
     OpenAi(OpenAiEvent),
     /// Incremental or completed assistant output.
     Assistant(AssistantEvent),
     /// Model reasoning that the API made visible.
     Reasoning(ReasoningEvent),
+    /// User input accepted by the agent, before model consumption.
+    InputAccepted(AcceptedInput),
     /// Agent-turn lifecycle state.
     Run(RunEvent),
     /// Tool invocation lifecycle state.
@@ -34,6 +41,23 @@ pub enum AgentEventData {
     Transport(TransportEvent),
 }
 
+/// An accepted user instruction, including ordered attachment descriptors.
+#[derive(Clone, Debug, Deserialize, serde::Serialize)]
+pub struct AcceptedInput {
+    /// Stable session identity.
+    pub session_id: String,
+    /// Canonical owning turn identity.
+    pub turn_id: String,
+    /// Stable identity of this accepted input in events and rollout records.
+    pub item_id: String,
+    /// `prompt` or `steer`.
+    pub kind: String,
+    /// Caller request/steering identity, when supplied.
+    pub request_id: Option<String>,
+    /// Exact ordered text and multimodal input; drafts are never emitted.
+    pub input: crate::PromptInput,
+}
+
 /// One raw `OpenAI` Responses protocol frame with stable routing metadata.
 ///
 /// `event` deliberately remains raw JSON. Provider wire events are already
@@ -41,6 +65,7 @@ pub enum AgentEventData {
 /// this firehose variant preserves every frame without forcing unknown
 /// provider additions through a JSON value tree.
 #[derive(Clone, Debug, Deserialize)]
+#[cfg(feature = "client")]
 pub struct OpenAiEvent {
     /// Whether the frame was sent or received.
     pub direction: String,
@@ -69,7 +94,7 @@ pub enum AssistantEvent {
 pub struct AssistantDelta {
     /// Logical model-call index.
     pub model_call_index: u32,
-    /// Provider output-item identity when supplied.
+    /// Stable output-item identity; uses the provider identity when available.
     pub item_id: Option<String>,
     /// Commentary or final-answer phase when supplied.
     pub phase: Option<MessagePhase>,
@@ -82,7 +107,7 @@ pub struct AssistantDelta {
 pub struct AssistantMessage {
     /// Logical model-call index.
     pub model_call_index: u32,
-    /// Provider output-item identity when supplied.
+    /// Stable output-item identity; uses the provider identity when available.
     pub item_id: Option<String>,
     /// Commentary or final-answer phase when supplied.
     pub phase: Option<MessagePhase>,
@@ -211,8 +236,6 @@ pub struct RunMetrics {
     pub response_attempts: u32,
     /// Retried Responses attempts.
     pub response_retries: u32,
-    /// Sent attempts that ended before provider usage was observed.
-    pub billing_uncertain_response_attempts: u32,
     /// Nanoseconds spent establishing connections.
     pub connection_duration_ns: u64,
     /// Nanoseconds spent in SDK retry backoff.
@@ -326,6 +349,8 @@ pub struct ToolResultEvent {
     pub started_after_ns: Option<u64>,
     /// Complete model-visible output.
     pub result: ToolOutputBody,
+    /// Exact machine-readable tool result.
+    pub structured_result: Value,
     /// Optional application or remote-tool metadata.
     pub metadata: Option<Box<RawValue>>,
 }

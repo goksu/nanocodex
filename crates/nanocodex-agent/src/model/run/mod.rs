@@ -1,9 +1,11 @@
+mod continuation;
 mod lifecycle;
 mod responses;
 mod state;
 mod tool_calls;
 mod turn;
 
+use continuation::ExecutionPhase;
 use lifecycle::*;
 use responses::*;
 use state::*;
@@ -11,7 +13,7 @@ use tool_calls::*;
 
 use std::{
     any::Any,
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     panic::AssertUnwindSafe,
     path::Path,
     sync::{Arc, Mutex},
@@ -21,9 +23,10 @@ use futures_util::{FutureExt, StreamExt, stream::FuturesOrdered};
 use nanocodex_oai_api::{
     __private::{
         EventSink, ManagedSessionState, ModelConfig, ResponsesAttemptFactory,
-        assign_missing_response_item_id, compaction, with_code_mode_tool_names,
+        assign_missing_response_item_id, compaction, responses_lite_request_prefix,
+        with_code_mode_tool_names,
     },
-    CONTEXT_WINDOW_TOKENS, Model, Prompt, Thinking,
+    Model, Prompt, Thinking,
     events::AgentEventKind,
     pricing::{ServiceTier, estimate_for_model},
     responses::{ContentItem, MessageRole, RequestProfile, ResponseItem, ToolDefinition, Usage},
@@ -31,9 +34,9 @@ use nanocodex_oai_api::{
         CodeCall, CodeCallKind, GenerationOutput as TurnResult, ResponsesAttempt, ResponsesClient,
         ResponsesOutput, ResponsesServiceResponse,
     },
-    transport::{ResponsesError, ResponsesTransport, TransportStats},
+    transport::{ResponsesError, ResponsesTransport, TransportStats, TransportStatsSnapshot},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, value::RawValue};
 use tokio::sync::{RwLock, watch};
 use tower::Service;
@@ -48,13 +51,13 @@ use super::{
     display_endpoint, elapsed_ns,
     input::{
         custom_tool_notification, custom_tool_output, developer_context, function_tool_output,
-        task_input, tool_search_output, turn_aborted,
+        prompt_messages, task_input, tool_search_output, turn_aborted,
     },
     terminal_payload,
 };
 use crate::{
     NanocodexError, Result,
-    agent::{AgentSend, ContextSource},
+    agent::{AgentSend, ContextSource, ExecutionSteps, execution::QueuedSteer},
     prompt_cache::ModelPromptCache,
     usage::TurnUsage,
 };
@@ -71,6 +74,7 @@ use nanocodex_tools::{
 
 pub(crate) struct ModelRun<S> {
     events: EventSink,
+    provider_session_id: Arc<str>,
     config: Arc<ModelConfig>,
     model: Model,
     thinking: Thinking,
@@ -79,6 +83,7 @@ pub(crate) struct ModelRun<S> {
     transport_stats: Arc<TransportStats>,
     started_at: Instant,
     stats: RunStats,
+    transport_baseline: TransportStatsSnapshot,
     session: Option<ModelSessionState>,
     active_tools: Option<ToolRuntimeControl>,
     active_tool_calls: Vec<ActiveToolCall>,
@@ -87,9 +92,20 @@ pub(crate) struct ModelRun<S> {
     tools: Tools,
     prompt_cache: ModelPromptCache,
     context_source: ContextSource,
+    host_context: Option<Arc<str>>,
+    // Execution-local authority is deliberately absent from inheritable ModelCheckpoint.
+    instruction_revision: Option<u64>,
     global_instructions: Option<Arc<str>>,
     force_compaction: bool,
     pending_developer_messages: Vec<ResponseItem>,
+    execution_steps: Option<ExecutionSteps>,
+    before_compaction: Option<Arc<dyn crate::execution::BeforeCompaction>>,
+}
+
+pub(crate) struct TurnSteering {
+    pub(crate) receiver: crate::agent::execution::SteerQueue,
+    pub(crate) retained: Vec<QueuedSteer>,
+    pub(crate) model_call_index: Arc<tokio::sync::Mutex<u32>>,
 }
 
 pub(crate) enum ModelTurnOutcome {
@@ -119,6 +135,7 @@ pub(crate) struct CompletedModelTurn {
 #[derive(Clone)]
 pub(crate) struct ModelCheckpoint {
     workspace: String,
+    provider_session_id: Arc<str>,
     conversation: ConversationState,
     request_prefix: Arc<[ResponseItem]>,
     prompt_cache_key: Arc<str>,
@@ -136,8 +153,10 @@ pub(crate) struct PreparedCheckpoint {
 
 pub(crate) struct HistoryCheckpoint {
     pub(crate) workspace: String,
+    pub(crate) provider_session_id: Arc<str>,
     pub(crate) canonical_context: ResponseItem,
     pub(crate) history: Vec<ResponseItem>,
+    pub(crate) client_authored: std::collections::BTreeSet<String>,
     pub(crate) prompt_cache_key: Arc<str>,
     pub(crate) context_baseline: Option<ContextBaseline>,
 }
@@ -150,7 +169,7 @@ impl ModelCheckpoint {
         self.conversation.shared_history()
     }
 
-    #[allow(dead_code, reason = "consumed by the native durability boundary only")]
+    #[allow(dead_code, reason = "consumed by the native rollout boundary only")]
     pub(crate) const fn history_revision(&self) -> u64 {
         self.conversation.history_revision()
     }
@@ -167,6 +186,27 @@ impl ModelCheckpoint {
         &self.conversation.canonical_context
     }
 
+    pub(crate) const fn client_authored(&self) -> &std::collections::BTreeSet<String> {
+        self.conversation.managed.client_authored()
+    }
+
+    pub(crate) fn context_usage(&self) -> crate::session::ContextUsage {
+        let (usage, server_reasoning_included) = self.conversation.managed.context_usage();
+        crate::session::ContextUsage {
+            usage: usage.cloned(),
+            server_reasoning_included,
+            is_estimate: self.conversation.managed.context_usage_is_estimate(),
+        }
+    }
+
+    pub(crate) fn restore_context_usage(&mut self, usage: &crate::session::ContextUsage) {
+        self.conversation.managed.restore_context_usage(
+            usage.usage.as_ref(),
+            usage.server_reasoning_included,
+            usage.is_estimate,
+        );
+    }
+
     pub(crate) fn snapshot_history(&self) -> Vec<ResponseItem> {
         self.conversation.flattened_history()
     }
@@ -175,21 +215,31 @@ impl ModelCheckpoint {
         &self.context_baseline
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "checkpoint restoration keeps each retained boundary explicit"
+    )]
     pub(crate) fn resume(
         workspace: String,
-        mut request_prefix: Vec<ResponseItem>,
+        provider_session_id: Arc<str>,
+        request_prefix: Vec<ResponseItem>,
         prompt_cache_key: Arc<str>,
         canonical_context: ResponseItem,
         history: Vec<ResponseItem>,
+        client_authored: std::collections::BTreeSet<String>,
         global_instructions: Option<Arc<str>>,
         context_baseline: Option<ContextBaseline>,
     ) -> Result<Self> {
-        assign_request_prefix_ids(&mut request_prefix);
         let context_baseline =
             context_baseline.unwrap_or_else(|| ContextBaseline::reconstruct(&history));
+        let mut conversation = ConversationState::resume(canonical_context, history)?;
+        conversation
+            .managed
+            .restore_client_authored(client_authored);
         Ok(Self {
             workspace,
-            conversation: ConversationState::resume(canonical_context, history)?,
+            provider_session_id,
+            conversation,
             request_prefix: Arc::from(request_prefix),
             prompt_cache_key,
             preserve_inherited_delta: false,
@@ -200,14 +250,20 @@ impl ModelCheckpoint {
 }
 
 impl<S> ModelRun<S> {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the private run owns each injected lifecycle component directly"
+    )]
     pub(crate) fn new(
         events: EventSink,
+        provider_session_id: Arc<str>,
         config: Arc<ModelConfig>,
         client: ResponsesClient<S>,
         transport_stats: Arc<TransportStats>,
         tools: Tools,
         prompt_cache: ModelPromptCache,
         context_source: ContextSource,
+        host_context: Option<Arc<str>>,
     ) -> Self {
         let model = config.model;
         let thinking = config.thinking;
@@ -215,6 +271,7 @@ impl<S> ModelRun<S> {
         let global_instructions = context_source.global_instructions();
         Self {
             events,
+            provider_session_id,
             config,
             model,
             thinking,
@@ -223,6 +280,7 @@ impl<S> ModelRun<S> {
             transport_stats,
             started_at: Instant::now(),
             stats: RunStats::default(),
+            transport_baseline: TransportStatsSnapshot::default(),
             session: None,
             active_tools: None,
             active_tool_calls: Vec::new(),
@@ -231,12 +289,20 @@ impl<S> ModelRun<S> {
             tools,
             prompt_cache,
             context_source,
+            host_context,
+            instruction_revision: None,
             global_instructions,
             force_compaction: false,
             pending_developer_messages: Vec::new(),
+            execution_steps: None,
+            before_compaction: None,
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the private run owns each injected lifecycle component directly"
+    )]
     pub(crate) fn from_checkpoint(
         events: EventSink,
         config: Arc<ModelConfig>,
@@ -245,6 +311,7 @@ impl<S> ModelRun<S> {
         tools: Tools,
         prompt_cache: ModelPromptCache,
         prepared: PreparedCheckpoint,
+        host_context: Option<Arc<str>>,
     ) -> Self {
         let PreparedCheckpoint {
             checkpoint,
@@ -252,15 +319,17 @@ impl<S> ModelRun<S> {
             context_source,
             selected_agents_md,
         } = prepared;
+        let provider_session_id = Arc::clone(&checkpoint.provider_session_id);
         let active_tools = runtime.control();
         let (_, code_mode_tool_names) = model_tool_contract(&runtime, events.request_id());
         let factory = ResponsesAttemptFactory::new(
             with_code_mode_tool_names(
                 RequestProfile::new(
-                    events.request_id(),
+                    checkpoint.provider_session_id.to_string(),
                     checkpoint.prompt_cache_key.to_string(),
                     Arc::clone(&checkpoint.request_prefix),
-                ),
+                )
+                .with_thread_id(events.request_id()),
                 code_mode_tool_names,
             ),
             events.clone(),
@@ -274,6 +343,7 @@ impl<S> ModelRun<S> {
         let global_instructions = context_source.global_instructions();
         Self {
             events,
+            provider_session_id,
             config,
             model,
             thinking,
@@ -282,6 +352,7 @@ impl<S> ModelRun<S> {
             transport_stats,
             started_at: Instant::now(),
             stats: RunStats::default(),
+            transport_baseline: TransportStatsSnapshot::default(),
             session: Some(ModelSessionState {
                 workspace: checkpoint.workspace,
                 tools: runtime,
@@ -297,10 +368,25 @@ impl<S> ModelRun<S> {
             tools,
             prompt_cache,
             context_source,
+            host_context,
+            instruction_revision: None,
             global_instructions,
             force_compaction: false,
             pending_developer_messages: Vec::new(),
+            execution_steps: None,
+            before_compaction: None,
         }
+    }
+
+    pub(crate) fn set_before_compaction(
+        &mut self,
+        hook: Option<Arc<dyn crate::execution::BeforeCompaction>>,
+    ) {
+        self.before_compaction = hook;
+    }
+
+    pub(crate) fn set_host_context(&mut self, host_context: Option<Arc<str>>) {
+        self.host_context = host_context;
     }
 
     pub(crate) fn set_events(&mut self, events: EventSink) {
@@ -320,25 +406,40 @@ impl<S> ModelRun<S> {
         }
     }
 
-    pub(crate) fn append_developer_message(&mut self, text: String) -> Option<ModelCheckpoint> {
+    pub(crate) fn append_developer_message(
+        &mut self,
+        text: String,
+        requested_workspace: Option<&str>,
+    ) -> Result<ModelCheckpoint> {
         let item = ResponseItem::message(
             MessageRole::Developer,
             [ContentItem::InputText {
                 text: text.into_boxed_str(),
             }],
         );
-        let Some(session) = &mut self.session else {
-            self.pending_developer_messages.push(item);
-            return None;
-        };
-        session.conversation.append([item]);
+        if self.session.is_none() {
+            self.session = Some(self.empty_session(requested_workspace)?);
+        }
+        let session = self.session.as_mut().ok_or_else(|| {
+            NanocodexError::InvalidSessionSnapshot(
+                "developer context did not establish a model session".to_owned(),
+            )
+        })?;
+        if !self.pending_developer_messages.is_empty() {
+            session
+                .conversation
+                .append_client(self.pending_developer_messages.drain(..));
+        }
+        session.conversation.append_client([item]);
         session.conversation.commit_tail();
-        Some(ModelCheckpoint {
+        session.preserve_inherited_delta = true;
+        Ok(ModelCheckpoint {
             workspace: session.workspace.clone(),
+            provider_session_id: Arc::from(session.factory.profile().session_id()),
             conversation: session.conversation.clone(),
             request_prefix: session.factory.profile().shared_prefix(),
             prompt_cache_key: Arc::from(session.factory.profile().prompt_cache_key()),
-            preserve_inherited_delta: false,
+            preserve_inherited_delta: true,
             global_instructions: self.global_instructions.clone(),
             context_baseline: session.context.baseline(),
         })
@@ -356,7 +457,7 @@ impl<S> ModelRun<S> {
         let tools = tool_runtime(&workspace, &self.config, &self.tools);
         let tool_control = tools.control();
         self.active_tools = Some(tool_control);
-        let factory = self.attempt_factory(&tools);
+        let factory = self.attempt_factory(&tools)?;
         let context = ContextState::new(selected_agents_md, ContextBaseline::Missing);
         let canonical_context = context
             .capture(
@@ -375,13 +476,14 @@ impl<S> ModelRun<S> {
         })
     }
 
-    fn attempt_factory(&self, tools: &ToolRuntime) -> ResponsesAttemptFactory {
+    fn attempt_factory(&self, tools: &ToolRuntime) -> Result<ResponsesAttemptFactory> {
         attempt_factory(
             &self.events,
             &self.transport_stats,
+            &self.provider_session_id,
             self.prompt_cache.key(),
             tools,
-            self.config.system_prompt(),
+            &self.config.system_prompt(),
         )
     }
 
@@ -418,38 +520,39 @@ pub(crate) fn prepare_resumed_checkpoint(
     session_id: &str,
     context_source: ContextSource,
 ) -> Result<PreparedCheckpoint> {
+    if checkpoint.conversation.prepare_replay_images() {
+        checkpoint.preserve_inherited_delta = false;
+    }
+    // Unstored response IDs are scoped to the live transport connection. A fork
+    // owns a fresh client, so it must replay client-owned history instead.
+    if !config.store_responses {
+        checkpoint.conversation.reset_for_full_request();
+    }
     checkpoint.global_instructions = context_source
         .global_instructions()
         .or(checkpoint.global_instructions);
-    let prepared = prepare_checkpoint(checkpoint, config, tools, context_source);
-    let (tool_specs, code_mode_tool_names) = model_tool_contract(&prepared.runtime, session_id);
-    let expected = request_profile(
-        "resume-validation",
-        "resume-validation",
-        tool_specs,
-        code_mode_tool_names,
-        config.system_prompt(),
+    let runtime = tool_runtime(checkpoint.workspace(), config, tools);
+    let (tool_specs, code_mode_tool_names) = model_tool_contract(&runtime, session_id);
+    checkpoint.request_prefix = Arc::from(
+        request_profile(
+            session_id,
+            checkpoint.prompt_cache_key(),
+            tool_specs,
+            code_mode_tool_names,
+            &config.system_prompt(),
+        )?
+        .prefix()
+        .to_vec(),
     );
-    let expected =
-        serde_json::to_vec(&without_response_item_ids(expected.prefix())).map_err(|error| {
-            NanocodexError::InvalidSessionSnapshot(format!(
-                "failed to validate the request prefix: {error}"
-            ))
-        })?;
-    let stored = serde_json::to_vec(&without_response_item_ids(
-        prepared.checkpoint.request_prefix(),
-    ))
-    .map_err(|error| {
-        NanocodexError::InvalidSessionSnapshot(format!(
-            "failed to validate the stored request prefix: {error}"
-        ))
-    })?;
-    if expected != stored {
-        return Err(NanocodexError::InvalidSessionSnapshot(
-            "instructions or tool definitions do not match the resumed session".to_owned(),
-        ));
-    }
-    Ok(prepared)
+    let selected_agents_md = context_source
+        .project_instructions(checkpoint.workspace())
+        .map(Arc::from);
+    Ok(PreparedCheckpoint {
+        checkpoint,
+        runtime,
+        context_source,
+        selected_agents_md,
+    })
 }
 
 pub(crate) fn prepare_history_checkpoint(
@@ -461,8 +564,10 @@ pub(crate) fn prepare_history_checkpoint(
 ) -> Result<PreparedCheckpoint> {
     let HistoryCheckpoint {
         workspace,
+        provider_session_id,
         canonical_context,
         history,
+        client_authored,
         prompt_cache_key,
         context_baseline,
     } = resume;
@@ -472,20 +577,22 @@ pub(crate) fn prepare_history_checkpoint(
     let runtime = tool_runtime(&workspace, config, tools);
     let (tool_specs, code_mode_tool_names) = model_tool_contract(&runtime, session_id);
     let request_prefix = request_profile(
-        "history-resume",
-        "history-resume",
+        session_id,
+        prompt_cache_key.as_ref(),
         tool_specs,
         code_mode_tool_names,
-        config.system_prompt(),
-    )
+        &config.system_prompt(),
+    )?
     .prefix()
     .to_vec();
     let checkpoint = ModelCheckpoint::resume(
         workspace,
+        provider_session_id,
         request_prefix,
         prompt_cache_key,
         canonical_context,
         history,
+        client_authored,
         context_source.global_instructions(),
         context_baseline,
     )?;
@@ -497,13 +604,75 @@ pub(crate) fn prepare_history_checkpoint(
     })
 }
 
-fn without_response_item_ids(items: &[ResponseItem]) -> Vec<ResponseItem> {
-    items
-        .iter()
-        .cloned()
-        .map(|mut item| {
-            item.strip_id();
-            item
-        })
-        .collect()
+#[cfg(test)]
+mod context_accounting_snapshot_tests {
+    use super::*;
+    use crate::session::{CommittedSession, SessionSnapshot};
+
+    #[test]
+    fn snapshot_preserves_context_accounting_and_accepts_legacy_snapshots() {
+        let history: Vec<ResponseItem> = serde_json::from_value(serde_json::json!([
+            {"type":"reasoning", "summary":[], "encrypted_content":"x".repeat(1200)},
+            {"type":"message", "role":"user", "content":[{"type":"input_text", "text":"synthetic task"}]},
+            {"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"synthetic answer"}]}
+        ])).unwrap();
+        let prefix = serde_json::from_value(serde_json::json!([
+            {"type":"additional_tools", "role":"developer", "tools":[]},
+            {"type":"message", "role":"developer", "content":[{"type":"input_text", "text":"synthetic instructions"}]}
+        ])).unwrap();
+        let mut checkpoint = ModelCheckpoint::resume(
+            ".".into(),
+            Arc::from("synthetic-lineage"),
+            prefix,
+            Arc::from("synthetic-cache"),
+            history[1].clone(),
+            history,
+            Default::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        checkpoint.conversation.update_token_info(Some(&Usage {
+            total_tokens: 265639,
+            ..Usage::default()
+        }));
+        checkpoint.conversation.observe_server_reasoning(true);
+        let snapshot =
+            CommittedSession::new(Arc::from("synthetic-lineage"), Model::Astra, checkpoint)
+                .snapshot();
+        let encoded = serde_json::to_value(snapshot).unwrap();
+        let restored: SessionSnapshot = serde_json::from_value(encoded.clone()).unwrap();
+        let restored = restored.into_resume().unwrap().checkpoint.unwrap();
+        assert_eq!(restored.conversation.active_context_tokens(), 265639);
+        assert!(restored.conversation.managed.context_usage().1);
+        assert!(restored.conversation.previous_response_id().is_none());
+        assert!(restored.conversation.active_context_tokens() >= 244800);
+
+        // History replacement stores an all-history estimate, not a provider baseline.
+        let mut estimated = restored;
+        estimated
+            .conversation
+            .managed
+            .replace_prepared_history(vec![
+                ResponseItem::message(MessageRole::Assistant, [ContentItem::output_text("answer")]),
+                ResponseItem::message(
+                    MessageRole::User,
+                    [ContentItem::input_text("x".repeat(600000))],
+                ),
+            ]);
+        let expected = estimated.conversation.active_context_tokens();
+        let snapshot =
+            CommittedSession::new(Arc::from("synthetic-lineage"), Model::Astra, estimated)
+                .snapshot();
+        let decoded: SessionSnapshot =
+            serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap();
+        let restored = decoded.into_resume().unwrap().checkpoint.unwrap();
+        assert!(restored.conversation.managed.context_usage_is_estimate());
+        assert_eq!(restored.conversation.active_context_tokens(), expected);
+        assert!(expected < 244800);
+        let mut legacy = encoded;
+        legacy.as_object_mut().unwrap().remove("context_usage");
+        let legacy: SessionSnapshot = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.into_resume().is_ok());
+    }
 }

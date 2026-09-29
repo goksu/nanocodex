@@ -1,29 +1,36 @@
+use super::backend::{
+    BackendPrompt, BackendPromptRoute, BackendTurn, BackendTurnKey, LifecycleBackend,
+};
 use super::*;
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "openai", not(target_family = "wasm")))]
 use crate::rollout::RolloutInfo;
 
 /// Cheap, cloneable command handle for an owned agent driver.
 pub struct Nanocodex {
-    pub(super) commands: mpsc::Sender<Command>,
-    pub(super) events: EventSink,
+    pub(super) backend: Arc<dyn LifecycleBackend>,
+    pub(super) events: nanocodex_oai_api::events::AgentEventPublisher,
     pub(super) next_turn: Arc<AtomicU64>,
-    pub(super) lineage_id: Arc<str>,
-    pub(super) session_id: SessionId,
-    pub(super) durability: Durability,
-    pub(super) shutdown: DriverShutdown,
+    pub(super) agent_id: Arc<str>,
+    pub(super) session_id: Arc<str>,
+    #[cfg(feature = "openai")]
+    pub(super) local_session_id: Option<SessionId>,
+    #[cfg(all(feature = "openai", not(target_family = "wasm")))]
+    pub(super) rollout: Option<RolloutInfo>,
 }
 
 impl Clone for Nanocodex {
     fn clone(&self) -> Self {
         Self {
-            commands: self.commands.clone(),
+            backend: Arc::clone(&self.backend),
             events: self.events.clone(),
             next_turn: Arc::clone(&self.next_turn),
-            lineage_id: Arc::clone(&self.lineage_id),
-            session_id: self.session_id,
-            durability: self.durability.clone(),
-            shutdown: self.shutdown.clone(),
+            agent_id: Arc::clone(&self.agent_id),
+            session_id: Arc::clone(&self.session_id),
+            #[cfg(feature = "openai")]
+            local_session_id: self.local_session_id,
+            #[cfg(all(feature = "openai", not(target_family = "wasm")))]
+            rollout: self.rollout.clone(),
         }
     }
 }
@@ -33,11 +40,21 @@ impl Clone for Nanocodex {
 /// A tools factory receives a fresh handle for every agent driver. Holding the
 /// handle does not keep its agent alive.
 #[derive(Clone)]
+#[cfg(feature = "openai")]
 pub struct AgentHandle {
     pub(super) commands: mpsc::WeakSender<Command>,
+    pub(super) shutdown: DriverShutdown,
+    pub(super) session_id: Arc<str>,
 }
 
+#[cfg(feature = "openai")]
 impl AgentHandle {
+    /// Returns the session owned by this weak driver capability.
+    #[must_use]
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
     /// Starts a clean agent with the containing driver's private configuration,
     /// service factory, workspace policy, and per-agent tools factory.
     ///
@@ -48,8 +65,106 @@ impl AgentHandle {
     ///
     /// Returns an error after the containing driver has stopped.
     pub async fn spawn(&self) -> Result<(Nanocodex, AgentEvents)> {
+        self.spawn_with(SpawnOptions::new()).await
+    }
+
+    /// Starts a clean agent with optional model and reasoning overrides.
+    ///
+    /// Unspecified values inherit this agent's settings when the driver handles
+    /// the spawn command. Overrides affect only the new child.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after the containing driver has stopped.
+    pub async fn spawn_with(&self, options: SpawnOptions) -> Result<(Nanocodex, AgentEvents)> {
         let commands = self.commands()?;
-        request_spawn(&commands).await
+        request_spawn_with_host_context(&commands, &self.shutdown, options, None).await
+    }
+
+    /// Starts a clean child with embedding-owned context inherited by its tool invocations.
+    #[doc(hidden)]
+    pub async fn spawn_with_host_context(
+        &self,
+        options: SpawnOptions,
+        host_context: Option<Arc<str>>,
+    ) -> Result<(Nanocodex, AgentEvents)> {
+        let commands = self.commands()?;
+        request_spawn_with_host_context(&commands, &self.shutdown, options, host_context).await
+    }
+
+    /// Rehydrates an idle child from this runtime's in-memory history and host capabilities.
+    #[doc(hidden)]
+    pub async fn restore_child(
+        &self,
+        snapshot: ChildRuntimeSnapshot,
+        host_context: Option<Arc<str>>,
+    ) -> Result<(Nanocodex, AgentEvents)> {
+        let commands = self.commands()?;
+        request_command(&commands, &self.shutdown, |result| Command::Spawn {
+            options: SpawnOptions::new()
+                .model(snapshot.model)
+                .thinking(snapshot.thinking),
+            restore: Some(snapshot),
+            host_context,
+            result,
+        })
+        .await
+    }
+
+    /// Starts several clean agents in the order requested.
+    ///
+    /// Every child receives the containing driver's private configuration,
+    /// service factory, workspace policy, and per-agent tools factory. The
+    /// children do not inherit conversation history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after the containing driver has stopped.
+    pub async fn spawn_many(&self, count: usize) -> Result<Vec<(Nanocodex, AgentEvents)>> {
+        let commands = self.commands()?;
+        request_spawn_many(&commands, &self.shutdown, count, None, None).await
+    }
+
+    /// Starts several clean agents and synchronously observes each child as it
+    /// is materialized by the parent driver.
+    ///
+    /// This low-level seam lets embeddings pair tool-runtime registration with
+    /// rollback even when the batch request is cancelled before its result is
+    /// delivered.
+    #[doc(hidden)]
+    pub async fn spawn_many_observed(
+        &self,
+        count: usize,
+        observer: impl Fn(&str) + Send + Sync + 'static,
+    ) -> Result<Vec<(Nanocodex, AgentEvents)>> {
+        let commands = self.commands()?;
+        request_spawn_many(
+            &commands,
+            &self.shutdown,
+            count,
+            Some(Arc::new(observer)),
+            None,
+        )
+        .await
+    }
+
+    /// Observes a clean batch while privately inheriting embedding-owned context.
+    #[doc(hidden)]
+    pub async fn spawn_many_observed_with_host_context(
+        &self,
+        count: usize,
+        observer: impl Fn(&str) + Send + Sync + 'static,
+        host_context: Option<Arc<str>>,
+    ) -> Result<Vec<(Nanocodex, AgentEvents)>> {
+        let commands = self.commands()?;
+        request_spawn_many(
+            &commands,
+            &self.shutdown,
+            count,
+            Some(Arc::new(observer)),
+            host_context,
+        )
+        .await
     }
 
     /// Forks the containing agent's latest safe model boundary.
@@ -60,7 +175,7 @@ impl AgentHandle {
     /// after the containing agent driver has stopped.
     pub async fn fork(&self) -> Result<(Nanocodex, AgentEvents)> {
         let commands = self.commands()?;
-        request_fork(&commands, None).await
+        request_fork(&commands, &self.shutdown, None, false).await
     }
 
     fn commands(&self) -> Result<mpsc::Sender<Command>> {
@@ -69,37 +184,41 @@ impl AgentHandle {
 }
 
 impl Nanocodex {
-    /// Starts configuring an agent from a reusable [`OpenAi`] client recipe.
+    /// Starts configuring an agent from a concrete backend input.
     #[must_use]
-    pub fn builder<F>(openai: OpenAi<F>) -> NanocodexBuilder<F>
+    pub fn builder<B>(backend: B) -> B::Builder
     where
-        F: ResponsesServiceFactory,
+        B: BuilderBackend,
     {
-        let (config, factory) = into_openai_parts(openai);
-        NanocodexBuilder {
-            config,
-            tools: ToolsConfiguration::Shared(Tools::default()),
-            workspace: None,
-            session_id: None,
-            prompt_cache: PromptCacheConfig::default(),
-            codex: CodexCompatibility::default(),
-            resume: None,
-            factory,
-        }
+        backend.into_builder()
+    }
+
+    /// Returns the stable agent identity used to reopen durable backends.
+    #[must_use]
+    pub fn agent_id(&self) -> &str {
+        &self.agent_id
     }
 
     /// Returns the stable identity used by events, transport metadata, and any rollout.
     #[must_use]
-    pub const fn session_id(&self) -> SessionId {
-        self.session_id
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// Returns the typed local OpenAI identity when this handle owns that backend.
+    #[cfg(feature = "openai")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "openai")))]
+    #[must_use]
+    pub const fn local_session_id(&self) -> Option<SessionId> {
+        self.local_session_id
     }
 
     /// Returns the Codex-compatible rollout identity and path when recording is enabled.
-    #[cfg(not(target_family = "wasm"))]
-    #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
+    #[cfg(all(feature = "openai", not(target_family = "wasm")))]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "openai", not(target_family = "wasm")))))]
     #[must_use]
     pub const fn rollout(&self) -> Option<&RolloutInfo> {
-        self.durability.info()
+        self.rollout.as_ref()
     }
 
     /// Retries any pending rollout write and waits for a durable file flush.
@@ -112,10 +231,23 @@ impl Nanocodex {
     /// # Errors
     ///
     /// Returns an error when the configured rollout cannot be written.
-    #[cfg(not(target_family = "wasm"))]
-    #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
+    #[cfg(all(feature = "openai", not(target_family = "wasm")))]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "openai", not(target_family = "wasm")))))]
     pub async fn flush_rollout(&self) -> Result<()> {
-        self.durability.flush().await
+        self.backend.flush().await
+    }
+
+    /// Disconnects this client while allowing backend-owned durable work to continue.
+    ///
+    /// A durable remote backend closes client-local streams and attachments
+    /// without cancelling accepted turns. Backends that cannot continue after
+    /// disconnection perform an ordinary shutdown instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's local resource cleanup failure.
+    pub async fn disconnect(&self) -> Result<()> {
+        self.backend.disconnect().await
     }
 
     /// Gracefully stops this agent and waits for all owned resources to close.
@@ -126,9 +258,10 @@ impl Nanocodex {
     /// returned `Ok(())` therefore establishes a durable boundary suitable for
     /// an immediate same-process rollout resume.
     ///
-    /// Dropping the final handle retains the existing implicit cancellation
-    /// behavior, but offers no future that can join resource cleanup. Use this
-    /// method at an explicit application or session boundary.
+    /// Dropping the final handle performs backend-owned implicit cleanup but
+    /// offers no future that can join it. Local backends cancel unfinished
+    /// work; durable remote backends may instead disconnect and leave accepted
+    /// turns running. Use this method when cancellation is the explicit intent.
     ///
     /// # Errors
     ///
@@ -136,62 +269,71 @@ impl Nanocodex {
     /// concurrent and later callers on any clone await or reuse that same
     /// result.
     pub async fn shutdown(&self) -> Result<()> {
-        let (initiate, receiver) = self.shutdown.request();
-        if initiate && self.commands.send(Command::Shutdown).await.is_err() {
-            let outcome = match self.durability.shutdown().await {
-                Ok(()) => Err(NanocodexError::AgentStopped),
-                Err(error) => Err(error),
-            };
-            self.shutdown.complete(outcome);
-        }
-        match receiver.await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(NanocodexError::Shutdown(error)),
-            Err(_) => Err(NanocodexError::AgentStopped),
-        }
+        self.backend.shutdown().await
     }
 
-    /// Accepts the agent's prompt and immediately returns its turn handle.
+    /// Accepts a prompt submission and immediately returns its turn handle.
+    ///
+    /// When an execution policy is configured, strings and [`Prompt`] values
+    /// receive an automatically generated operation identity. Use
+    /// [`PromptRequest::request_id`] to supply a stable caller-owned identity.
     ///
     /// # Errors
     ///
-    /// Returns an error for an empty prompt or if the driver stopped.
-    pub async fn prompt(&self, prompt: impl Into<Prompt>) -> Result<Turn> {
-        let prompt = prompt.into();
-        if prompt.instruction.is_empty() {
+    /// Returns an error for an empty prompt or request ID, when identified
+    /// work is submitted without a configured policy, or if the driver stopped.
+    pub async fn prompt(&self, request: impl Into<PromptRequest>) -> Result<Turn> {
+        let PromptRequest {
+            prompt,
+            request_id,
+            cancel_on_admission,
+        } = request.into();
+        prompt
+            .validate()
+            .map_err(|error| NanocodexError::InvalidRequest(error.to_string()))?;
+        if request_id
+            .as_deref()
+            .is_some_and(|request_id| request_id.trim().is_empty())
+        {
             return Err(NanocodexError::InvalidRequest(
-                "prompt instruction must not be empty".to_owned(),
+                "request ID must not be empty".to_owned(),
             ));
         }
-        let key = TurnKey(self.next_turn.fetch_add(1, Ordering::Relaxed));
-        let parent = tracing::Span::current();
-        let parent = (!parent.is_disabled()).then_some(parent);
+        let key = BackendTurnKey(self.next_turn.fetch_add(1, Ordering::Relaxed));
         let (events, event_stream) = self.events.mirrored_channel();
-        let (result, receiver) = oneshot::channel();
-        if self
-            .commands
-            .send(Command::Prompt {
+        #[cfg(feature = "openai")]
+        let turn_id = uuid::Uuid::now_v7().to_string();
+        #[cfg(not(feature = "openai"))]
+        let turn_id = format!("{}:{}", self.session_id, key.0);
+        let events = events.with_turn_id(turn_id.clone());
+        let BackendTurn { request_id, result } = self
+            .backend
+            .submit(BackendPrompt {
                 key,
                 prompt,
-                thinking: None,
-                fast_mode: None,
-                parent,
+                request_id,
+                cancel_on_admission,
                 events,
-                result,
             })
-            .await
-            .is_err()
-        {
-            return Err(NanocodexError::AgentStopped);
-        }
+            .await?;
         Ok(Turn {
+            turn_id: self.canonical_turn_id(turn_id, request_id.as_deref()),
             control: TurnControl {
                 key,
-                commands: self.commands.clone(),
+                backend: Arc::clone(&self.backend),
             },
+            request_id,
             events: event_stream,
-            result: receiver,
+            result,
         })
+    }
+
+    fn canonical_turn_id(&self, generated: String, request_id: Option<&str>) -> String {
+        #[cfg(feature = "openai")]
+        if self.local_session_id.is_some() {
+            return generated;
+        }
+        request_id.map(str::to_owned).unwrap_or(generated)
     }
 
     /// Routes live input into the active turn or starts a new turn when idle.
@@ -210,45 +352,41 @@ impl Nanocodex {
     /// agent driver stopped.
     pub async fn route_prompt(&self, prompt: impl Into<Prompt>) -> Result<PromptRoute> {
         let prompt = prompt.into();
-        if prompt.instruction.is_empty() {
-            return Err(NanocodexError::InvalidRequest(
-                "prompt instruction must not be empty".to_owned(),
-            ));
-        }
-        let key = TurnKey(self.next_turn.fetch_add(1, Ordering::Relaxed));
-        let parent = tracing::Span::current();
-        let parent = (!parent.is_disabled()).then_some(parent);
+        prompt
+            .validate()
+            .map_err(|error| NanocodexError::InvalidRequest(error.to_string()))?;
+        let key = BackendTurnKey(self.next_turn.fetch_add(1, Ordering::Relaxed));
         let (events, event_stream) = self.events.mirrored_channel();
-        let (turn_result, turn_receiver) = oneshot::channel();
-        let (route_result, route_receiver) = oneshot::channel();
-        if self
-            .commands
-            .send(Command::RoutePrompt {
+        #[cfg(feature = "openai")]
+        let turn_id = uuid::Uuid::now_v7().to_string();
+        #[cfg(not(feature = "openai"))]
+        let turn_id = format!("{}:{}", self.session_id, key.0);
+        let events = events.with_turn_id(turn_id.clone());
+        match self
+            .backend
+            .route(BackendPrompt {
                 key,
                 prompt,
-                parent,
+                request_id: None,
+                cancel_on_admission: false,
                 events,
-                turn_result,
-                route_result,
             })
             .await
-            .is_err()
         {
-            return Err(NanocodexError::AgentStopped);
-        }
-        match route_receiver
-            .await
-            .map_err(|_| NanocodexError::AgentStopped)??
-        {
-            PromptRouteKind::Started => Ok(PromptRoute::Started(Turn {
-                control: TurnControl {
-                    key,
-                    commands: self.commands.clone(),
-                },
-                events: event_stream,
-                result: turn_receiver,
-            })),
-            PromptRouteKind::Steered => Ok(PromptRoute::Steered),
+            Ok(BackendPromptRoute::Started(BackendTurn { request_id, result })) => {
+                Ok(PromptRoute::Started(Turn {
+                    turn_id: self.canonical_turn_id(turn_id, request_id.as_deref()),
+                    control: TurnControl {
+                        key,
+                        backend: Arc::clone(&self.backend),
+                    },
+                    request_id,
+                    events: event_stream,
+                    result,
+                }))
+            }
+            Ok(BackendPromptRoute::Steered) => Ok(PromptRoute::Steered),
+            Err(error) => Err(error),
         }
     }
 
@@ -261,11 +399,18 @@ impl Nanocodex {
     ///
     /// Returns an error if the agent driver has stopped.
     pub async fn set_thinking(&self, thinking: Thinking) -> Result<()> {
-        request_command(&self.commands, |result| Command::SetThinking {
-            thinking,
-            result,
-        })
-        .await
+        self.backend.set_thinking(thinking).await
+    }
+
+    /// Changes the model before the first turn is accepted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after conversation activity begins, when the selected
+    /// model is incompatible with the current thinking level, or if the
+    /// backend has stopped.
+    pub async fn set_model(&self, model: Model) -> Result<()> {
+        self.backend.set_model(model).await
     }
 
     /// Enables or disables priority processing for subsequently accepted turns.
@@ -277,11 +422,7 @@ impl Nanocodex {
     ///
     /// Returns an error if the agent driver has stopped.
     pub async fn set_fast_mode(&self, enabled: bool) -> Result<()> {
-        request_command(&self.commands, |result| Command::SetFastMode {
-            enabled,
-            result,
-        })
-        .await
+        self.backend.set_fast_mode(enabled).await
     }
 
     /// Immediately compacts this agent's retained conversation.
@@ -316,9 +457,7 @@ impl Nanocodex {
     /// Returns a model or driver-stopped error. Rollout writes follow the same
     /// retry-on-[`Self::flush_rollout`] contract as prompt turns.
     pub async fn compact(&self) -> Result<()> {
-        let parent = tracing::Span::current();
-        let parent = (!parent.is_disabled()).then_some(parent);
-        request_command(&self.commands, |result| Command::Compact { parent, result }).await
+        self.backend.compact().await
     }
 
     /// Appends adapter-owned developer context at the next safe model boundary.
@@ -341,11 +480,44 @@ impl Nanocodex {
                 "developer message must not be empty".to_owned(),
             ));
         }
-        request_command(&self.commands, |result| Command::AppendDeveloperMessage {
-            text,
-            result,
-        })
-        .await
+        self.backend.append_developer_message(text).await
+    }
+
+    /// Returns complete model-visible context at the latest safe boundary.
+    ///
+    /// This is a read-only adapter view. The history can contain unredacted
+    /// prompts, responses, reasoning, and tool activity and must be protected
+    /// like a session snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after the agent driver has stopped.
+    pub async fn context(&self) -> Result<AgentSessionContext> {
+        self.backend.context().await
+    }
+
+    /// Copies the latest committed model boundary without changing this agent.
+    ///
+    /// The caller owns its unredacted model-visible history. This fails before
+    /// the first safe boundary or after the driver stops, even during a turn.
+    pub async fn snapshot(&self) -> Result<SessionSnapshot> {
+        self.backend.snapshot().await
+    }
+
+    /// Rehydrates a child driver from this runtime's in-memory identity and history.
+    #[doc(hidden)]
+    pub async fn restore_child(
+        &self,
+        snapshot: ChildRuntimeSnapshot,
+        host_context: Option<Arc<str>>,
+    ) -> Result<(Self, AgentEvents)> {
+        self.backend.restore_child(snapshot, host_context).await
+    }
+
+    /// Captures an in-memory idle child boundary without exposing host credentials.
+    #[doc(hidden)]
+    pub async fn child_snapshot(&self) -> Result<ChildRuntimeSnapshot> {
+        self.backend.child_snapshot().await
     }
 
     /// Starts a clean sibling agent with the same private configuration,
@@ -358,7 +530,19 @@ impl Nanocodex {
     ///
     /// Returns an error after this agent's driver has stopped.
     pub async fn spawn(&self) -> Result<(Self, AgentEvents)> {
-        request_spawn(&self.commands).await
+        self.spawn_with(SpawnOptions::new()).await
+    }
+
+    /// Starts a clean sibling with optional model and reasoning overrides.
+    ///
+    /// Unspecified values inherit this agent's settings when its driver handles
+    /// the spawn command. Overrides affect only the new sibling.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after this agent's driver has stopped.
+    pub async fn spawn_with(&self, options: SpawnOptions) -> Result<(Self, AgentEvents)> {
+        self.backend.spawn(options).await
     }
 
     /// Forks from the latest safe model boundary into an independently driven
@@ -373,51 +557,95 @@ impl Nanocodex {
     /// Returns an error before the first prompt reaches a safe boundary, or
     /// when the driver has stopped.
     pub async fn fork(&self) -> Result<(Self, AgentEvents)> {
-        self.request_fork(None).await
+        self.backend.fork(None).await
     }
 
-    /// Forks from an exact historical completed turn while this agent may keep
-    /// advancing on its current branch.
+    /// Forks a separately identified side conversation from the latest safe boundary.
     ///
     /// # Errors
+    /// Returns an error when the backend cannot fork a side conversation.
+    pub async fn fork_side_conversation(&self) -> Result<(Self, AgentEvents)> {
+        self.backend.fork_side_conversation().await
+    }
+
+    /// Forks from an exact historical completed turn.
     ///
-    /// Returns an error when the result belongs to another conversation or the
-    /// driver stopped.
+    /// # Errors
+    /// Returns an error if the checkpoint belongs to another conversation.
     pub async fn fork_from(&self, completed: &TurnResult) -> Result<(Self, AgentEvents)> {
-        if completed.checkpoint.lineage_id() != self.lineage_id.as_ref() {
-            return Err(NanocodexError::CheckpointLineageMismatch);
-        }
-        self.request_fork(Some(Arc::clone(&completed.checkpoint)))
-            .await
-    }
-
-    async fn request_fork(
-        &self,
-        checkpoint: Option<Arc<CommittedSession>>,
-    ) -> Result<(Self, AgentEvents)> {
-        request_fork(&self.commands, checkpoint).await
+        self.backend.fork(Some(completed.clone())).await
     }
 }
 
-async fn request_fork(
+#[cfg(feature = "openai")]
+pub(super) async fn request_fork(
     commands: &mpsc::Sender<Command>,
+    shutdown: &DriverShutdown,
     checkpoint: Option<Arc<CommittedSession>>,
+    side_conversation: bool,
 ) -> Result<(Nanocodex, AgentEvents)> {
-    request_command(commands, |result| Command::Fork { checkpoint, result }).await
+    request_command(commands, shutdown, |result| Command::Fork {
+        side_conversation,
+        checkpoint,
+        result,
+    })
+    .await
 }
 
-async fn request_spawn(commands: &mpsc::Sender<Command>) -> Result<(Nanocodex, AgentEvents)> {
-    request_command(commands, |result| Command::Spawn { result }).await
+#[cfg(feature = "openai")]
+pub(super) async fn request_spawn(
+    commands: &mpsc::Sender<Command>,
+    shutdown: &DriverShutdown,
+    options: SpawnOptions,
+) -> Result<(Nanocodex, AgentEvents)> {
+    request_spawn_with_host_context(commands, shutdown, options, None).await
 }
 
+#[cfg(feature = "openai")]
+async fn request_spawn_with_host_context(
+    commands: &mpsc::Sender<Command>,
+    shutdown: &DriverShutdown,
+    options: SpawnOptions,
+    host_context: Option<Arc<str>>,
+) -> Result<(Nanocodex, AgentEvents)> {
+    request_command(commands, shutdown, |result| Command::Spawn {
+        restore: None,
+        options,
+        host_context,
+        result,
+    })
+    .await
+}
+
+#[cfg(feature = "openai")]
+async fn request_spawn_many(
+    commands: &mpsc::Sender<Command>,
+    shutdown: &DriverShutdown,
+    count: usize,
+    observer: Option<Arc<SpawnObserver>>,
+    host_context: Option<Arc<str>>,
+) -> Result<Vec<(Nanocodex, AgentEvents)>> {
+    request_command(commands, shutdown, |result| Command::SpawnBatch {
+        count,
+        observer,
+        host_context,
+        result,
+    })
+    .await
+}
+
+#[cfg(feature = "openai")]
 pub(super) async fn request_command<T>(
     commands: &mpsc::Sender<Command>,
+    shutdown: &DriverShutdown,
     command: impl FnOnce(oneshot::Sender<Result<T>>) -> Command,
 ) -> Result<T> {
     let (result, receiver) = oneshot::channel();
-    commands
-        .send(command(result))
-        .await
-        .map_err(|_| NanocodexError::AgentStopped)?;
-    receiver.await.map_err(|_| NanocodexError::AgentStopped)?
+    if commands.send(command(result)).await.is_err() {
+        return Err(shutdown.stopped_error().await);
+    }
+    match receiver.await {
+        Ok(Err(NanocodexError::AgentStopped)) | Err(_) => Err(shutdown.stopped_error().await),
+        Ok(outcome) => outcome,
+    }
 }

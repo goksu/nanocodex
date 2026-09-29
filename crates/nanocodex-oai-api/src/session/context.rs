@@ -8,6 +8,8 @@ use crate::{
 use super::compaction;
 
 const TOOL_OUTPUT_TOKEN_LIMIT: usize = 12_000;
+const REQUEST_PREFIX_ID_NAMESPACE: uuid::Uuid =
+    uuid::Uuid::from_u128(0x3e203f80_1cd8_4938_9588_0990bb023db5);
 // Changing this value would change model-visible IDs and invalidate prompt caches.
 const SYNTHETIC_OUTPUT_ID_NAMESPACE: uuid::Uuid =
     uuid::Uuid::from_u128(0x90d38d3e_6a5b_4d52_bfe2_2f1e634bfac4);
@@ -17,7 +19,8 @@ const SYNTHETIC_OUTPUT_ID_NAMESPACE: uuid::Uuid =
 #[derive(Clone)]
 pub struct ContextManager {
     items: ResponseHistory,
-    last_token_usage: Option<Usage>,
+    pub(super) last_token_usage: Option<Usage>,
+    pub(super) token_usage_is_estimate: bool,
     calls: CallIds,
 }
 
@@ -32,12 +35,15 @@ struct CallIds {
     non_server_tool_search_outputs: HashSet<Box<str>>,
 }
 
+use crate::tools::valid_tool_image_data_url;
+
 impl ContextManager {
     #[must_use]
     pub fn new(items: Vec<ResponseItem>) -> Self {
         let mut context = Self {
             items: ResponseHistory::default(),
             last_token_usage: None,
+            token_usage_is_estimate: false,
             calls: CallIds::default(),
         };
         context.record_items(items);
@@ -75,8 +81,32 @@ impl ContextManager {
             .filter(is_api_item)
             .map(truncate_tool_output)
         {
+            if let ResponseItem::CustomToolCallOutput {
+                call_id,
+                name: Some(_),
+                ..
+            } = &item
+                && !self.items.iter().any(|item| {
+                    matches!(
+                        item,
+                        ResponseItem::CustomToolCall {
+                            call_id: candidate,
+                            ..
+                        } if candidate == call_id
+                    )
+                })
+            {
+                continue;
+            }
             assign_missing_response_item_id(&mut item);
             self.calls.track(&item);
+            if self.token_usage_is_estimate
+                && let Some(usage) = &mut self.last_token_usage
+            {
+                usage.total_tokens = usage
+                    .total_tokens
+                    .saturating_add(compaction::estimate_item_tokens(&item));
+            }
             self.items.push(item);
         }
     }
@@ -86,6 +116,98 @@ impl ContextManager {
         if self.calls.is_balanced() {
             self.calls.clear();
         }
+    }
+
+    /// Repairs malformed legacy tool images before restored history is replayed.
+    pub(super) fn replace_invalid_tool_images(&mut self) -> usize {
+        let mut replaced = 0;
+        let mut items = self.flattened_items();
+        for item in &mut items {
+            let (ResponseItem::FunctionCallOutput { output, .. }
+            | ResponseItem::CustomToolCallOutput { output, .. }) = item
+            else {
+                continue;
+            };
+            let FunctionOutputBody::Content(content) = output else {
+                continue;
+            };
+            for part in content {
+                if let FunctionOutputContent::InputImage { image_url, .. } = part
+                    && !valid_tool_image_data_url(image_url)
+                {
+                    *part = FunctionOutputContent::InputText {
+                        text:
+                            "[image omitted: malformed base64 image data in restored tool output]"
+                                .into(),
+                    };
+                    replaced += 1;
+                }
+            }
+        }
+        if replaced > 0 {
+            self.replace_and_recompute(items, &[]);
+        }
+        replaced
+    }
+
+    pub fn replace_rejected_images(&mut self) -> usize {
+        let mut replaced = 0;
+        let mut items = self.flattened_items();
+        for item in &mut items {
+            match item {
+                ResponseItem::Message { content, .. } => {
+                    for content in content {
+                        if matches!(content, ContentItem::InputImage { .. }) {
+                            *content = ContentItem::input_text(
+                                "[image omitted after the provider rejected its data]",
+                            );
+                            replaced += 1;
+                        }
+                    }
+                }
+                ResponseItem::FunctionCallOutput { output, .. }
+                | ResponseItem::CustomToolCallOutput { output, .. } => {
+                    let FunctionOutputBody::Content(content) = output else {
+                        continue;
+                    };
+                    for content in content {
+                        if matches!(content, FunctionOutputContent::InputImage { .. }) {
+                            *content = FunctionOutputContent::InputText {
+                                text: "[image omitted after the provider rejected its data]".into(),
+                            };
+                            replaced += 1;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if replaced > 0 {
+            self.replace_and_recompute(items, &[]);
+        }
+        replaced
+    }
+
+    pub fn remove_tool_definition(&mut self, definition: &serde_json::Value) -> usize {
+        let mut removed = 0;
+        let mut items = self.flattened_items();
+        for item in &mut items {
+            if let ResponseItem::ToolSearchOutput { tools, .. } = item {
+                tools.retain_mut(|tool| {
+                    let mut value = tool.as_value().clone();
+                    let before = removed;
+                    let retain = retain_tool_definition(&mut value, definition, &mut removed);
+                    if retain && removed != before {
+                        *tool = value.into();
+                    }
+                    retain
+                });
+            }
+        }
+        if removed > 0 {
+            self.replace_and_recompute(items, &[]);
+        }
+        removed
     }
 
     pub fn replace_and_recompute(&mut self, mut items: Vec<ResponseItem>, prefix: &[ResponseItem]) {
@@ -100,15 +222,14 @@ impl ContextManager {
             total_tokens,
             ..Usage::default()
         });
-        self.calls.clear();
-        for item in self.items.iter() {
-            self.calls.track(item);
-        }
+        self.token_usage_is_estimate = true;
+        self.calls = CallIds::from_items(self.items.iter());
     }
 
     pub fn update_token_info(&mut self, usage: Option<&Usage>) {
         if let Some(usage) = usage {
             self.last_token_usage = Some(usage.clone());
+            self.token_usage_is_estimate = false;
         }
     }
 
@@ -118,6 +239,11 @@ impl ContextManager {
             .last_token_usage
             .as_ref()
             .map_or(0, |usage| usage.total_tokens);
+        // A recomputed baseline already includes every retained item. Appends
+        // extend that estimate directly until a provider supplies fresh usage.
+        if self.token_usage_is_estimate {
+            return reported;
+        }
         let local_tail = self.items_after_last_model_generated_tokens();
         if server_reasoning_included {
             reported.saturating_add(local_tail)
@@ -141,6 +267,7 @@ impl ContextManager {
             return (self.items.clone(), false);
         }
 
+        let calls = CallIds::from_items(self.items.iter());
         let mut repaired = Vec::with_capacity(self.items.len() + 2);
         for item in &self.items {
             match item {
@@ -151,7 +278,7 @@ impl ContextManager {
                     ..
                 } => {
                     repaired.push(item.clone());
-                    if !self.calls.function_outputs.contains(call_id.as_ref()) {
+                    if !calls.function_outputs.contains(call_id.as_ref()) {
                         let mut output = ResponseItem::function_call_output(
                             call_id.to_string(),
                             FunctionOutputBody::Text("aborted".into()),
@@ -162,7 +289,7 @@ impl ContextManager {
                 }
                 ResponseItem::CustomToolCall { id, call_id, .. } => {
                     repaired.push(item.clone());
-                    if !self.calls.custom_outputs.contains(call_id.as_ref()) {
+                    if !calls.custom_outputs.contains(call_id.as_ref()) {
                         let mut output = ResponseItem::custom_tool_output(
                             call_id.to_string(),
                             None,
@@ -173,16 +300,16 @@ impl ContextManager {
                     }
                 }
                 ResponseItem::FunctionCallOutput { call_id, .. }
-                    if !self.calls.function_calls.contains(call_id.as_ref()) => {}
+                    if !calls.function_calls.contains(call_id.as_ref()) => {}
                 ResponseItem::CustomToolCallOutput { call_id, .. }
-                    if !self.calls.custom_calls.contains(call_id.as_ref()) => {}
+                    if !calls.custom_calls.contains(call_id.as_ref()) => {}
                 ResponseItem::ToolSearchCall {
                     id,
                     call_id: Some(call_id),
                     ..
                 } => {
                     repaired.push(item.clone());
-                    if !self.calls.tool_search_outputs.contains(call_id.as_ref()) {
+                    if !calls.tool_search_outputs.contains(call_id.as_ref()) {
                         repaired.push(ResponseItem::ToolSearchOutput {
                             id: synthetic_output_id("tso", id.as_ref()),
                             call_id: Some(call_id.clone()),
@@ -198,7 +325,7 @@ impl ContextManager {
                     execution,
                     ..
                 } if execution.as_ref() != "server"
-                    && !self.calls.tool_search_calls.contains(call_id.as_ref()) => {}
+                    && !calls.tool_search_calls.contains(call_id.as_ref()) => {}
                 _ => repaired.push(item.clone()),
             }
         }
@@ -206,23 +333,38 @@ impl ContextManager {
     }
 
     pub(crate) fn adopt_prompt_items(&mut self, items: ResponseHistory) {
-        self.items = items;
-        self.calls.clear();
-        for item in self.items.iter() {
-            self.calls.track(item);
+        if self.token_usage_is_estimate
+            && let Some(usage) = &mut self.last_token_usage
+        {
+            let before = self
+                .items
+                .iter()
+                .map(compaction::estimate_item_tokens)
+                .fold(0, u64::saturating_add);
+            let after = items
+                .iter()
+                .map(compaction::estimate_item_tokens)
+                .fold(0, u64::saturating_add);
+            // Retain any request-prefix contribution outside the history.
+            usage.total_tokens = usage
+                .total_tokens
+                .saturating_sub(before)
+                .saturating_add(after);
         }
+        self.items = items;
+        self.calls = CallIds::from_items(self.items.iter());
     }
 
     fn items_after_last_model_generated_tokens(&self) -> u64 {
-        let mut tokens = 0_u64;
+        let mut tokens = None::<u64>;
         for item in &self.items {
             if is_model_generated_item(item) {
-                tokens = 0;
-            } else {
-                tokens = tokens.saturating_add(compaction::estimate_item_tokens(item));
+                tokens = Some(0);
+            } else if let Some(tokens) = &mut tokens {
+                *tokens = tokens.saturating_add(compaction::estimate_item_tokens(item));
             }
         }
-        tokens
+        tokens.unwrap_or_default()
     }
 
     fn non_last_reasoning_tokens(&self) -> u64 {
@@ -247,6 +389,14 @@ impl ContextManager {
 }
 
 impl CallIds {
+    fn from_items<'a>(items: impl IntoIterator<Item = &'a ResponseItem>) -> Self {
+        let mut calls = Self::default();
+        for item in items {
+            calls.track(item);
+        }
+        calls
+    }
+
     fn is_balanced(&self) -> bool {
         self.function_calls == self.function_outputs
             && self.custom_calls == self.custom_outputs
@@ -281,9 +431,15 @@ impl CallIds {
             ResponseItem::CustomToolCall { call_id, .. } => {
                 self.custom_calls.insert(call_id.clone());
             }
-            ResponseItem::CustomToolCallOutput { call_id, .. } => {
+            ResponseItem::CustomToolCallOutput {
+                call_id,
+                name: None,
+                ..
+            } => {
                 self.custom_outputs.insert(call_id.clone());
             }
+            // Named outputs are progress notifications, not terminal tool results.
+            ResponseItem::CustomToolCallOutput { .. } => {}
             ResponseItem::ToolSearchCall {
                 call_id: Some(call_id),
                 ..
@@ -321,6 +477,58 @@ pub fn assign_missing_response_item_id(item: &mut ResponseItem) {
     item.set_id(Some(new_response_item_id(prefix)));
 }
 
+pub fn responses_lite_request_prefix(
+    cache_lineage: &str,
+    tools: Vec<crate::ToolDefinition>,
+    instructions: &str,
+) -> Result<[ResponseItem; 2], serde_json::Error> {
+    let prefix_namespace =
+        uuid::Uuid::new_v5(&REQUEST_PREFIX_ID_NAMESPACE, cache_lineage.as_bytes());
+    let tools_id = crate::ResponseItemId::with_suffix(
+        "at",
+        uuid::Uuid::new_v5(&prefix_namespace, &serde_json::to_vec(&tools)?),
+    );
+    let instructions_id = crate::ResponseItemId::with_suffix(
+        "msg",
+        uuid::Uuid::new_v5(&prefix_namespace, instructions.as_bytes()),
+    );
+    let mut tools_item = ResponseItem::additional_tools(tools);
+    tools_item.set_id(Some(tools_id));
+    let mut instructions_item = ResponseItem::message(
+        crate::MessageRole::Developer,
+        [crate::ContentItem::InputText {
+            text: instructions.into(),
+        }],
+    );
+    instructions_item.set_id(Some(instructions_id));
+    Ok([tools_item, instructions_item])
+}
+
+// Only namespace children are definitions. Never walk arbitrary JSON Schema
+// properties that happen to be named `tools`.
+fn retain_tool_definition(
+    tool: &mut serde_json::Value,
+    rejected: &serde_json::Value,
+    removed: &mut usize,
+) -> bool {
+    if tool == rejected {
+        *removed += 1;
+        return false;
+    }
+    if tool["type"] == "namespace"
+        && let Some(children) = tool
+            .get_mut("tools")
+            .and_then(serde_json::Value::as_array_mut)
+    {
+        let before = *removed;
+        children.retain_mut(|child| retain_tool_definition(child, rejected, removed));
+        if *removed != before && children.is_empty() {
+            return false;
+        }
+    }
+    true
+}
+
 fn new_response_item_id(prefix: &str) -> ResponseItemId {
     ResponseItemId::with_suffix(prefix, uuid::Uuid::now_v7())
 }
@@ -355,8 +563,9 @@ pub fn has_well_formed_tool_calls(items: &[ResponseItem]) -> bool {
                     && function_outputs.insert(call_id.as_ref())
             }
             ResponseItem::CustomToolCall { call_id, .. } => custom_calls.insert(call_id.as_ref()),
-            ResponseItem::CustomToolCallOutput { call_id, .. } => {
-                custom_calls.contains(call_id.as_ref()) && custom_outputs.insert(call_id.as_ref())
+            ResponseItem::CustomToolCallOutput { call_id, name, .. } => {
+                custom_calls.contains(call_id.as_ref())
+                    && (name.is_some() || custom_outputs.insert(call_id.as_ref()))
             }
             ResponseItem::ToolSearchCall {
                 call_id: Some(call_id),
@@ -389,8 +598,7 @@ const fn is_model_generated_item(item: &ResponseItem) -> bool {
         ResponseItem::Message {
             role: MessageRole::Assistant,
             ..
-        } | ResponseItem::AgentMessage { .. }
-            | ResponseItem::Reasoning { .. }
+        } | ResponseItem::Reasoning { .. }
             | ResponseItem::LocalShellCall { .. }
             | ResponseItem::FunctionCall { .. }
             | ResponseItem::ToolSearchCall { .. }
@@ -403,7 +611,69 @@ const fn is_model_generated_item(item: &ResponseItem) -> bool {
 }
 
 fn is_user_turn_boundary(item: &ResponseItem) -> bool {
-    item.is_user_message() && !is_contextual_user_message(item)
+    match item {
+        ResponseItem::AgentMessage { .. } => true,
+        ResponseItem::Message {
+            role: MessageRole::Assistant,
+            content,
+            ..
+        } => is_inter_agent_instruction_content(content),
+        _ => item.is_user_message() && !is_contextual_user_message(item),
+    }
+}
+
+// Older Codex histories encode inter-agent instructions as a single JSON text
+// block in an assistant message. Recognize the envelope, not arbitrary JSON.
+fn is_inter_agent_instruction_content(content: &[ContentItem]) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Instruction {
+        author: String,
+        recipient: String,
+        #[serde(default)]
+        other_recipients: Vec<String>,
+        #[serde(rename = "content")]
+        _content: String,
+        #[serde(rename = "trigger_turn")]
+        _trigger_turn: bool,
+        #[serde(rename = "id")]
+        _id: Option<String>,
+        #[serde(rename = "encrypted_content")]
+        _encrypted_content: Option<String>,
+        #[serde(rename = "internal_chat_message_metadata_passthrough")]
+        _metadata: Option<InstructionMetadata>,
+    }
+    #[derive(serde::Deserialize)]
+    struct InstructionMetadata {
+        #[serde(rename = "turn_id")]
+        _turn_id: Option<String>,
+        #[serde(rename = "create_time")]
+        _create_time: Option<serde_json::Number>,
+    }
+    fn valid_agent_path(path: &str) -> bool {
+        if matches!(path, "/root" | "/morpheus") {
+            return true;
+        }
+        path.strip_prefix("/root/").is_some_and(|suffix| {
+            suffix.split('/').all(|segment| {
+                !segment.is_empty()
+                    && segment != "root"
+                    && segment
+                        .chars()
+                        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+            })
+        })
+    }
+    let [ContentItem::InputText { text } | ContentItem::OutputText { text, .. }] = content else {
+        return false;
+    };
+    serde_json::from_str::<Instruction>(text).is_ok_and(|instruction| {
+        valid_agent_path(&instruction.author)
+            && valid_agent_path(&instruction.recipient)
+            && instruction
+                .other_recipients
+                .iter()
+                .all(|path| valid_agent_path(path))
+    })
 }
 
 #[must_use]
@@ -525,10 +795,116 @@ mod tests {
     use super::*;
 
     #[test]
-    fn complete_prompt_reuses_the_history_without_repair() {
-        let context = ContextManager::new(vec![message("hello")]);
-        let prompt = context.prompt_items();
-        assert_eq!(prompt.len(), 1);
+    fn recomputed_history_does_not_double_count_the_existing_local_tail() {
+        let history: Vec<ResponseItem> = serde_json::from_value(serde_json::json!([
+            {"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"x".repeat(28)}]},
+            {"type":"message", "role":"user", "content":[{"type":"input_text", "text":"x".repeat(600000)}]}
+        ])).unwrap();
+        let mut context = ContextManager::new(Vec::new());
+        context.replace_and_recompute(history, &[]);
+        assert_eq!(context.active_context_tokens(false), 150007);
+        assert_eq!(context.active_context_tokens(true), 150007);
+        context.record_items([message("more")]);
+        assert_eq!(context.active_context_tokens(false), 150008);
+    }
+
+    #[test]
+    fn recomputed_context_counts_existing_items_once_and_tracks_new_items() {
+        let history: Vec<ResponseItem> = serde_json::from_value(serde_json::json!([
+            {"type":"reasoning", "summary":[], "encrypted_content":"x".repeat(1200)},
+            {"type":"message", "role":"user", "content":[
+                {"type":"input_text", "text":"x".repeat(600000)}]}
+        ]))
+        .unwrap();
+        let mut context = ContextManager::new(Vec::new());
+        context.replace_and_recompute(history, &[]);
+        // 250 reasoning bytes / 4 rounded up, plus 150000 user text tokens.
+        for includes_reasoning in [false, true] {
+            assert_eq!(context.active_context_tokens(includes_reasoning), 150063);
+        }
+        context.record_items([message("more")]);
+        assert_eq!(context.active_context_tokens(false), 150064);
+        context.update_token_info(Some(&Usage {
+            total_tokens: 100,
+            ..Usage::default()
+        }));
+        assert_eq!(context.active_context_tokens(true), 150101);
+    }
+
+    #[test]
+    fn usage_counts_incoming_agent_instructions_and_preceding_local_tail() {
+        let reasoning: ResponseItem = serde_json::from_value(serde_json::json!({
+            "type": "reasoning", "summary": [], "encrypted_content": "x".repeat(1200)
+        }))
+        .unwrap();
+        let agent: ResponseItem = serde_json::from_value(serde_json::json!({
+            "type": "agent_message", "author": "/root/peer", "recipient": "/root",
+            "content": [{"type": "input_text", "text": "Continue with the new task"}]
+        }))
+        .unwrap();
+        let local = ResponseItem::message(
+            MessageRole::Developer,
+            [ContentItem::InputText {
+                text: "additional local context".into(),
+            }],
+        );
+        let expected_tail =
+            compaction::estimate_item_tokens(&local) + compaction::estimate_item_tokens(&agent);
+        let prior_reasoning = compaction::estimate_item_tokens(&reasoning);
+        assert!(prior_reasoning > 0);
+        let mut context = ContextManager::new(vec![reasoning, local, agent]);
+        context.update_token_info(Some(&Usage {
+            total_tokens: 100,
+            ..Usage::default()
+        }));
+        assert_eq!(context.active_context_tokens(true), 100 + expected_tail);
+        assert_eq!(
+            context.active_context_tokens(false),
+            100 + expected_tail + prior_reasoning
+        );
+    }
+
+    #[test]
+    fn usage_without_model_items_does_not_add_the_entire_history_again() {
+        let mut context = ContextManager::new(vec![message("initial input")]);
+        assert_eq!(context.active_context_tokens(true), 0);
+        context.replace_and_recompute(vec![message("restored input")], &[]);
+        let estimated = context.last_token_usage.as_ref().unwrap().total_tokens;
+        assert!(estimated > 0);
+        assert_eq!(context.active_context_tokens(true), estimated);
+        assert_eq!(context.active_context_tokens(false), estimated);
+    }
+
+    #[test]
+    fn usage_legacy_agent_instruction_starts_a_reasoning_boundary() {
+        let reasoning: ResponseItem = serde_json::from_value(serde_json::json!({
+            "type": "reasoning", "summary": [], "encrypted_content": "x".repeat(1200)
+        }))
+        .unwrap();
+        let prior_reasoning = compaction::estimate_item_tokens(&reasoning);
+        let envelope = serde_json::json!({
+            "author": "/root/peer", "recipient": "/root", "content": "new task",
+            "trigger_turn": true
+        });
+        let instruction = ResponseItem::message(
+            MessageRole::Assistant,
+            [ContentItem::InputText {
+                text: envelope.to_string().into(),
+            }],
+        );
+        let mut context = ContextManager::new(vec![reasoning, instruction]);
+        context.update_token_info(Some(&Usage {
+            total_tokens: 100,
+            ..Usage::default()
+        }));
+        assert_eq!(context.active_context_tokens(false), 100 + prior_reasoning);
+        assert_eq!(context.active_context_tokens(true), 100);
+        for text in ["ordinary assistant output".to_owned(), "{}".to_owned(),
+            serde_json::json!({"author":"relative", "recipient":"/root", "content":"x", "trigger_turn":true}).to_string()] {
+            let item = ResponseItem::message(MessageRole::Assistant,
+                [ContentItem::InputText { text: text.into() }]);
+            assert!(!is_user_turn_boundary(&item));
+        }
     }
 
     #[test]
@@ -577,6 +953,104 @@ mod tests {
                 && call_id.as_ref() == "missing"
                 && text.as_ref() == "aborted"
         ));
+    }
+
+    #[test]
+    fn notification_for_committed_custom_call_keeps_history_balanced() {
+        let mut context = committed_custom_call_context("running");
+
+        context.record_items([ResponseItem::custom_tool_output(
+            "exec".to_owned(),
+            Some("exec".to_owned()),
+            FunctionOutputBody::Text("progress".into()),
+        )]);
+
+        let (prompt, repaired) = context.prompt_items_with_repair();
+        assert!(!repaired);
+        assert_eq!(prompt.len(), 3);
+        assert!(has_well_formed_tool_calls(
+            &prompt.iter().cloned().collect::<Vec<_>>()
+        ));
+
+        let pending: ResponseItem = serde_json::from_str(
+            r#"{"type":"custom_tool_call","id":"ctc_pending","call_id":"pending","name":"exec","input":"code"}"#,
+        )
+        .unwrap();
+        context.record_items([pending]);
+
+        let (prompt, repaired) = context.prompt_items_with_repair();
+        let prompt = prompt.iter().cloned().collect::<Vec<_>>();
+        assert!(repaired);
+        assert!(has_well_formed_tool_calls(&prompt));
+        assert!(prompt.iter().any(|item| matches!(
+            item,
+            ResponseItem::CustomToolCallOutput {
+                call_id,
+                name: None,
+                output: FunctionOutputBody::Text(text),
+                ..
+            } if call_id.as_ref() == "exec" && text.as_ref() == "running"
+        )));
+        assert!(prompt.iter().any(|item| matches!(
+            item,
+            ResponseItem::CustomToolCallOutput {
+                call_id,
+                name: Some(name),
+                output: FunctionOutputBody::Text(text),
+                ..
+            } if call_id.as_ref() == "exec"
+                && name.as_ref() == "exec"
+                && text.as_ref() == "progress"
+        )));
+    }
+
+    #[test]
+    fn notification_for_custom_call_removed_by_compaction_is_not_replayed() {
+        let mut context = committed_custom_call_context("yielded");
+
+        context.replace_and_recompute(vec![message("compacted history")], &[]);
+        context.record_items([ResponseItem::custom_tool_output(
+            "exec".to_owned(),
+            Some("exec".to_owned()),
+            FunctionOutputBody::Text("resumed".into()),
+        )]);
+
+        assert_eq!(context.len(), 1);
+        let prompt = context.prompt_items();
+        let prompt = prompt.iter().cloned().collect::<Vec<_>>();
+        assert_eq!(prompt.len(), 1);
+        assert!(has_well_formed_tool_calls(&prompt));
+    }
+
+    #[test]
+    fn notification_for_custom_call_retained_by_compaction_is_replayed() {
+        let mut context = committed_custom_call_context("yielded");
+
+        let mut retained = context.flattened_items();
+        retained.push(message("compacted history"));
+        context.replace_and_recompute(retained, &[]);
+        context.record_items([ResponseItem::custom_tool_output(
+            "exec".to_owned(),
+            Some("exec".to_owned()),
+            FunctionOutputBody::Text("deferred subagent completed".into()),
+        )]);
+
+        assert_eq!(context.len(), 4);
+        let prompt = context.prompt_items();
+        let prompt = prompt.iter().cloned().collect::<Vec<_>>();
+        assert_eq!(prompt.len(), 4);
+        assert!(has_well_formed_tool_calls(&prompt));
+        assert!(prompt.iter().any(|item| matches!(
+            item,
+            ResponseItem::CustomToolCallOutput {
+                call_id,
+                name: Some(name),
+                output: FunctionOutputBody::Text(text),
+                ..
+            } if call_id.as_ref() == "exec"
+                && name.as_ref() == "exec"
+                && text.as_ref() == "deferred subagent completed"
+        )));
     }
 
     #[test]
@@ -680,6 +1154,8 @@ mod tests {
 
     #[test]
     fn history_truncates_tool_text_but_preserves_images() {
+        // Image payloads can exceed the entire text budget and must remain intact.
+        let image_url = format!("data:image/png;base64,{}", "YWJj".repeat(24_000));
         let context = ContextManager::new(vec![ResponseItem::custom_tool_output(
             "call".to_owned(),
             None,
@@ -688,7 +1164,7 @@ mod tests {
                     text: "x".repeat(48_004).into_boxed_str(),
                 },
                 FunctionOutputContent::InputImage {
-                    image_url: "data:image/png;base64,a".into(),
+                    image_url: image_url.clone().into_boxed_str(),
                     detail: None,
                 },
                 FunctionOutputContent::InputText {
@@ -709,11 +1185,86 @@ mod tests {
         );
         assert!(matches!(
             &output[1],
-            FunctionOutputContent::InputImage { .. }
+            FunctionOutputContent::InputImage { image_url: retained, .. }
+                if retained.as_ref() == image_url
         ));
         assert!(
             matches!(&output[2], FunctionOutputContent::InputText { text } if text.as_ref() == "[omitted 1 text items ...]")
         );
+    }
+
+    #[test]
+    fn malformed_restored_tool_images_are_replaced_without_removing_valid_images() {
+        let mut context = ContextManager::new(vec![ResponseItem::custom_tool_output(
+            "call".to_owned(),
+            None,
+            FunctionOutputBody::Content(vec![
+                FunctionOutputContent::InputText {
+                    text: "retained text".into(),
+                },
+                FunctionOutputContent::InputImage {
+                    image_url: "data:image/png;base64,AAAA\n[output truncated]".into(),
+                    detail: None,
+                },
+                FunctionOutputContent::InputImage {
+                    image_url: "data:image/png;base64,YQ==".into(),
+                    detail: None,
+                },
+            ]),
+        )]);
+        assert_eq!(context.replace_invalid_tool_images(), 1);
+        let encoded = serde_json::to_string(&context.flattened_items()).unwrap();
+        assert!(encoded.contains("retained text"));
+        assert!(encoded.contains("base64,YQ=="));
+        assert!(encoded.contains("malformed base64 image data"));
+        assert!(!encoded.contains("output truncated"));
+        assert_eq!(context.replace_invalid_tool_images(), 0);
+    }
+
+    #[test]
+    fn restored_tool_image_envelopes_require_image_mime_and_valid_base64() {
+        for valid in [
+            "data:image/png;base64,YQ==",
+            "DATA:IMAGE/PNG;BASE64,YWI=",
+            "data:image/svg+xml;base64,YWJj",
+        ] {
+            assert!(super::valid_tool_image_data_url(valid), "{valid}");
+        }
+        for invalid in [
+            "data:image/png;base64,",
+            "data:image/png;base64,a",
+            "data:image/png;base64,AA=A",
+            "data:image/png;base64,!!!!",
+            "data:image/png;base64\n,AAAA",
+            "data:application/octet-stream;base64,AAAA",
+            "https://example.test/image.png",
+        ] {
+            assert!(!super::valid_tool_image_data_url(invalid), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn rejected_images_are_replaced_before_full_history_replay() {
+        let mut context = ContextManager::new(vec![
+            ResponseItem::message(
+                MessageRole::User,
+                [ContentItem::input_image("data:image/png;base64,bad")],
+            ),
+            ResponseItem::custom_tool_output(
+                "call".to_owned(),
+                None,
+                FunctionOutputBody::Content(vec![FunctionOutputContent::InputImage {
+                    image_url: "data:image/gif;base64,bad".into(),
+                    detail: None,
+                }]),
+            ),
+        ]);
+
+        assert_eq!(context.replace_rejected_images(), 2);
+        let encoded = serde_json::to_string(&context.flattened_items()).unwrap();
+        assert!(!encoded.contains("input_image"));
+        assert!(!encoded.contains("base64,bad"));
+        assert!(encoded.contains("provider rejected its data"));
     }
 
     #[test]
@@ -730,11 +1281,73 @@ mod tests {
         assert!(!is_canonical_context_item(&aborted));
     }
 
+    #[test]
+    fn responses_lite_prefix_ids_track_lineage_and_visible_payload() {
+        let original =
+            responses_lite_request_prefix("lineage-a", Vec::new(), "instructions").unwrap();
+        let same = responses_lite_request_prefix("lineage-a", Vec::new(), "instructions").unwrap();
+        assert_eq!(
+            original[0].id().map(ResponseItemId::as_str),
+            Some("at_3b16b3c0-4197-5a27-8244-86e6d9dce5cb")
+        );
+        assert_eq!(
+            original[1].id().map(ResponseItemId::as_str),
+            Some("msg_79409b05-5ae7-5578-9bab-8612d6b14ef0")
+        );
+        assert_eq!(original[0].id(), same[0].id(), "tool ID must be stable");
+        assert_eq!(
+            original[1].id(),
+            same[1].id(),
+            "instruction ID must be stable"
+        );
+
+        let changed_tools = responses_lite_request_prefix(
+            "lineage-a",
+            vec![crate::ToolDefinition::function(
+                "lookup",
+                "look up a value",
+                serde_json::json!({"type": "object"}),
+            )],
+            "instructions",
+        )
+        .unwrap();
+        assert_ne!(original[0].id(), changed_tools[0].id());
+        assert_eq!(original[1].id(), changed_tools[1].id());
+
+        let changed_instructions =
+            responses_lite_request_prefix("lineage-a", Vec::new(), "changed").unwrap();
+        assert_eq!(original[0].id(), changed_instructions[0].id());
+        assert_ne!(original[1].id(), changed_instructions[1].id());
+
+        let changed_lineage =
+            responses_lite_request_prefix("lineage-b", Vec::new(), "instructions").unwrap();
+        assert_ne!(original[0].id(), changed_lineage[0].id());
+        assert_ne!(original[1].id(), changed_lineage[1].id());
+
+        assert!(original[0].id().is_some_and(|id| id.starts_with("at_")));
+        assert!(original[1].id().is_some_and(|id| id.starts_with("msg_")));
+    }
+
     fn message(text: &str) -> ResponseItem {
         ResponseItem::message(
             MessageRole::User,
             [ContentItem::InputText { text: text.into() }],
         )
+    }
+
+    fn committed_custom_call_context(output: &str) -> ContextManager {
+        let call: ResponseItem = serde_json::from_str(
+            r#"{"type":"custom_tool_call","id":"ctc_source","call_id":"exec","name":"exec","input":"code"}"#,
+        )
+        .unwrap();
+        let output = ResponseItem::custom_tool_output(
+            "exec".to_owned(),
+            None,
+            FunctionOutputBody::Text(output.into()),
+        );
+        let mut context = ContextManager::new(vec![call, output]);
+        context.commit_tail();
+        context
     }
 
     fn tool_search_call(call_id: &str, execution: &str) -> ResponseItem {

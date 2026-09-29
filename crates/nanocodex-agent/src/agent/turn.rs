@@ -1,4 +1,6 @@
+use super::backend::{BackendFuture, BackendTurnKey, LifecycleBackend};
 use super::*;
+use nanocodex_oai_api::PromptValidationError;
 
 /// Completion handle for an accepted turn.
 ///
@@ -10,9 +12,11 @@ use super::*;
 /// before dropping it when the work should stop.
 #[must_use = "a turn continues running when dropped; await result(), control it, or explicitly drop it"]
 pub struct Turn {
+    pub(super) turn_id: String,
     pub(super) control: TurnControl,
+    pub(super) request_id: Option<String>,
     pub(super) events: AgentEvents,
-    pub(super) result: oneshot::Receiver<Result<TurnResult>>,
+    pub(super) result: BackendFuture<Result<TurnResult>>,
 }
 
 /// Outcome of routing live user input into an agent session.
@@ -29,6 +33,23 @@ pub enum PromptRoute {
 }
 
 impl Turn {
+    /// Canonical turn identity shared by live events and saved native history.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.turn_id
+    }
+
+    /// Returns the durable request identity selected during prompt admission.
+    ///
+    /// A caller-supplied [`PromptRequest::request_id`] is returned unchanged.
+    /// When an execution policy generated the identity, this returns the
+    /// generated or recovered journal operation ID. Agents without an attached
+    /// execution policy do not assign request identities.
+    #[must_use]
+    pub fn request_id(&self) -> Option<&str> {
+        self.request_id.as_deref()
+    }
+
     /// Returns a cheap cloneable capability targeting this exact turn.
     #[must_use]
     pub fn control(&self) -> TurnControl {
@@ -43,6 +64,22 @@ impl Turn {
     /// longer active, when its steering queue is full, or if the driver stops.
     pub async fn steer(&self, prompt: impl Into<Prompt>) -> Result<()> {
         self.control.steer(prompt).await
+    }
+
+    /// Admits a steer with an identity for later withdrawal.
+    ///
+    /// # Errors
+    /// See [`TurnControl::steer_with_id`].
+    pub async fn steer_with_id(&self, id: String, prompt: impl Into<Prompt>) -> Result<()> {
+        self.control.steer_with_id(id, prompt).await
+    }
+
+    /// Withdraws the latest steer before the next model boundary.
+    ///
+    /// # Errors
+    /// See [`TurnControl::withdraw_steer`].
+    pub async fn withdraw_steer(&self, id: String) -> Result<bool> {
+        self.control.withdraw_steer(id).await
     }
 
     /// Cancels this exact unfinished turn.
@@ -87,17 +124,15 @@ impl Future for Turn {
     type Output = Result<TurnResult>;
 
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.result)
-            .poll(context)
-            .map(|result| result.map_err(|_| NanocodexError::TurnStopped)?)
+        self.result.as_mut().poll(context)
     }
 }
 
 /// Cheap cloneable control capability for one accepted turn.
 #[derive(Clone)]
 pub struct TurnControl {
-    pub(super) key: TurnKey,
-    pub(super) commands: mpsc::Sender<Command>,
+    pub(super) key: BackendTurnKey,
+    pub(super) backend: Arc<dyn LifecycleBackend>,
 }
 
 impl TurnControl {
@@ -109,17 +144,34 @@ impl TurnControl {
     /// its steering queue is full, or if the driver stops.
     pub async fn steer(&self, prompt: impl Into<Prompt>) -> Result<()> {
         let prompt = prompt.into();
-        if prompt.instruction.is_empty() {
+        prompt.validate().map_err(steer_validation_error)?;
+        self.backend.steer(self.key, prompt).await
+    }
+
+    /// Admits input with a caller-owned identity unique within this turn.
+    /// Receipt-capable execution policies replay the same identity and input
+    /// without adding a second instruction, including after recovery.
+    ///
+    /// # Errors
+    /// Returns admission errors or an error if identified steering is unsupported.
+    pub async fn steer_with_id(&self, id: String, prompt: impl Into<Prompt>) -> Result<()> {
+        if id.is_empty() {
             return Err(NanocodexError::InvalidRequest(
-                "steer instruction must not be empty".to_owned(),
+                "steer identity must not be empty".into(),
             ));
         }
-        request_command(&self.commands, |result| Command::Steer {
-            key: self.key,
-            prompt,
-            result,
-        })
-        .await
+        let prompt = prompt.into();
+        prompt.validate().map_err(steer_validation_error)?;
+        self.backend.steer_with_id(self.key, id, prompt).await
+    }
+
+    /// Withdraws the latest accepted steer before its model boundary.
+    /// Returns false if the identity is no longer latest or was already consumed.
+    ///
+    /// # Errors
+    /// Returns an error if persistence fails, the driver stops, or withdrawal is unsupported.
+    pub async fn withdraw_steer(&self, id: String) -> Result<bool> {
+        self.backend.withdraw_steer(self.key, id).await
     }
 
     /// Cancels the targeted unfinished turn.
@@ -129,27 +181,48 @@ impl TurnControl {
     /// Returns an error when the turn has already finished or if the driver
     /// stops.
     pub async fn cancel(&self) -> Result<()> {
-        request_command(&self.commands, |result| Command::Cancel {
-            key: self.key,
-            result,
-        })
-        .await
+        self.backend.cancel(self.key).await
     }
 }
 
+fn steer_validation_error(error: PromptValidationError) -> NanocodexError {
+    let message = match error {
+        PromptValidationError::EmptyInstruction => "steer instruction must not be empty".to_owned(),
+        error => error.to_string(),
+    };
+    NanocodexError::InvalidRequest(message)
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
+#[cfg(feature = "openai")]
 pub(super) struct TurnKey(pub(super) u64);
 
 /// Final result of a completed turn.
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct TurnResult {
+    pub(super) request_id: Option<String>,
     pub(super) final_message: String,
-    pub(super) usage: TurnUsage,
-    pub(super) checkpoint: Arc<CommittedSession>,
+    pub(super) usage: Option<TurnUsage>,
+    #[cfg(feature = "openai")]
+    pub(super) checkpoint: TurnCheckpoint,
+}
+
+#[derive(Clone)]
+#[cfg(feature = "openai")]
+pub(super) enum TurnCheckpoint {
+    Live(Arc<CommittedSession>),
+    Replayed(SessionSnapshot),
+    Unavailable,
 }
 
 impl TurnResult {
+    /// Returns the durable request identity selected during prompt admission.
+    #[must_use]
+    pub fn request_id(&self) -> Option<&str> {
+        self.request_id.as_deref()
+    }
+
     /// Returns the final assistant message for this completed turn.
     #[must_use]
     pub fn final_message(&self) -> &str {
@@ -162,20 +235,46 @@ impl TurnResult {
         self.final_message
     }
 
-    /// Returns exact aggregate token usage for this logical agent turn.
+    /// Returns exact aggregate token usage when reported by the backend.
     #[must_use]
-    pub const fn usage(&self) -> &TurnUsage {
-        &self.usage
+    pub const fn usage(&self) -> Option<&TurnUsage> {
+        self.usage.as_ref()
     }
 
-    /// Copies this completed boundary into a serializable, caller-owned session snapshot.
+    /// Returns a serializable, caller-owned session snapshot when retained by the backend.
     ///
     /// The snapshot contains the complete unredacted model-visible conversation,
     /// including reasoning payloads and tool inputs and outputs. Applications are
     /// responsible for protecting and retaining serialized snapshots appropriately.
     #[must_use]
-    pub fn snapshot(&self) -> SessionSnapshot {
-        self.checkpoint.snapshot()
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn snapshot(&self) -> Option<SessionSnapshot> {
+        #[cfg(feature = "openai")]
+        match &self.checkpoint {
+            TurnCheckpoint::Live(checkpoint) => Some(checkpoint.snapshot()),
+            TurnCheckpoint::Replayed(snapshot) => Some(snapshot.clone()),
+            TurnCheckpoint::Unavailable => None,
+        }
+        #[cfg(not(feature = "openai"))]
+        None
+    }
+
+    /// Constructs a completed result for a backend without a transferable
+    /// local session checkpoint.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn from_backend(
+        request_id: Option<String>,
+        final_message: String,
+        usage: Option<TurnUsage>,
+    ) -> Self {
+        Self {
+            request_id,
+            final_message,
+            usage,
+            #[cfg(feature = "openai")]
+            checkpoint: TurnCheckpoint::Unavailable,
+        }
     }
 }
 
@@ -188,10 +287,172 @@ impl fmt::Debug for TurnResult {
     }
 }
 
+/// One prompt submission with an optional execution identity.
+///
+/// When an execution policy is attached, the agent automatically assigns an
+/// operation ID to requests that omit one. Attach a caller-owned ID when an
+/// external job, webhook, or host retry resubmits the same logical operation.
+#[derive(Clone, Debug)]
+pub struct PromptRequest {
+    pub(super) prompt: Prompt,
+    pub(super) request_id: Option<String>,
+    pub(super) cancel_on_admission: bool,
+}
+
+impl PromptRequest {
+    /// Creates a prompt submission without a caller-owned operation identity.
+    ///
+    /// A policy-enabled agent assigns a unique operation ID before accepting
+    /// this request.
+    #[must_use]
+    pub fn new(prompt: impl Into<Prompt>) -> Self {
+        Self {
+            prompt: prompt.into(),
+            request_id: None,
+            cancel_on_admission: false,
+        }
+    }
+
+    /// Supplies a stable caller-owned request identity.
+    ///
+    /// When omitted, an execution policy generates an identity before the
+    /// prompt is accepted. Resubmitting the same request ID with the same
+    /// prompt resumes or replays that durable operation; reusing it for a
+    /// different prompt is rejected as a conflict.
+    #[must_use]
+    pub fn request_id(mut self, request_id: impl Into<String>) -> Self {
+        self.request_id = Some(request_id.into());
+        self
+    }
+
+    /// Cancels this prompt at its durable admission boundary before model or
+    /// tool work can start.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn cancel_on_admission(mut self) -> Self {
+        self.cancel_on_admission = true;
+        self
+    }
+}
+
+impl From<Prompt> for PromptRequest {
+    fn from(prompt: Prompt) -> Self {
+        Self::new(prompt)
+    }
+}
+
+impl From<String> for PromptRequest {
+    fn from(prompt: String) -> Self {
+        Self::new(prompt)
+    }
+}
+
+impl From<&str> for PromptRequest {
+    fn from(prompt: &str) -> Self {
+        Self::new(prompt)
+    }
+}
+
+/// Optional model policy for a newly spawned clean agent.
+///
+/// Omitted values inherit the invoking agent's settings at the model boundary
+/// where the spawn command is handled.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SpawnOptions {
+    pub(super) model: Option<Model>,
+    pub(super) thinking: Option<Thinking>,
+    pub(super) stateless_http: bool,
+}
+
+impl SpawnOptions {
+    /// Starts an inherited spawn configuration.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            model: None,
+            thinking: None,
+            stateless_http: false,
+        }
+    }
+
+    /// Overrides the model for the new agent without changing its parent.
+    #[must_use]
+    pub const fn model(mut self, model: Model) -> Self {
+        self.model = Some(model);
+        self
+    }
+
+    /// Overrides the reasoning effort for the new agent without changing its parent.
+    #[must_use]
+    pub const fn thinking(mut self, thinking: Thinking) -> Self {
+        self.thinking = Some(thinking);
+        self
+    }
+    /// Uses full-history HTTP for this child without changing its parent transport.
+    /// Intended for host-owned routes to providers without Responses WebSockets.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn stateless_http(mut self) -> Self {
+        self.stateless_http = true;
+        self
+    }
+
+    /// Returns the requested model override, when supplied.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn selected_model(&self) -> Option<Model> {
+        self.model
+    }
+
+    /// Returns the requested reasoning-effort override, when supplied.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn selected_thinking(&self) -> Option<Thinking> {
+        self.thinking
+    }
+}
+
+/// In-memory idle child state, rehydrated within the same parent runtime.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ChildRuntimeSnapshot {
+    /// Stable child session identity.
+    pub session_id: String,
+    /// Pinned model.
+    pub model: Model,
+    /// Pinned reasoning effort.
+    pub thinking: Thinking,
+    /// Fast-mode policy.
+    pub fast_mode: bool,
+    /// Whether this child uses full-history HTTP independently of its parent.
+    #[serde(default)]
+    pub stateless_http: bool,
+    /// Last safe conversation boundary; absent before the first model turn.
+    pub conversation: Option<SessionSnapshot>,
+}
+
+#[cfg(feature = "openai")]
+impl ChildRuntimeSnapshot {
+    /// Validates stored identity, model policy, and the versioned conversation.
+    pub fn validate(&self) -> Result<()> {
+        self.session_id.parse::<SessionId>().map_err(|error| {
+            NanocodexError::InvalidSessionSnapshot(format!("invalid child session ID: {error}"))
+        })?;
+        super::spawn::validate_model_thinking(self.model, self.thinking)?;
+        if let Some(conversation) = &self.conversation {
+            conversation.clone().into_resume()?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "openai")]
 pub(super) enum Command {
     Prompt {
         key: TurnKey,
         prompt: Prompt,
+        execution_operation: Option<ExecutionOperation>,
+        accepted: Option<oneshot::Sender<Result<String>>>,
+        cancel_on_admission: bool,
         thinking: Option<Thinking>,
         fast_mode: Option<bool>,
         parent: Option<tracing::Span>,
@@ -202,6 +463,17 @@ pub(super) enum Command {
         key: TurnKey,
         prompt: Prompt,
         result: oneshot::Sender<Result<()>>,
+    },
+    SteerWithId {
+        key: TurnKey,
+        id: String,
+        prompt: Prompt,
+        result: oneshot::Sender<Result<()>>,
+    },
+    WithdrawSteer {
+        key: TurnKey,
+        id: String,
+        result: oneshot::Sender<Result<bool>>,
     },
     RoutePrompt {
         key: TurnKey,
@@ -216,11 +488,32 @@ pub(super) enum Command {
         result: oneshot::Sender<Result<()>>,
     },
     Fork {
+        side_conversation: bool,
         checkpoint: Option<Arc<CommittedSession>>,
         result: oneshot::Sender<Result<(Nanocodex, AgentEvents)>>,
     },
+    /// Captures the latest committed, resumable model boundary without mutating the driver.
+    Snapshot {
+        result: oneshot::Sender<Result<SessionSnapshot>>,
+    },
+    ChildSnapshot {
+        result: oneshot::Sender<Result<ChildRuntimeSnapshot>>,
+    },
     Spawn {
+        restore: Option<ChildRuntimeSnapshot>,
+        options: SpawnOptions,
+        host_context: Option<Arc<str>>,
         result: oneshot::Sender<Result<(Nanocodex, AgentEvents)>>,
+    },
+    SpawnBatch {
+        count: usize,
+        observer: Option<Arc<SpawnObserver>>,
+        host_context: Option<Arc<str>>,
+        result: oneshot::Sender<Result<Vec<(Nanocodex, AgentEvents)>>>,
+    },
+    SetModel {
+        model: Model,
+        result: oneshot::Sender<Result<()>>,
     },
     SetThinking {
         thinking: Thinking,
@@ -238,19 +531,58 @@ pub(super) enum Command {
         text: String,
         result: oneshot::Sender<Result<AgentSessionContext>>,
     },
+    Context {
+        result: oneshot::Sender<Result<AgentSessionContext>>,
+    },
     Shutdown,
 }
 
-#[derive(Clone, Copy)]
+#[cfg(feature = "openai")]
+#[derive(Clone)]
+pub(super) enum ExecutionOperation {
+    Caller(String),
+    Automatic(String),
+    Admitted(String),
+    Recovered(String),
+}
+
+#[cfg(feature = "openai")]
+impl ExecutionOperation {
+    pub(super) fn into_id(self) -> String {
+        match self {
+            Self::Caller(operation_id)
+            | Self::Automatic(operation_id)
+            | Self::Admitted(operation_id)
+            | Self::Recovered(operation_id) => operation_id,
+        }
+    }
+
+    pub(super) fn id(&self) -> &str {
+        match self {
+            Self::Caller(operation_id)
+            | Self::Automatic(operation_id)
+            | Self::Admitted(operation_id)
+            | Self::Recovered(operation_id) => operation_id,
+        }
+    }
+
+    pub(super) const fn is_recovered(&self) -> bool {
+        matches!(self, Self::Recovered(_))
+    }
+}
+
+#[cfg(feature = "openai")]
 pub(super) enum PromptRouteKind {
-    Started,
+    Started { request_id: Option<String> },
     Steered,
 }
 
+#[cfg(feature = "openai")]
 pub(super) enum QueuedTurn {
     Pending {
         key: TurnKey,
         prompt: Prompt,
+        execution_operation: Option<ExecutionOperation>,
         thinking: Thinking,
         fast_mode: bool,
         parent: Option<tracing::Span>,
@@ -258,7 +590,10 @@ pub(super) enum QueuedTurn {
         result: oneshot::Sender<Result<TurnResult>>,
     },
     Cancelled {
+        key: TurnKey,
         prompt: Prompt,
+        execution_operation: Option<ExecutionOperation>,
+        cancellation_committed: bool,
         thinking: Thinking,
         fast_mode: bool,
         parent: Option<tracing::Span>,

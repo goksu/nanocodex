@@ -21,11 +21,6 @@ pub(crate) use crate::transport::wire::{decode_event, parse_raw_json};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
-const EVENT_IDLE_TIMEOUT: Duration = if cfg!(test) {
-    Duration::from_millis(100)
-} else {
-    Duration::from_mins(5)
-};
 const SOCKET_MESSAGE_CAPACITY: usize = 32;
 const RESPONSES_WEBSOCKETS_BETA: &str = "responses_websockets=2026-02-06";
 const RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
@@ -80,6 +75,7 @@ impl ResponsesSocket {
         endpoint: &str,
         auth: &OpenAiAuthSnapshot,
         session_id: &str,
+        thread_id: &str,
         turn_state: Option<&str>,
     ) -> Result<(Self, ConnectionMetadata), ResponsesError> {
         let mut request =
@@ -119,10 +115,18 @@ impl ResponsesSocket {
         request
             .headers_mut()
             .insert(RESPONSES_LITE_HEADER, HeaderValue::from_static("true"));
-        for name in ["session-id", "thread-id", "x-client-request-id"] {
+        request.headers_mut().insert(
+            "session-id",
+            HeaderValue::from_str(session_id).map_err(|error| {
+                ResponsesError::InvalidSessionId {
+                    detail: error.to_string(),
+                }
+            })?,
+        );
+        for name in ["thread-id", "x-client-request-id"] {
             request.headers_mut().insert(
                 name,
-                HeaderValue::from_str(session_id).map_err(|error| {
+                HeaderValue::from_str(thread_id).map_err(|error| {
                     ResponsesError::InvalidSessionId {
                         detail: error.to_string(),
                     }
@@ -177,21 +181,6 @@ impl ResponsesSocket {
             })?
             .map_err(map_send_error)?;
         Ok(())
-    }
-
-    /// Receives the next text event within the configured idle timeout.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for timeout, socket failure, closure, or an unexpected frame.
-    pub(crate) async fn next_text_or_idle_timeout(
-        &mut self,
-    ) -> Result<ReceivedText, ResponsesError> {
-        timeout(EVENT_IDLE_TIMEOUT, self.next_text())
-            .await
-            .map_err(|_| ResponsesError::IdleTimeout {
-                seconds: EVENT_IDLE_TIMEOUT.as_secs(),
-            })?
     }
 
     /// Receives the next text event while handling control frames in the pump.
@@ -347,14 +336,40 @@ fn map_handshake_error(error: WebSocketError) -> ResponsesError {
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<f64>().ok())
         .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok());
-    let body = response.body().as_deref().map_or_else(
-        || "empty response body".to_owned(),
-        |body| String::from_utf8_lossy(body).into_owned(),
-    );
+    let body = handshake_rejection_detail(response.body().as_deref(), response.headers());
     ResponsesError::HandshakeRejected {
         status,
         body,
         retry_after,
+    }
+}
+
+fn handshake_rejection_detail(
+    body: Option<&[u8]>,
+    headers: &tokio_tungstenite::tungstenite::http::HeaderMap,
+) -> String {
+    let body = body.map_or_else(String::new, |body| {
+        String::from_utf8_lossy(body).into_owned()
+    });
+    if !body.trim().is_empty() {
+        return body;
+    }
+
+    let request_id = header_string(headers, "x-request-id")
+        .or_else(|| header_string(headers, "x-oai-request-id"));
+    let diagnostics = [
+        header_string(headers, "cf-ray").map(|value| format!("cf-ray={value}")),
+        request_id.map(|value| format!("request-id={value}")),
+        header_string(headers, "x-openai-authorization-error")
+            .map(|value| format!("authorization-error={value}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    if diagnostics.is_empty() {
+        "empty response body".to_owned()
+    } else {
+        format!("empty response body ({})", diagnostics.join(", "))
     }
 }
 
@@ -412,7 +427,10 @@ mod tests {
         tungstenite::{Message, handshake::server::Request},
     };
 
-    use super::{ResponsesSocket, SOCKET_MESSAGE_CAPACITY, parse_raw_json, turn_state_from_event};
+    use super::{
+        ResponsesSocket, SOCKET_MESSAGE_CAPACITY, handshake_rejection_detail, parse_raw_json,
+        turn_state_from_event,
+    };
 
     #[test]
     fn only_decodes_turn_state_metadata_events() {
@@ -429,6 +447,20 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn empty_handshake_rejection_retains_gateway_diagnostics() -> Result<()> {
+        let mut headers = tokio_tungstenite::tungstenite::http::HeaderMap::new();
+        headers.insert("cf-ray", "ray-test".parse()?);
+        headers.insert("x-oai-request-id", "req-test".parse()?);
+        headers.insert("x-openai-authorization-error", "edge-policy".parse()?);
+
+        assert_eq!(
+            handshake_rejection_detail(Some(b""), &headers),
+            "empty response body (cf-ray=ray-test, request-id=req-test, authorization-error=edge-policy)"
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -574,7 +606,8 @@ mod tests {
         }
         let endpoint = env::var("NANOCODEX_HTTP_PROXY_TEST_ENDPOINT")?;
         let auth = crate::OpenAiAuth::api_key("test-key").snapshot().await?;
-        let result = ResponsesSocket::connect(&endpoint, &auth, "session-proxy", None).await;
+        let result =
+            ResponsesSocket::connect(&endpoint, &auth, "session-proxy", "thread-proxy", None).await;
         let expected_rejection = env::var("NANOCODEX_HTTP_PROXY_TEST_EXPECT_REJECTION")
             .ok()
             .map(|status| status.parse::<u16>())
@@ -634,14 +667,14 @@ mod tests {
                         .headers()
                         .get("thread-id")
                         .and_then(|v| v.to_str().ok()),
-                    Some("session-test")
+                    Some("thread-test")
                 );
                 assert_eq!(
                     request
                         .headers()
                         .get("x-client-request-id")
                         .and_then(|v| v.to_str().ok()),
-                    Some("session-test")
+                    Some("thread-test")
                 );
                 assert_eq!(
                     request
@@ -688,9 +721,14 @@ mod tests {
             true,
             1,
         );
-        let (mut socket, _) =
-            ResponsesSocket::connect(&endpoint, &auth, "session-test", Some("turn-state-test"))
-                .await?;
+        let (mut socket, _) = ResponsesSocket::connect(
+            &endpoint,
+            &auth,
+            "session-test",
+            "thread-test",
+            Some("turn-state-test"),
+        )
+        .await?;
 
         server.await??;
         let text = socket.next_text().await?;
@@ -727,9 +765,14 @@ mod tests {
             false,
             0,
         );
-        let (socket, _) =
-            ResponsesSocket::connect(&format!("ws://{address}"), &auth, "bounded-backlog", None)
-                .await?;
+        let (socket, _) = ResponsesSocket::connect(
+            &format!("ws://{address}"),
+            &auth,
+            "bounded-backlog",
+            "bounded-backlog",
+            None,
+        )
+        .await?;
         server.await??;
 
         timeout(Duration::from_secs(1), async {

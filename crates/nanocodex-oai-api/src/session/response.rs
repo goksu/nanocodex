@@ -119,6 +119,7 @@ impl From<&str> for ResponseInput {
 pub struct CompletedResponse {
     output: Arc<[ResponseItem]>,
     output_text: Arc<str>,
+    reported_model: Option<String>,
     usage: Option<Usage>,
     estimated_cost: Option<crate::EstimatedUsdCost>,
     cost_status: crate::CostStatus,
@@ -136,6 +137,12 @@ impl CompletedResponse {
     #[must_use]
     pub fn output_text(&self) -> &str {
         &self.output_text
+    }
+
+    /// Returns the model identifier reported by the provider, when available.
+    #[must_use]
+    pub fn reported_model(&self) -> Option<&str> {
+        self.reported_model.as_deref()
     }
 
     /// Iterates over complete function and custom tool calls.
@@ -546,7 +553,7 @@ where
     if reinject_canonical_context {
         candidate.append(session.canonical_context.iter().cloned());
     }
-    candidate.append(input.items);
+    candidate.append_client(input.items);
     let (prompt_history, prompt_repaired) = candidate.prompt_history_with_repair();
     let previous_response_id = if prompt_repaired {
         None
@@ -604,6 +611,7 @@ where
     let completed = CompletedResponse {
         output,
         output_text,
+        reported_model: response.reported_model,
         usage: response.usage,
         estimated_cost,
         cost_status,
@@ -692,14 +700,25 @@ where
         Arc::clone(&session.transport_stats),
     )
     .for_logical_turn(turn.logical_turn);
-    let mut history = session.state.prompt_history();
-    compaction::trim_tool_outputs_to_fit_context_window(&mut history, session.profile.prefix());
+    let (mut history, prompt_repaired) = session.state.prompt_history_with_repair();
+    let rewritten = compaction::trim_tool_outputs_to_fit_context_window(
+        &mut history,
+        session.profile.prefix(),
+        session.context_window_tokens,
+    );
     let request = factory.compaction(
         call_index,
         history.clone(),
         history,
-        session.state.delta_start(),
-        session.state.previous_response_id(),
+        if rewritten == 0 && !prompt_repaired {
+            session.state.delta_start()
+        } else {
+            0
+        },
+        session
+            .state
+            .previous_response_id()
+            .filter(|_| rewritten == 0 && !prompt_repaired),
         compaction::trigger(),
         session.model,
         session.thinking,
@@ -885,11 +904,7 @@ pub(super) fn estimate_cost(
             Some(crate::pricing::estimate_for_model(
                 usage,
                 model,
-                if fast_mode {
-                    crate::pricing::ServiceTier::Priority
-                } else {
-                    crate::pricing::ServiceTier::Standard
-                },
+                crate::pricing::ServiceTier::for_model(model, fast_mode),
             )),
             crate::CostStatus::EstimatedFromUsage,
         ),

@@ -1,8 +1,4 @@
 pub use nanocodex_oai_api::pricing::{CostStatus, EstimatedUsdCost, ServiceTier, UsdAmount};
-use nanocodex_oai_api::{
-    pricing,
-    responses::{InputTokenDetails, Usage},
-};
 use serde::{Deserialize, Serialize};
 
 /// Exact token accounting for every Responses call in one logical agent turn.
@@ -26,8 +22,33 @@ pub struct TurnUsage {
     cost_status: CostStatus,
 }
 
+/// Exact turn usage reported by an external backend.
+///
+/// Every field is named and required so wire adapters cannot silently swap or
+/// default adjacent token counters.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReportedTurnUsage {
+    /// All input tokens billed or reported by the backend.
+    pub input_tokens: u64,
+    /// Input tokens served from the backend's prompt cache.
+    pub cached_input_tokens: u64,
+    /// Input tokens newly written into the backend's prompt cache.
+    pub cache_write_input_tokens: u64,
+    /// All output tokens billed or reported by the backend.
+    pub output_tokens: u64,
+    /// Reasoning tokens included within `output_tokens`.
+    pub reasoning_output_tokens: u64,
+    /// Backend-reported aggregate token count.
+    pub total_tokens: u64,
+    /// Exact retained cost estimate, when one was reported.
+    pub estimated_cost: Option<EstimatedUsdCost>,
+    /// Availability and provenance of `estimated_cost`.
+    pub cost_status: CostStatus,
+}
+
 #[allow(clippy::struct_field_names)]
-#[derive(Clone, Copy)]
+#[derive(Clone)]
+#[cfg(feature = "openai")]
 pub(crate) struct TurnUsageCounts {
     pub(crate) input_tokens: u64,
     pub(crate) cached_input_tokens: u64,
@@ -36,37 +57,37 @@ pub(crate) struct TurnUsageCounts {
     pub(crate) reasoning_output_tokens: u64,
     pub(crate) total_tokens: u64,
     pub(crate) reported: bool,
+    pub(crate) estimated_cost: Option<EstimatedUsdCost>,
 }
 
 impl TurnUsage {
-    pub(crate) fn from_counts(
-        counts: TurnUsageCounts,
-        model: nanocodex_oai_api::Model,
-        fast_mode: bool,
-    ) -> Self {
+    /// Constructs exact usage reported by an external backend.
+    ///
+    /// All counts, the optional retained estimate, and its status are explicit
+    /// so a wire boundary cannot silently default an omitted field. This API
+    /// lets dependency-light backends construct usage without a serialization
+    /// round trip.
+    #[must_use]
+    pub fn from_reported(reported: ReportedTurnUsage) -> Self {
+        Self {
+            input_tokens: reported.input_tokens,
+            cached_input_tokens: reported.cached_input_tokens,
+            cache_write_input_tokens: reported.cache_write_input_tokens,
+            output_tokens: reported.output_tokens,
+            reasoning_output_tokens: reported.reasoning_output_tokens,
+            total_tokens: reported.total_tokens,
+            estimated_cost: reported.estimated_cost.map(Box::new),
+            cost_status: reported.cost_status,
+        }
+    }
+
+    #[cfg(feature = "openai")]
+    pub(crate) fn from_counts(counts: TurnUsageCounts) -> Self {
         let (estimated_cost, cost_status) = if !counts.reported {
             (None, CostStatus::UsageNotReported)
         } else {
-            let usage = Usage {
-                input_tokens: counts.input_tokens,
-                input_tokens_details: Some(InputTokenDetails {
-                    cached_tokens: counts.cached_input_tokens,
-                    cache_write_tokens: counts.cache_write_input_tokens,
-                }),
-                output_tokens: counts.output_tokens,
-                output_tokens_details: None,
-                total_tokens: counts.total_tokens,
-            };
             (
-                Some(Box::new(pricing::estimate_for_model(
-                    &usage,
-                    model,
-                    if fast_mode {
-                        ServiceTier::Priority
-                    } else {
-                        ServiceTier::Standard
-                    },
-                ))),
+                counts.estimated_cost.map(Box::new),
                 CostStatus::EstimatedFromUsage,
             )
         };
@@ -120,9 +141,10 @@ impl TurnUsage {
 
     /// Returns the automatic local USD estimate.
     ///
-    /// Nanocodex applies the selected model's built-in standard or priority
-    /// rates. `None` means the provider omitted usage; [`Self::cost_status`]
-    /// distinguishes that from a genuine zero-token estimate.
+    /// Nanocodex applies the selected model's built-in rates for the requested
+    /// processing mode. `None` means the provider omitted usage;
+    /// [`Self::cost_status`] distinguishes that from a genuine zero-token
+    /// estimate.
     #[must_use]
     pub fn estimated_cost(&self) -> Option<&EstimatedUsdCost> {
         self.estimated_cost.as_deref()

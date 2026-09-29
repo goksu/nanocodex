@@ -1,4 +1,7 @@
-use std::io::{BufRead, BufReader, Read};
+use std::{
+    io::{BufRead, BufReader, Read},
+    time::Duration,
+};
 
 use nanocodex_oai_api::responses::{ContentItem, MessageRole};
 use serde_json::Value;
@@ -29,27 +32,158 @@ fn completed_turn_with_effort(prompt: &str, final_message: &str, effort: Thinkin
 }
 
 #[test]
-fn child_rollout_policy_does_not_inherit_a_resume_path() {
-    let resumed =
-        RolloutConfig::new("/codex").resumed(PathBuf::from("/codex/sessions/parent.jsonl"));
-    let child = resumed.for_new_thread();
+fn discovers_active_and_archived_rollouts_newest_first() {
+    let home = tempdir().expect("temporary Codex home");
+    let active_id = "019c0d31-c308-7d91-bff4-5dca82d15ac6";
+    let archived_id = "019c0d31-c308-7d91-bff4-5dca82d15ac5";
+    let ignored_id = "019c0d31-c308-7d91-bff4-5dca82d15ac4";
+    let active = write_discoverable_rollout(home.path(), "sessions/2026/08/04", active_id);
+    let archived =
+        write_discoverable_rollout(home.path(), "archived_sessions/2026/08/03", archived_id);
+    let ignored_directory = home.path().join("sessions/2026/08/02");
+    std::fs::create_dir_all(&ignored_directory).expect("create ignored rollout directory");
+    std::fs::write(
+        ignored_directory.join(format!("rollout-2026-08-02T12-00-00-{ignored_id}.jsonl")),
+        "not json\n",
+    )
+    .expect("write malformed rollout");
+    std::fs::write(
+        ignored_directory.join(format!(
+            "rollout-2026-08-02T12-00-00-{ignored_id}.jsonl.zst"
+        )),
+        "compressed",
+    )
+    .expect("write unsupported compressed rollout");
 
-    assert_eq!(child.codex_home(), Path::new("/codex"));
-    assert!(child.resume_path.is_none());
+    set_modified(&archived, 10);
+    set_modified(&active, 20);
+    let sessions = RolloutConfig::new(home.path())
+        .list_sessions()
+        .expect("discover rollouts");
+
+    assert_eq!(sessions.len(), 2);
+    assert_eq!(sessions[0].thread_id(), active_id);
+    assert_eq!(sessions[0].workspace(), home.path().to_str());
+    assert_eq!(sessions[0].preview(), Some("resume me"));
+    assert!(!sessions[0].is_archived());
+    assert_eq!(sessions[1].thread_id(), archived_id);
+    assert!(sessions[1].is_archived());
+}
+
+#[test]
+fn discovery_prefers_an_active_copy_of_a_duplicate_thread() {
+    let home = tempdir().expect("temporary Codex home");
+    let thread_id = "019c0d31-c308-7d91-bff4-5dca82d15ac6";
+    let active = write_discoverable_rollout(home.path(), "sessions/2026/08/04", thread_id);
+    let archived =
+        write_discoverable_rollout(home.path(), "archived_sessions/2026/08/05", thread_id);
+    set_modified(&active, 10);
+    set_modified(&archived, 20);
+
+    let sessions = RolloutConfig::new(home.path())
+        .list_sessions()
+        .expect("discover deduplicated rollouts");
+
+    assert_eq!(sessions.len(), 1);
+    assert!(!sessions[0].is_archived());
+}
+
+fn write_discoverable_rollout(home: &Path, relative: &str, thread_id: &str) -> PathBuf {
+    let directory = home.join(relative);
+    std::fs::create_dir_all(&directory).expect("create rollout directory");
+    let path = directory.join(format!("rollout-2026-08-04T12-00-00-{thread_id}.jsonl"));
+    let mut file = File::create(&path).expect("create discoverable rollout");
+    write_line(
+        &mut file,
+        &serde_json::json!({
+            "timestamp": "2026-08-04T12:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": thread_id,
+                "cwd": home,
+                "history_mode": "legacy",
+                "context_window": {"window_id": "window-1"}
+            }
+        }),
+    )
+    .expect("write session metadata");
+    write_line(
+        &mut file,
+        &serde_json::json!({
+            "timestamp": "2026-08-04T12:00:01Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "message": "resume\n  me"
+            }
+        }),
+    )
+    .expect("write user preview");
+    write_line(
+        &mut file,
+        &serde_json::json!({
+            "timestamp": "2026-08-04T12:00:02Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "resume me"}]
+            }
+        }),
+    )
+    .expect("write committed history");
+    file.flush().expect("flush discoverable rollout");
+    path
+}
+
+#[test]
+fn prompt_previews_are_single_line_and_bounded() {
+    assert_eq!(
+        load::prompt_preview("  first\n\tsecond  "),
+        Some("first second".to_owned())
+    );
+    let long = "x".repeat(200);
+    assert_eq!(
+        load::prompt_preview(&long)
+            .expect("non-empty preview")
+            .chars()
+            .count(),
+        160
+    );
+    assert_eq!(load::prompt_preview(" \n\t "), None);
+    assert_eq!(
+        load::prompt_preview("safe\u{1b}]52;c;payload\u{7} text"),
+        Some("safe]52;c;payload text".to_owned())
+    );
+}
+
+fn set_modified(path: &Path, seconds: u64) {
+    File::options()
+        .write(true)
+        .open(path)
+        .expect("open rollout to set modification time")
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)),
+        )
+        .expect("set rollout modification time");
 }
 
 fn recorder(home: &Path) -> RolloutRecorder {
     RolloutRecorder::create(
         &Handle::current(),
-        &RolloutConfig::new(home),
-        "019c0d31-c308-7d91-bff4-5dca82d15ac6",
-        Path::new("/worktree"),
-        "base instructions",
-        RolloutOrigin {
-            kind: "root",
-            parent_thread_id: None,
+        RolloutCreate {
+            config: &RolloutConfig::new(home),
+            thread_id: "019c0d31-c308-7d91-bff4-5dca82d15ac6",
+            prompt_cache_key: "durable-cache",
+            cwd: Path::new("/worktree"),
+            instructions: "base instructions",
+            origin: RolloutOrigin {
+                kind: "root",
+                parent_thread_id: None,
+            },
+            resume_history_len: None,
         },
-        None,
     )
     .expect("create rollout")
 }
@@ -156,6 +290,8 @@ fn loads_codex_rollout_without_a_nanocodex_sidecar() {
     assert_eq!(session.rollout_path(), path.canonicalize().unwrap());
     assert_eq!(session.model(), Model::Sol);
     let snapshot = serde_json::to_value(session.snapshot()).expect("encode snapshot");
+    assert_eq!(snapshot["lineage_id"], thread_id);
+    assert_eq!(snapshot["prompt_cache_key"], thread_id);
     assert!(snapshot.get("request_prefix").is_none());
     assert_eq!(snapshot["history"].as_array().map(Vec::len), Some(2));
     let history = snapshot["history"].to_string();
@@ -170,6 +306,90 @@ fn loads_codex_rollout_without_a_nanocodex_sidecar() {
             RolloutTranscriptItem::Assistant("visible answer".to_owned()),
         ]
     );
+}
+
+#[test]
+fn moved_rollout_payload_preserves_tool_transcript_and_compacted_history() {
+    let home = tempdir().expect("temporary Codex home");
+    let thread_id = "019c0d31-c308-7d91-bff4-5dca82d15ac6";
+    let directory = home.path().join("sessions/2026/07/24");
+    std::fs::create_dir_all(&directory).expect("create rollout directory");
+    let path = directory.join(format!("rollout-2026-07-24T12-00-00-{thread_id}.jsonl"));
+    let mut file = File::create(path).expect("create Codex rollout");
+    for record in [
+        serde_json::json!({
+            "type": "session_meta",
+            "payload": {"id": thread_id, "cwd": home.path(), "history_mode": "legacy"}
+        }),
+        serde_json::json!({
+            "type": "response_item",
+            "payload": {"type": "function_call", "name": "search", "call_id": "call-1",
+                "arguments": "{\"query\":\"rust\"}"}
+        }),
+        serde_json::json!({
+            "type": "compacted",
+            "payload": {"replacement_history": [{
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "retained after compaction"}]
+            }]}
+        }),
+    ] {
+        write_line(&mut file, &record).expect("write rollout line");
+    }
+    file.flush().expect("flush rollout");
+
+    let session = RolloutConfig::new(home.path())
+        .load_session(thread_id)
+        .expect("load compacted rollout");
+    assert_eq!(
+        session.transcript(),
+        [RolloutTranscriptItem::Tool {
+            call_id: "call-1".to_owned(),
+            name: "search".to_owned(),
+            arguments: "{\"query\":\"rust\"}".to_owned(),
+        }]
+    );
+    let snapshot = serde_json::to_value(session.snapshot()).expect("encode snapshot");
+    assert_eq!(snapshot["history"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        snapshot["history"][0]["content"][0]["text"],
+        "retained after compaction"
+    );
+}
+
+#[test]
+fn missing_compacted_history_still_reports_line_specific_error() {
+    let home = tempdir().expect("temporary Codex home");
+    let thread_id = "019c0d31-c308-7d91-bff4-5dca82d15ac6";
+    let directory = home.path().join("sessions/2026/07/24");
+    std::fs::create_dir_all(&directory).expect("create rollout directory");
+    let path = directory.join(format!("rollout-2026-07-24T12-00-00-{thread_id}.jsonl"));
+    let mut file = File::create(&path).expect("create Codex rollout");
+    write_line(
+        &mut file,
+        &serde_json::json!({
+            "type": "session_meta",
+            "payload": {"id": thread_id, "cwd": home.path(), "history_mode": "legacy"}
+        }),
+    )
+    .expect("write session metadata");
+    write_line(
+        &mut file,
+        &serde_json::json!({"type": "compacted", "payload": {}}),
+    )
+    .expect("write malformed compacted payload");
+    file.flush().expect("flush rollout");
+    let error = RolloutConfig::new(home.path())
+        .load_session(thread_id)
+        .expect_err("missing replacement history must be rejected");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(
+        error
+            .to_string()
+            .contains("failed to decode replacement history"),
+        "{error}"
+    );
+    assert!(error.to_string().contains("line 2"), "{error}");
 }
 
 #[test]
@@ -207,7 +427,7 @@ fn loads_the_latest_supported_model_from_codex_turn_context() {
                 "cwd": home.path(),
                 "approval_policy": "on-request",
                 "sandbox_policy": {"type": "workspace-write"},
-                "model": "gpt-5.6-sol",
+                "model": "gpt-6.1-sol",
                 "effort": "high",
                 "summary": "auto"
             }
@@ -219,7 +439,7 @@ fn loads_the_latest_supported_model_from_codex_turn_context() {
                 "cwd": home.path(),
                 "approval_policy": "on-request",
                 "sandbox_policy": {"type": "workspace-write"},
-                "model": "gpt-5.6-luna",
+                "model": "gpt-6-luna",
                 "effort": "high",
                 "summary": "auto"
             }
@@ -235,7 +455,46 @@ fn loads_the_latest_supported_model_from_codex_turn_context() {
     let snapshot = serde_json::to_value(session.snapshot()).expect("encode snapshot");
 
     assert_eq!(session.model(), Model::Luna);
-    assert_eq!(snapshot["model"], "gpt-5.6-luna");
+    assert_eq!(snapshot["model"], "gpt-6-luna");
+}
+
+#[test]
+fn rejects_rollout_continuation_for_obsolete_model_ids() {
+    let home = tempdir().expect("temporary Codex home");
+    let thread_id = "019c0d31-c308-7d91-bff4-5dca82d15ac7";
+    let directory = home.path().join("sessions/2026/07/24");
+    std::fs::create_dir_all(&directory).expect("create rollout directory");
+    let path = directory.join(format!("rollout-2026-07-24T12-00-00-{thread_id}.jsonl"));
+    let mut file = File::create(&path).expect("create Codex rollout");
+    write_line(
+        &mut file,
+        &serde_json::json!({
+            "timestamp": "2026-07-24T12:00:00Z",
+            "type": "session_meta",
+            "payload": {"id": thread_id, "cwd": home.path()}
+        }),
+    )
+    .expect("write session metadata");
+    write_line(
+        &mut file,
+        &serde_json::json!({
+            "timestamp": "2026-07-24T12:00:01Z",
+            "type": "turn_context",
+            "payload": {"model": "gpt-6-sol"}
+        }),
+    )
+    .expect("write obsolete model");
+    file.flush().expect("flush rollout");
+
+    let error = RolloutConfig::new(home.path())
+        .load_session(thread_id)
+        .expect_err("obsolete model continuation must be rejected");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        error
+            .to_string()
+            .contains("continuation requires its original model")
+    );
 }
 
 #[test]
@@ -363,7 +622,7 @@ async fn writes_codex_rollout_envelope_and_committed_items() {
     assert_eq!(lines[2]["payload"]["message"], "remember amber");
     assert_eq!(lines[3]["type"], "turn_context");
     assert_eq!(lines[3]["payload"]["cwd"], "/worktree");
-    assert_eq!(lines[3]["payload"]["model"], "gpt-5.6-sol");
+    assert_eq!(lines[3]["payload"]["model"], "gpt-6.1-sol");
     assert_eq!(lines[3]["payload"]["effort"], "high");
     assert_eq!(lines[4]["type"], "response_item");
     assert_eq!(lines[4]["payload"]["type"], "message");
@@ -439,6 +698,47 @@ async fn appends_only_the_new_committed_delta() {
 }
 
 #[tokio::test]
+async fn legacy_resume_roots_new_children_at_the_resumed_session() {
+    let home = tempdir().unwrap();
+    let original = recorder(home.path());
+    let path = original.info().path().to_path_buf();
+    let thread = original.info().thread_id().to_owned();
+    original.shutdown().await.unwrap();
+    let mut records = lines(&original);
+    records[0]["payload"]
+        .as_object_mut()
+        .unwrap()
+        .remove("root_session_id");
+    std::fs::write(
+        &path,
+        records
+            .iter()
+            .map(|line| format!("{line}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    let config = RolloutConfig::new(home.path()).resumed(path);
+    let resumed = RolloutRecorder::create(
+        &Handle::current(),
+        RolloutCreate {
+            config: &config,
+            thread_id: &thread,
+            prompt_cache_key: "cache",
+            cwd: Path::new("/worktree"),
+            instructions: "instructions",
+            origin: RolloutOrigin {
+                kind: "resume",
+                parent_thread_id: None,
+            },
+            resume_history_len: Some(0),
+        },
+    )
+    .unwrap();
+    assert_eq!(config.root_session_id.get(), Some(&thread));
+    resumed.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn resumed_writer_repairs_a_rollout_behind_the_durable_boundary() {
     let home = tempdir().expect("temporary Codex home");
     let original = recorder(home.path());
@@ -460,16 +760,19 @@ async fn resumed_writer_repairs_a_rollout_behind_the_durable_boundary() {
     let config = RolloutConfig::new(home.path()).resumed(path.clone());
     let resumed = RolloutRecorder::create(
         &Handle::current(),
-        &config,
-        "019c0d31-c308-7d91-bff4-5dca82d15ac6",
-        Path::new("/worktree"),
-        "base instructions",
-        RolloutOrigin {
-            kind: "resume",
-            parent_thread_id: None,
+        RolloutCreate {
+            config: &config,
+            thread_id: "019c0d31-c308-7d91-bff4-5dca82d15ac6",
+            prompt_cache_key: "durable-cache",
+            cwd: Path::new("/worktree"),
+            instructions: "base instructions",
+            origin: RolloutOrigin {
+                kind: "resume",
+                parent_thread_id: None,
+            },
+            // The durable snapshot already contains `two`, but its rollout append failed.
+            resume_history_len: Some(2),
         },
-        // The durable snapshot already contains `two`, but its rollout append failed.
-        Some(2),
     )
     .expect("resume rollout");
     resumed
@@ -538,15 +841,18 @@ async fn fork_metadata_retains_parent_identity() {
     let parent = "019c0d31-c308-7d91-bff4-5dca82d15ac5";
     let recorder = RolloutRecorder::create(
         &Handle::current(),
-        &RolloutConfig::new(home.path()),
-        "019c0d31-c308-7d91-bff4-5dca82d15ac6",
-        Path::new("/worktree"),
-        "base instructions",
-        RolloutOrigin {
-            kind: "fork",
-            parent_thread_id: Some(parent),
+        RolloutCreate {
+            config: &RolloutConfig::new(home.path()),
+            thread_id: "019c0d31-c308-7d91-bff4-5dca82d15ac6",
+            prompt_cache_key: "durable-cache",
+            cwd: Path::new("/worktree"),
+            instructions: "base instructions",
+            origin: RolloutOrigin {
+                kind: "fork",
+                parent_thread_id: Some(parent),
+            },
+            resume_history_len: None,
         },
-        None,
     )
     .expect("create fork rollout");
 

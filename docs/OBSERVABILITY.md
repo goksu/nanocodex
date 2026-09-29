@@ -155,17 +155,10 @@ gate verifies event counts, exactly one trace root per accepted prompt, all
 parent references, expected success/error span volume, shared cell-actor
 parentage and complete interval overlap for the delayed `Promise.all` fan-out,
 model and terminal latency, exact token/cache fields, automatic
-the selected GPT-5.6 model's cost, structural model/tool fields, API-visible reasoning
+the selected GPT-6 model's cost, structural model/tool fields, API-visible reasoning
 summaries, prompt/readable/encrypted reasoning/tool-argument sentinels in
 ordered span events, and absence of the separately configured API key from
 exported trace data.
-
-The PR #50 milestone run on 2026-07-28 emitted 2,215 contractual events and
-retained 32 validated turn roots. The identical 32-turn/16-way workload took
-34.420 seconds without OTLP and 34.504 seconds with OTLP; exporter and Jaeger
-validation then took 399 milliseconds. The observed workload delta was 84
-milliseconds (0.24%); the deliberate one-second yielded subprocess in every
-turn remained the dominant measured harness cost.
 
 Scale it up without changing code:
 

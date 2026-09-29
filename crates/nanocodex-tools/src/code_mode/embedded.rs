@@ -12,8 +12,10 @@ use std::{
 };
 
 use rquickjs::{
-    CatchResultExt, Context, Ctx, Exception, Function, Persistent, Promise, Runtime,
-    function::Func, promise::PromiseState,
+    CatchResultExt, Coerced, Context, Ctx, Exception, FromJs, Function, Persistent, Promise,
+    Runtime,
+    function::{Func, Rest},
+    promise::PromiseState,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -22,6 +24,9 @@ use tokio::sync::mpsc;
 use super::RuntimeEvent;
 
 const BOOTSTRAP: &str = include_str!("bootstrap.js");
+// Generated from js/nanocodex-tools/runtime/code-tools.mjs for crate packaging.
+const CODE_TOOLS: &str = include_str!("code-tools.mjs");
+const CODE_VALUES: &str = include_str!("code-values.mjs");
 
 type SavedFunction = Persistent<Function<'static>>;
 
@@ -54,9 +59,9 @@ struct ExecutionState {
     execution_id: u64,
     event_tx: mpsc::UnboundedSender<RuntimeEvent>,
     pending_tools: HashMap<u64, (SavedFunction, SavedFunction)>,
-    pending_timeouts: HashMap<u32, PendingTimeout>,
+    pending_timeouts: HashMap<u64, PendingTimeout>,
     next_tool_id: u64,
-    next_timeout_id: u32,
+    next_timeout_id: u64,
 }
 
 struct PendingTimeout {
@@ -254,10 +259,34 @@ fn run_execution_in_context<'js>(
         next_timeout_id: 1,
     }));
     install_native_functions(ctx, &state)?;
-    let run_cell = ctx
+    // Reuse exactly the same tool facade as the JS runtimes. Strip only the
+    // module export so QuickJS can evaluate the factory as an expression.
+    let factory_source = format!(
+        "({})",
+        CODE_TOOLS.replacen("export function", "function", 1)
+    );
+    let create_tools = ctx
+        .eval::<Function<'js>, _>(factory_source)
+        .catch(ctx)
+        .map_err(|error| format!("failed to evaluate shared tool facade: {error}"))?;
+    let values_factory = CODE_VALUES
+        .split_once("export const")
+        .ok_or_else(|| "shared value helper export marker is missing".to_owned())?
+        .0;
+    let value_helpers = ctx
+        .eval::<rquickjs::Object<'js>, _>(format!(
+            "(() => {{{values_factory}\nreturn createValueHelpers();}})()"
+        ))
+        .catch(ctx)
+        .map_err(|error| format!("failed to evaluate shared value helpers: {error}"))?;
+    let bootstrap = ctx
         .eval::<Function<'js>, _>(BOOTSTRAP)
         .catch(ctx)
         .map_err(|error| format!("failed to evaluate embedded QuickJS bootstrap: {error}"))?;
+    let run_cell = bootstrap
+        .call::<_, Function<'js>>((create_tools, value_helpers))
+        .catch(ctx)
+        .map_err(|error| format!("failed to initialize embedded QuickJS bootstrap: {error}"))?;
     remove_native_globals(ctx)?;
 
     let tools = serde_json::to_string(&start.tools)
@@ -353,9 +382,22 @@ fn install_native_functions<'js>(
             "__nanocodexContent",
             Func::from(
                 move |ctx: Ctx<'js>, content_json: String| -> rquickjs::Result<()> {
-                    let content = serde_json::from_str(&content_json).map_err(|error| {
+                    let content: crate::ToolOutputContent = serde_json::from_str(&content_json).map_err(|error| {
                         Exception::throw_type(&ctx, &format!("invalid output content: {error}"))
                     })?;
+                    // Shared guest helpers normalize values and omit short PCM WAV.
+                    // Retain native audio validation at this host boundary too.
+                    let content = match content {
+                        crate::ToolOutputContent::InputAudio { ref audio_url }
+                            if super::audio::wav_duration_seconds(audio_url)
+                                .is_some_and(|duration| duration < 0.025) =>
+                        {
+                            crate::ToolOutputContent::InputText {
+                                text: "Audio output omitted because the clip is shorter than 25 ms; use a longer clip.".to_owned(),
+                            }
+                        }
+                        content => content,
+                    };
                     let state = content_state.borrow();
                     let _ = state.event_tx.send(RuntimeEvent::Content {
                         cell_id: state.execution_id,
@@ -402,11 +444,21 @@ fn install_native_functions<'js>(
         .set(
             "__nanocodexSetTimeout",
             Func::from(
-                move |ctx: Ctx<'js>,
-                      callback: Function<'js>,
-                      delay_ms: i64|
-                      -> rquickjs::Result<u32> {
-                    let delay_ms = u64::try_from(delay_ms).unwrap_or_default();
+                move |ctx: Ctx<'js>, args: Rest<rquickjs::Value<'js>>| -> rquickjs::Result<u64> {
+                    let callback = args
+                        .first()
+                        .and_then(|value| value.as_function())
+                        .cloned()
+                        .ok_or_else(|| {
+                            throw_message(&ctx, "setTimeout expects a function callback")
+                        })?;
+                    let delay_ms = args
+                        .get(1)
+                        .cloned()
+                        .map(|value| Coerced::<f64>::from_js(&ctx, value))
+                        .transpose()?
+                        .map_or(0.0, |value| value.0);
+                    let delay_ms = normalize_delay_ms(delay_ms);
                     let mut state = timeout_state.borrow_mut();
                     let id = state.next_timeout_id;
                     state.next_timeout_id = state.next_timeout_id.saturating_add(1);
@@ -428,12 +480,33 @@ fn install_native_functions<'js>(
     globals
         .set(
             "__nanocodexClearTimeout",
-            Func::from(move |id: u32| {
-                clear_timeout_state
-                    .borrow_mut()
-                    .pending_timeouts
-                    .remove(&id);
-            }),
+            Func::from(
+                move |ctx: Ctx<'js>, args: Rest<rquickjs::Value<'js>>| -> rquickjs::Result<()> {
+                    let Some(value) = args
+                        .first()
+                        .filter(|value| !value.is_null() && !value.is_undefined())
+                    else {
+                        return Ok(());
+                    };
+                    let id = match Coerced::<f64>::from_js(&ctx, value.clone()) {
+                        Ok(id) => id.0,
+                        Err(_) => {
+                            let _ = ctx.catch();
+                            return Err(throw_message(
+                                &ctx,
+                                "clearTimeout expects a numeric timeout id",
+                            ));
+                        }
+                    };
+                    if id.is_finite() && id > 0.0 {
+                        clear_timeout_state
+                            .borrow_mut()
+                            .pending_timeouts
+                            .remove(&normalize_delay_ms(id));
+                    }
+                    Ok(())
+                },
+            ),
         )
         .catch(ctx)
         .map_err(|error| format!("failed to install QuickJS timer cleanup: {error}"))?;
@@ -542,7 +615,7 @@ fn resolve_tool(
 fn invoke_timeout(
     ctx: &Ctx<'_>,
     state: &Rc<RefCell<ExecutionState>>,
-    id: u32,
+    id: u64,
 ) -> Result<(), String> {
     let timeout = state.borrow_mut().pending_timeouts.remove(&id);
     let Some(timeout) = timeout else {
@@ -569,7 +642,7 @@ fn next_timeout_wait(state: &Rc<RefCell<ExecutionState>>) -> Option<Duration> {
         .map(|deadline| deadline.saturating_duration_since(now))
 }
 
-fn next_due_timeout(state: &Rc<RefCell<ExecutionState>>) -> Option<u32> {
+fn next_due_timeout(state: &Rc<RefCell<ExecutionState>>) -> Option<u64> {
     let now = Instant::now();
     state
         .borrow()
@@ -603,4 +676,116 @@ fn receive_command(
 
 fn drain_jobs(ctx: &Ctx<'_>) {
     while ctx.execute_pending_job() {}
+}
+
+fn normalize_delay_ms(value: f64) -> u64 {
+    if !value.is_finite() || value <= 0.0 {
+        0
+    } else {
+        value.trunc() as u64
+    }
+}
+
+fn throw_message(ctx: &Ctx<'_>, message: &str) -> rquickjs::Error {
+    match rquickjs::String::from_str(ctx.clone(), message) {
+        Ok(message) => ctx.throw(message.into_value()),
+        Err(error) => error,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn all_native_oracle_helper_cases_match_embedded_evaluation() {
+        let fixture: Value = serde_json::from_str(include_str!("native-behavior.json")).unwrap();
+        let cases = fixture["helpers"].as_array().unwrap();
+        assert_eq!(cases.len(), 21);
+        let mut host = EmbeddedHost::spawn().unwrap();
+        for (index, case) in cases.iter().enumerate() {
+            let kind = case["kind"].as_str().unwrap();
+            let expression = case["expression"].as_str().unwrap();
+            let source = format!(
+                "try {{ {kind}({expression}); }} catch (error) {{ text({{error: String(error)}}); }}"
+            );
+            host.start_cell(index as u64, &source, HashMap::new(), vec![])
+                .unwrap();
+            let event = tokio::time::timeout(Duration::from_secs(2), host.read_event())
+                .await
+                .unwrap()
+                .unwrap();
+            let RuntimeEvent::Content { content, .. } = event else {
+                panic!("missing content for {kind}({expression})");
+            };
+            let observed = if case["result"].get("error").is_some() {
+                let crate::ToolOutputContent::InputText { text } = content else {
+                    panic!("missing error text");
+                };
+                serde_json::from_str::<Value>(&text).unwrap()
+            } else {
+                serde_json::json!({"item": content})
+            };
+            assert_eq!(observed, case["result"], "{kind}({expression})");
+            let event = tokio::time::timeout(Duration::from_secs(2), host.read_event())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(event, RuntimeEvent::Done { .. }),
+                "{kind}({expression})"
+            );
+        }
+        host.terminate().await;
+    }
+
+    #[tokio::test]
+    async fn root_terminal_discards_unawaited_callbacks_and_stale_results() {
+        let mut host = EmbeddedHost::spawn().unwrap();
+        for (execution_id, ending) in [(1, "return;"), (2, "throw new Error('root failed');")] {
+            host.start_cell(
+                execution_id,
+                &format!("tools.pending({{}}); setTimeout(() => text('late'), 60000); {ending}"),
+                HashMap::new(),
+                vec![
+                    serde_json::json!({"name":"pending", "tool_name":"pending", "kind":"function"}),
+                ],
+            )
+            .unwrap();
+            let event = tokio::time::timeout(Duration::from_secs(2), host.read_event())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(event, RuntimeEvent::ToolCall { cell_id, id: 1, .. } if cell_id == execution_id)
+            );
+            // Neither the unresolved tool nor the timer keeps the root alive.
+            let event = tokio::time::timeout(Duration::from_secs(2), host.read_event())
+                .await
+                .unwrap()
+                .unwrap();
+            if execution_id == 1 {
+                assert!(matches!(event, RuntimeEvent::Done { cell_id: 1, .. }));
+            } else {
+                assert!(
+                    matches!(event, RuntimeEvent::Error { cell_id: 2, message, .. } if message.contains("root failed"))
+                );
+            }
+            host.send_tool_result(execution_id, 1, Value::Null, true)
+                .unwrap();
+        }
+        host.start_cell(3, "text('fresh');", HashMap::new(), vec![])
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(2), host.read_event())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(event, RuntimeEvent::Content { cell_id: 3, .. }));
+        let event = tokio::time::timeout(Duration::from_secs(2), host.read_event())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(event, RuntimeEvent::Done { cell_id: 3, .. }));
+        host.terminate().await;
+    }
 }

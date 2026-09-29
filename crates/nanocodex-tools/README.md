@@ -54,6 +54,16 @@ Matching Codex, direct-plus-Code-Mode exposure keeps `exec` terse and
 adds each typed `exec` declaration to the corresponding direct tool; Code
 Mode-only instead carries the complete nested catalog in `exec`. Selection
 changes model-visible exposure, not registration or dispatch behavior.
+`tool_with_exposure` can override one registered tool with `DirectOnly`,
+`CodeModeOnly`, `DirectAndCodeMode`, or `Hidden` while preserving the global
+default for the rest. Host-owned `exec`, `wait`, and `tool_search` names cannot
+be replaced, and colliding normalized JavaScript names are rejected when the
+recipe is built.
+
+`ToolsBuilder::add` composes the same recipe from a fixed [`Tool`], a
+[`WorkspaceTools`] value, or [`Mcp`](mcp::Mcp). A workspace source selects canonical
+local workspace tools rooted at its directory; adding a second workspace source
+is rejected.
 Namespaced Code Mode names such as `image_gen__imagegen` remain available to
 `exec`; normal Code Mode exposes the Codex-compatible `image_gen.imagegen`
 Responses namespace and routes its namespaced call to the same handler.
@@ -108,11 +118,12 @@ impl Tool for DeploymentRegion {
 
 ## Embed Code Mode in another host
 
-[`hosted`] is the portable boundary for environments that own JavaScript
-execution outside Rust. Implement [`hosted::CodeModeHost`] and pass it to
-[`hosted::HostedTools`]; the adapter reuses the same execution, nested-call,
-notification, observer, and owned-context types as native Code Mode. The
-[`hosted`] module documentation includes a complete host implementation.
+[`embedded`] is the portable boundary for environments that own JavaScript
+execution outside Rust. Build the ordinary [`Tools`] recipe, implement
+[`embedded::CodeModeHost`], and bind that host at the embedding boundary. The
+adapter reuses the same execution, nested-call, notification, observer, and
+owned-context types as native Code Mode. The [`embedded`] module documentation
+includes a complete host implementation.
 
 ## MCP is native and always available
 
@@ -133,7 +144,7 @@ let mcp = Mcp::builder()
     )
     .build()?;
 
-let tools = Tools::builder().provider(mcp).build()?;
+let tools = Tools::builder().add(mcp).build()?;
 # Ok(())
 # }
 ```
@@ -141,9 +152,58 @@ let tools = Tools::builder().provider(mcp).build()?;
 Handshakes and discovery start with the owning runtime. Both exposure policies
 keep the provider-native `tool_search` visible while omitting deferred MCP
 schemas from the initial request. Code Mode lists those deferred tools as
-compact name/description entries in `ALL_TOOLS`. Search results contain
-loadable MCP namespaces for direct model calls and also activate matching Code
-Mode definitions, keeping large catalogs out of the initial tool list.
+compact name/description entries in `ALL_TOOLS`. Search results contain loadable
+MCP namespaces for direct model calls and also activate matching Code Mode
+definitions, keeping large catalogs out of the initial tool list.
+`McpServer::tool_exposure` independently selects `DeferredOnly`,
+`CodeModeOnly`, `DeferredAndCodeMode`, or `Hidden` for each server. Automatic
+catalog pagination is bounded by page, item, cursor, and wall-clock limits.
+
+## Attach one immutable recipe
+
+With the `attachment` feature, the same `Tools` value can execute behind a
+reverse WebSocket. Attachment consumes the complete recipe, finishes MCP
+discovery, validates the immutable catalog, connects, and waits for the remote
+catalog acknowledgement:
+
+```rust,no_run
+use nanocodex_tools::{Tools, attachment::AttachmentTarget};
+
+# async fn run() -> Result<(), Box<dyn std::error::Error>> {
+let tools = Tools::builder().without_defaults().build()?;
+let target = AttachmentTarget::new("wss://tools.example.test/v1/attach", "bearer")?;
+let (attachment, mut events) = tools.attach(target).connect().await?;
+
+let observer = tokio::spawn(async move {
+    while let Some(event) = events.recv().await {
+        println!("{event:?}");
+    }
+});
+attachment.detach().await?;
+observer.await?;
+# Ok(())
+# }
+```
+
+Only sources with a concrete attached executor are accepted: fixed tools,
+MCP added with `add`, and pinned `WorkspaceTools`. Generic dynamic providers
+remain local-only. Built-in web search and image generation also remain at the
+model backend, so attached recipes disable defaults and opt into concrete
+sources. Preparation and discovery errors happen before a socket is opened;
+`connect` returns only after readiness. The cheap `Attachment` control handle
+is cloneable and its last drop detaches. `AttachmentEvents` is an independent,
+bounded, best-effort observer: lag may drop events but can never delay tool
+execution or protocol progress. `Attachment::status` and `closed` are the
+authoritative lifecycle APIs.
+
+### Deferred: workspace replication
+
+Attachment chooses where a tool call executes; it does not move or merge
+workspace data. An attached local workspace and the detached cloud
+`/workspace` may therefore diverge. Automatic replication and reconciliation
+are intentionally deferred to a separate capability with explicit direction,
+conflict, and recovery policy. Until that capability exists, attach and detach
+must never imply synchronization.
 
 ## Companion workspace runtimes
 
@@ -157,6 +217,11 @@ identities, and their shared contracts without linking OpenAI transports, Code
 Mode/QuickJS, MCP, or HTTP clients. This is artifact separation, not a second
 tool implementation or an alternate mode for normal native applications.
 
+Both runtimes retain yielded shell sessions until their exit is collected or
+the owner cancels or shuts down the runtime. Opening another command never
+evicts an existing process, and there is no application-level process-count
+cap. The host operating system remains responsible for resource limits.
+
 ## Going lower level
 
 The crate root intentionally contains only the normal registry path:
@@ -168,7 +233,7 @@ deliberately restoring proxy-safe credential markers to tool subprocesses.
 
 - [`contract`] contains complete model-visible inputs, outputs, errors, and
   retained wire forms.
-- [`hosted`] contains the portable application-owned Code Mode boundary.
+- [`embedded`] contains the portable application-owned Code Mode boundary.
 - [`runtime`] contains the stateful per-agent executor, built-in connection
   configuration, and dynamic-provider contract.
 - [`code_mode`] contains cell results, notifications, and nested-tool updates.

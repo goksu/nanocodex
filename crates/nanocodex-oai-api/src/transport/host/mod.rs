@@ -35,6 +35,18 @@ pub trait HostTransport: Send + Sync + 'static {
         request: HostConnectRequest<'a>,
     ) -> HostFuture<'a, Result<ConnectedHost, HostError>>;
 
+    /// Opens an HTTPS Responses byte stream. Dropping the returned future must
+    /// cancel a pending request; dropping the body must cancel its reader.
+    /// Hosts must reject non-success statuses as `HandshakeRejected`, preserving
+    /// status, response body and Retry-After, and must never buffer successful bodies.
+    fn http<'a>(
+        &'a self,
+        _request: HostConnectRequest<'a>,
+        _body: &'a str,
+    ) -> HostFuture<'a, Result<HostHttpResponse, HostError>> {
+        Box::pin(async { Err(HostError::new("host HTTPS transport is unavailable")) })
+    }
+
     /// Waits without blocking the embedding thread.
     ///
     /// The SDK calls this only for its typed retry backoff.
@@ -46,8 +58,11 @@ pub trait HostConnection: Send + 'static {
     /// Sends one complete text frame.
     fn send<'a>(&'a self, message: &'a str) -> HostFuture<'a, Result<(), HostError>>;
 
-    /// Waits for the next data, closure, or timeout result.
-    fn next(&mut self, idle_timeout: Duration) -> HostFuture<'_, Result<HostMessage, HostError>>;
+    /// Waits for the next data or closure result, without a silence deadline.
+    ///
+    /// Model reasoning may be silent for an unbounded duration. The runtime owns
+    /// cancellation and calls `close` when it releases this connection.
+    fn next(&mut self) -> HostFuture<'_, Result<HostMessage, HostError>>;
 
     /// Releases the environment's connection handle synchronously.
     fn close(&mut self);
@@ -64,6 +79,7 @@ pub struct HostConnectRequest<'a> {
     account_id: Option<&'a str>,
     fedramp: bool,
     session_id: &'a str,
+    thread_id: &'a str,
     turn_state: Option<&'a str>,
 }
 
@@ -82,12 +98,33 @@ impl<'a> HostConnectRequest<'a> {
         session_id: &'a str,
         turn_state: Option<&'a str>,
     ) -> Self {
+        Self::new_with_thread_id(
+            endpoint,
+            bearer_token,
+            account_id,
+            fedramp,
+            session_id,
+            session_id,
+            turn_state,
+        )
+    }
+
+    pub(crate) const fn new_with_thread_id(
+        endpoint: &'a str,
+        bearer_token: &'a str,
+        account_id: Option<&'a str>,
+        fedramp: bool,
+        session_id: &'a str,
+        thread_id: &'a str,
+        turn_state: Option<&'a str>,
+    ) -> Self {
         Self {
             endpoint,
             bearer_token,
             account_id,
             fedramp,
             session_id,
+            thread_id,
             turn_state,
         }
     }
@@ -123,6 +160,12 @@ impl<'a> HostConnectRequest<'a> {
     #[must_use]
     pub const fn session_id(&self) -> &'a str {
         self.session_id
+    }
+
+    /// Returns the current agent thread identity sent on the handshake.
+    #[must_use]
+    pub const fn thread_id(&self) -> &'a str {
+        self.thread_id
     }
 
     /// Returns opaque server turn state retained across a replacement socket.
@@ -247,8 +290,6 @@ pub enum HostMessage {
         /// Close code and reason formatted by the host.
         detail: String,
     },
-    /// The idle deadline elapsed without an event.
-    Timeout,
     /// A binary frame arrived where the protocol requires JSON text.
     Binary,
 }
@@ -332,4 +373,18 @@ impl HostError {
             }
         )
     }
+}
+
+/// A successful HTTPS response with a pull-based, host-owned body.
+pub struct HostHttpResponse {
+    /// Streaming body; its destructor must release the host request.
+    pub body: Box<dyn HostHttpBody>,
+    /// Response headers needed by the Responses state machine.
+    pub metadata: HostConnectionMetadata,
+}
+
+/// Raw response bytes. SSE framing and JSON decoding remain in Rust.
+pub trait HostHttpBody: Send + 'static {
+    /// Pulls one chunk, or `None` at EOF, without buffering the response.
+    fn next(&mut self) -> HostFuture<'_, Result<Option<Vec<u8>>, HostError>>;
 }

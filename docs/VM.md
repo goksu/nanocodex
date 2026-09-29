@@ -16,9 +16,9 @@ The package does not own payment-provider policy, agent identity, secret
 resolution, or the caller's choice to enable VM tools.
 
 The crate's canonical public documentation is
-[`crates/experimental/nanocodex-vm/README.md`](../crates/experimental/nanocodex-vm/README.md).
+[`crates/nanocodex-vm/README.md`](../crates/nanocodex-vm/README.md).
 Its
-[host/guest RPC section](../crates/experimental/nanocodex-vm/README.md#hostguest-rpc-protocol)
+[host/guest RPC section](../crates/nanocodex-vm/README.md#hostguest-rpc-protocol)
 specifies every frame, limit, cancellation rule, and terminal failure in the
 private lockstep protocol.
 
@@ -177,7 +177,7 @@ let workspace = image.private_workspace(
 .firmware_directory(".cache/libkrunfw/libkrunfw")
 .launch()
 .await?;
-let tools = workspace.tools_builder().build()?;
+let tools = workspace.tools_builder().await?.build()?;
 let (agent, events) = Nanocodex::builder(auth)
     .workspace(workspace.guest_workspace())
     .tools(tools)
@@ -193,24 +193,21 @@ image generation, and `update_plan` retain their existing host-side behavior.
 Callers can disable or replace those independently.
 
 Use `NanocodexBuilder::tools_factory` when an agent can spawn or fork. Start one
-`VmWorkspace` for the root agent tree and capture its clone-cheap `VmTools` in
-the factory. Nanocodex invokes the factory once per driver, so agent-relative
-tools are freshly bound to that driver while every driver deliberately shares
-the same VM, filesystem, and retained guest shell sessions:
+`VmWorkspace` for the root agent tree and discover its guest provider catalog
+before creating the factory. The factory clones the prepared tool selection for
+each driver, sharing the same VM, filesystem, and retained guest shell sessions:
 
 ```rust,no_run
 # use nanocodex::{Nanocodex, OpenAiAuth};
 # use nanocodex_vm::tools::VmToolSession;
-# fn build(auth: OpenAiAuth, session: VmToolSession) -> nanocodex::Result<()> {
-let vm = session.tools();
+# async fn build(auth: OpenAiAuth, session: VmToolSession) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+let tools = session.tools().tools_builder().await?
+    .working_directory("/workspace")
+    .default_shell("sh")
+    .build()?;
 let (agent, events) = Nanocodex::builder(auth)
     .workspace("/workspace")
-    .tools_factory(move |_agent| {
-        vm.tools_builder()
-            .working_directory("/workspace")
-            .default_shell("sh")
-            .build()
-    })
+    .tools_factory(move |_agent| Ok(tools.clone()))
     .build()?;
 # drop((agent, events));
 # Ok(())
@@ -383,5 +380,5 @@ for the end-to-end tool protocol example. Build the lean guest artifact with
 If the runtime argument is omitted, the rootfs must already contain
 `/usr/local/bin/nanocodex-vm-guest`.
 
-The retained baseline and regression budgets are recorded in
-[`benchmarks/refactor_vm_baseline_2026-07-26.md`](../benchmarks/refactor_vm_baseline_2026-07-26.md).
+Keep VM regression budgets in executable benchmark thresholds, not dated
+baseline narratives.

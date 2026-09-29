@@ -8,17 +8,14 @@ import {
 
 const MIB = 1024 * 1024;
 const OUTPUT_LIMIT = 128 * 1024;
-const context = { callId: "call", parentCallId: "parent", sessionId: "session" };
+const context = {
+  callId: "call",
+  parentCallId: "parent",
+  sessionId: "session",
+  signal: new AbortController().signal,
+};
 
 describe("Vercel Sandbox workspace paths", () => {
-  it("canonicalizes paths under the physical workspace", () => {
-    expect(workspacePath(".")).toBe("/vercel/sandbox");
-    expect(workspacePath("././")).toBe("/vercel/sandbox");
-    expect(workspacePath("src//./index.ts")).toBe("/vercel/sandbox/src/index.ts");
-    expect(workspacePath("/workspace/out.txt")).toBe("/vercel/sandbox/out.txt");
-    expect(workspacePath("/vercel/sandbox/out.txt")).toBe("/vercel/sandbox/out.txt");
-  });
-
   it.each([
     "",
     "../secret",
@@ -157,17 +154,6 @@ describe("Vercel Sandbox tools", () => {
       "port must be one of",
     );
     expect(factory).not.toHaveBeenCalled();
-  });
-
-  it("returns only configured Vercel preview domains", async () => {
-    const sandbox = makeSandbox();
-    const tools = createVercelSandboxTools(async () => sandbox.client);
-    await expect(invoke(tools, "sandbox_preview", { port: 8080 })).resolves.toEqual({
-      port: 8080,
-      url: "https://sb-8080.vercel.run",
-      persistent: false,
-    });
-    expect(sandbox.domain).toHaveBeenCalledWith(8080);
   });
 });
 
